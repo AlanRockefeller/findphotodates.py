@@ -170,9 +170,10 @@ def summarize_results(photo_data, file_counts, quiet):
             try:
                 year_month = "-".join(day.split("-")[:2])  # Extract year and month
                 month_counter[year_month] += date_counter[day]
-            except:
+            except (IndexError, ValueError) as e:
+                if args.debug:
+                    print(f"Error extracting year-month from '{day}': {str(e)}")
                 continue
-
         print(f"\n{file_type_label} Taken per Month:")
         for year_month, count in sorted(month_counter.items()):
             print(f"  {year_month}: {count}")

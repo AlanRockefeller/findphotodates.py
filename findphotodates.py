@@ -147,8 +147,10 @@ def summarize_results(photo_data, file_counts, quiet):
             try:
                 day = date.split(" ")[0]  # Extract just the date portion
                 date_counter[day] += 1
-            except:
+            except (IndexError, AttributeError) as e:
                 # Skip invalid dates
+                if args.debug:
+                    print(f"Error processing date '{date}': {str(e)}")
                 continue
 
     # Determine file type label for summary

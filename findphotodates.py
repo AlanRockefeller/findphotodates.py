@@ -58,7 +58,7 @@ def get_photo_data(filepath, locate=False):
                         if re.match(r'\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}', line):
                             date = line
                             break
-                    except:
+                    except (IndexError, AttributeError) as e:
                         continue
             
             # Process GPS data if requested and available
@@ -76,8 +76,8 @@ def get_photo_data(filepath, locate=False):
             return date, gps_lat, gps_lon
         else:
             return None, None, None
-    except FileNotFoundError:
-        raise FileNotFoundError("Exiftool is required but was not found. Please install it.")
+    except FileNotFoundError as e:
+        raise FileNotFoundError("Exiftool is required but was not found. Please install it.") from e
 
 def geolocate(lat, lon):
     """Convert GPS coordinates to a human-readable location."""
@@ -106,16 +106,16 @@ def geolocate(lat, lon):
         )
         
         # Cleanup
-        try:
+        import contextlib
+        with contextlib.suppress(Exception):
             os.unlink(temp_path)
-        except:
             pass
             
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
         else:
             return f"{lat}, {lon}"
-    except Exception as e:
+    except Exception:
         return f"{lat}, {lon}"
 
 def write_dates_to_file(output_file, photo_data):
@@ -149,15 +149,14 @@ def summarize_results(photo_data, file_counts, quiet):
                 date_counter[day] += 1
             except (IndexError, AttributeError) as e:
                 # Skip invalid dates
-                if args.debug:
-                    print(f"Error processing date '{date}': {str(e)}")
+                print(f"Error processing date '{date}': {str(e)}")
                 continue
 
     # Determine file type label for summary
     file_type_label = "Media" 
-    if all(ext in VIDEO_EXTENSIONS for ext in file_counts.keys()):
+    if all(ext in VIDEO_EXTENSIONS for ext in file_counts):
         file_type_label = "Videos"
-    elif all(ext in PHOTO_EXTENSIONS for ext in file_counts.keys()):
+    elif all(ext in PHOTO_EXTENSIONS for ext in file_counts):
         file_type_label = "Photos"
             
     if len(date_counter) <= 20:

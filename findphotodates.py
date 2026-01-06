@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# Find photo / video dates version 1.1 - By Alan Rockefeller January 2, 2026
+# Find photo / video dates version 1.2 - By Alan Rockefeller January 6, 2026
 
 import os
 import subprocess

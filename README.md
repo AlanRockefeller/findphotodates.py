@@ -6,7 +6,7 @@ A versatile Python tool for extracting and organizing dates from your media file
 
 Ever found yourself with thousands of photos and videos scattered across your drives, wondering when they were actually taken? `findphotodates.py` is the solution. This script scans your photos and videos, extracts the dates they were created (from EXIF data), and organizes this information in a neat text file.
 
-Version 1.1 - January 2, 2026 - By Alan Rockefeller
+Version 1.2 - January 6, 2026 - By Alan Rockefeller
 
 ## Features
 
@@ -19,6 +19,7 @@ Version 1.1 - January 2, 2026 - By Alan Rockefeller
 - Estimates processing time for large collections
 - Creates a detailed TSV file with a list of your media and when it was created
 - **Smart caching** - Uses filesystem metadata to cache results and skip re-processing unchanged files
+- Saves progress every 5 minutes or 100 files - and handles errors from disconnecting drives gracefully.    Picks up where it left off.
 
 ## Requirements
 

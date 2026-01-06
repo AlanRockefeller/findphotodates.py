@@ -138,7 +138,7 @@ def geolocate(lat, lon):
         
         # Create request with proper User-Agent header (required by Nominatim)
         req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'findphotodates.py/1.0 (https://github.com/alanrockefeller/findphotodates.py)')
+        req.add_header('User-Agent', 'findphotodates.py/1.1 (https://github.com/alanrockefeller/findphotodates.py)')
         
         # Make the request
         with urllib.request.urlopen(req, timeout=10) as response:
@@ -647,6 +647,13 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
                     files_to_process.append((out_path, key_path, size_bytes, mtime_ns))
             except OSError as e:
                 error_log.write(f"Warning: Could not stat '{file}': {str(e)}\n")
+                # Check for drive disconnect
+                if any(err in str(e).lower() for err in ['no such file', 'input/output error', 'stale file handle']):
+                    print(f"\n\nWARNING: Drive may be disconnected! Saving progress...")
+                    write_dates_to_file_atomic(output, photo_data)
+                    print(f"Saved {len(photo_data)} files to '{output}'")
+                    print("Reconnect drive and run again to resume.")
+                    return False
                 continue
 
         if not quiet:
@@ -654,6 +661,7 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
 
         # Estimate runtime and save results from first files
         start_time = time.time()
+        last_save_time = start_time
         estimated_finish_time = None
         timing_results = []  # Save results from timing test files
         start_idx = 0
@@ -661,20 +669,31 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
         if len(files_to_process) > 10 and not quiet:
             test_files = min(5, len(files_to_process))
             for out_path, key_path, size_bytes, mtime_ns in files_to_process[:test_files]:
-                # Always extract GPS data (even if locate=False) for caching
-                # Use key_path (canonical) for exiftool, but out_path for output
-                date_taken, gps_lat, gps_lon = get_photo_data(key_path)
-                location = None
-                if locate and gps_lat and gps_lon:
-                    location = geolocate(gps_lat, gps_lon)
-                    # Don't save coordinate strings as location (treat as None to allow retry)
-                    if location and is_coordinate_string(location):
-                        location = None
-                if date_taken:
-                    # Save result for reuse - use out_path for output
-                    timing_results.append((out_path, date_taken, size_bytes, mtime_ns, gps_lat, gps_lon, location))
-                else:
-                    error_log.write(f"Warning: Could not extract date for '{out_path}'.\n")
+                try:
+                    # Always extract GPS data (even if locate=False) for caching
+                    # Use key_path (canonical) for exiftool, but out_path for output
+                    date_taken, gps_lat, gps_lon = get_photo_data(key_path)
+                    location = None
+                    if locate and gps_lat and gps_lon:
+                        location = geolocate(gps_lat, gps_lon)
+                        # Don't save coordinate strings as location (treat as None to allow retry)
+                        if location and is_coordinate_string(location):
+                            location = None
+                    if date_taken:
+                        # Save result for reuse - use out_path for output
+                        timing_results.append((out_path, date_taken, size_bytes, mtime_ns, gps_lat, gps_lon, location))
+                    else:
+                        error_log.write(f"Warning: Could not extract date for '{out_path}'.\n")
+                except OSError as e:
+                    error_log.write(f"Error: Could not access '{out_path}': {str(e)}\n")
+                    # Check for drive disconnect
+                    if any(err in str(e).lower() for err in ['no such file', 'input/output error', 'stale file handle']):
+                        print(f"\n\nWARNING: Drive may be disconnected! Saving progress...")
+                        write_dates_to_file_atomic(output, photo_data)
+                        print(f"Saved {len(photo_data)} files to '{output}'")
+                        print("Reconnect drive and run again to resume.")
+                        return False
+                    continue
             
             elapsed_time = time.time() - start_time
             avg_time_per_file = elapsed_time / test_files
@@ -702,21 +721,40 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
 
         # Process remaining files that need exiftool
         for idx, (out_path, key_path, size_bytes, mtime_ns) in enumerate(files_to_process[start_idx:], start=start_idx):
-            # Always extract GPS data (even if locate=False) for caching
-            # Use key_path (canonical) for exiftool, but out_path for output
-            date_taken, gps_lat, gps_lon = get_photo_data(key_path)
-            location = None
-            if locate and gps_lat and gps_lon:
-                location = geolocate(gps_lat, gps_lon)
-                # Don't save coordinate strings as location (treat as None to allow retry)
-                if location and is_coordinate_string(location):
-                    location = None
-            if date_taken:
-                # Always preserve location if computed (for future --locate runs)
-                # Use out_path (abspath) for output to preserve what user sees
-                photo_data.append((out_path, date_taken, size_bytes, mtime_ns, gps_lat, gps_lon, location))
-            else:
-                error_log.write(f"Warning: Could not extract date for '{out_path}'.\n")
+            try:
+                # Always extract GPS data (even if locate=False) for caching
+                # Use key_path (canonical) for exiftool, but out_path for output
+                date_taken, gps_lat, gps_lon = get_photo_data(key_path)
+                location = None
+                if locate and gps_lat and gps_lon:
+                    location = geolocate(gps_lat, gps_lon)
+                    # Don't save coordinate strings as location (treat as None to allow retry)
+                    if location and is_coordinate_string(location):
+                        location = None
+                if date_taken:
+                    # Always preserve location if computed (for future --locate runs)
+                    # Use out_path (abspath) for output to preserve what user sees
+                    photo_data.append((out_path, date_taken, size_bytes, mtime_ns, gps_lat, gps_lon, location))
+                else:
+                    error_log.write(f"Warning: Could not extract date for '{out_path}'.\n")
+            except OSError as e:
+                error_log.write(f"Error: Could not access '{out_path}': {str(e)}\n")
+                # Check for drive disconnect
+                if any(err in str(e).lower() for err in ['no such file', 'input/output error', 'stale file handle']):
+                    print(f"\n\nWARNING: Drive may be disconnected! Saving progress...")
+                    write_dates_to_file_atomic(output, photo_data)
+                    print(f"Saved {len(photo_data)} files to '{output}'")
+                    print("Reconnect drive and run again to resume.")
+                    return False
+                continue
+
+            # Save checkpoint every 100 files or 5 minutes
+            current_time = time.time()
+            if (idx + 1) % 100 == 0 or (current_time - last_save_time) > 300:
+                write_dates_to_file_atomic(output, photo_data)
+                last_save_time = current_time
+                if not quiet:
+                    print(f"\n[Checkpoint: {len(photo_data)} files saved]", end="")
 
             # Update progress bar after processing (display after, not before)
             if not quiet and idx % 10 == 0:  # Update less frequently for better performance

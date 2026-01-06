@@ -3,6 +3,7 @@
 # Find photo / video dates version 1.2 - By Alan Rockefeller January 6, 2026
 
 import os
+import sys
 import subprocess
 import argparse
 import re
@@ -780,6 +781,58 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
     return True
 
 def main():
+    # If no arguments are provided, print helpful help
+    if len(sys.argv) == 1:
+        print("""
+Find Photo Dates - A tool to index and geolocate your media collection.
+
+This tool recursively scans directories for photos and videos, extracting their
+creation dates using ExifTool. It allows you to organize your media by date
+and location.
+
+Key Features:
+  - Extracts 'Date Taken' from EXIF metadata.
+  - Supports common photo (JPG, NEF, ORF) and video (MP4, MOV, AVI, etc.) formats.
+  - Caches results in a TSV file to speed up subsequent runs.
+  - Can reverse geolocate files using GPS coordinates (--locate).
+  - Can save and manage multiple scan configurations (--save, --scan).
+
+Usage: findphotodates.py [options]
+
+Options:
+  --directory DIR    The directory to search (default: current directory).
+  --output FILE      The output TSV file to save results (default: photo.dates.tsv).
+  --locate           Attempt to reverse geolocate files using GPS coordinates.
+  --video            Search for video files only.
+  --only-photos      Search for photo files only.
+  --extension EXT    Search for a specific file extension (e.g., --extension jpg).
+  --save             Save the current scan configuration for later use.
+  --scan             Run all saved scan configurations.
+  --quiet            Run quietly (suppress normal output).
+  --debug            Enable verbose debug output.
+  --test             Run internal tests.
+
+Examples:
+  # Scan a specific folder and save to default output
+  findphotodates.py --directory /home/user/Photos
+
+  # Scan for videos only in the current directory
+  findphotodates.py --video
+
+  # Scan a backup drive and geolocate photos
+  findphotodates.py --directory /Volumes/Backup --locate
+
+  # Save this configuration to run later
+  findphotodates.py --directory /Volumes/Backup --save
+
+  # Run all previously saved scan configurations
+  findphotodates.py --scan
+
+For more details on a specific option, you can also use:
+  findphotodates.py --help
+""")
+        return
+
     # Check exiftool availability at the very start
     try:
         result = subprocess.run(

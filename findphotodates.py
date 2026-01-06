@@ -650,7 +650,7 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
                 error_log.write(f"Warning: Could not stat '{file}': {str(e)}\n")
                 # Check for drive disconnect
                 if any(err in str(e).lower() for err in ['no such file', 'input/output error', 'stale file handle']):
-                    print(f"\n\nWARNING: Drive may be disconnected! Saving progress...")
+                    print("\n\nWARNING: Drive may be disconnected! Saving progress...")
                     write_dates_to_file_atomic(output, photo_data)
                     print(f"Saved {len(photo_data)} files to '{output}'")
                     print("Reconnect drive and run again to resume.")
@@ -686,10 +686,10 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
                     else:
                         error_log.write(f"Warning: Could not extract date for '{out_path}'.\n")
                 except OSError as e:
-                    error_log.write(f"Error: Could not access '{out_path}': {str(e)}\n")
+                    error_log.write(f"Error: Could not access '{out_path}': {e}\n")
                     # Check for drive disconnect
                     if any(err in str(e).lower() for err in ['no such file', 'input/output error', 'stale file handle']):
-                        print(f"\n\nWARNING: Drive may be disconnected! Saving progress...")
+                        print("\n\nWARNING: Drive may be disconnected! Saving progress...")
                         write_dates_to_file_atomic(output, photo_data)
                         print(f"Saved {len(photo_data)} files to '{output}'")
                         print("Reconnect drive and run again to resume.")
@@ -739,10 +739,10 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
                 else:
                     error_log.write(f"Warning: Could not extract date for '{out_path}'.\n")
             except OSError as e:
-                error_log.write(f"Error: Could not access '{out_path}': {str(e)}\n")
+                error_log.write(f"Error: Could not access '{out_path}': {e}\n")
                 # Check for drive disconnect
                 if any(err in str(e).lower() for err in ['no such file', 'input/output error', 'stale file handle']):
-                    print(f"\n\nWARNING: Drive may be disconnected! Saving progress...")
+                    print("\n\nWARNING: Drive may be disconnected! Saving progress...")
                     write_dates_to_file_atomic(output, photo_data)
                     print(f"Saved {len(photo_data)} files to '{output}'")
                     print("Reconnect drive and run again to resume.")

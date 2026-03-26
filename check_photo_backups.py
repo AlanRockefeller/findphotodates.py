@@ -199,6 +199,8 @@ def iter_inventory_rows(
                             file=sys.stderr,
                         )
                     content_hash = ""
+                else:
+                    content_hash = content_hash.lower()
 
                 yield filepath, date_taken, size_bytes, mtime_ns, content_hash, headers
                 continue
@@ -567,8 +569,11 @@ def main() -> int:
             Path(p).expanduser() for p in args.inventories.split(",") if p.strip()
         ]
     else:
-        inv_files = sorted(Path.home().glob("*:photo.taken.dates.txt")) + sorted(
-            Path.home().glob("*_photo.taken.dates.txt")
+        inv_files = (
+            sorted(Path.home().glob("*:photo.taken.dates.txt"))
+            + sorted(Path.home().glob("*_photo.taken.dates.txt"))
+            + sorted(Path.home().glob("*:photo.taken.dates.tsv"))
+            + sorted(Path.home().glob("*_photo.taken.dates.tsv"))
         )
 
     if not inv_files:
@@ -600,18 +605,33 @@ def main() -> int:
         if len(lst) < 3:
             lst.append(p)
 
+    _VALID_HASH_ALGOS = {"blake3", "blake2b", "sha256"}
+
     def _parse_inv_hash_config(hdrs: Dict[str, str]) -> Optional[InvHashConfig]:
         """Parse an InvHashConfig from inventory comment headers, or None."""
-        if "samplehash_v1" in hdrs:
-            cfg = parse_config_str(hdrs["samplehash_v1"])
-            algo = cfg.get("algo", resolved_sample_algo)
-            chunks = int(cfg.get("chunks", str(args.sample_chunks)))
-            chunk_mib = float(cfg.get("chunk_mib", str(args.sample_chunk_mib)))
-            return InvHashConfig("sample", algo, chunks, int(chunk_mib * 1024 * 1024))
-        if "fullhash" in hdrs:
-            cfg = parse_config_str(hdrs.get("fullhash", ""))
-            algo = cfg.get("algo", resolved_full_algo)
-            return InvHashConfig("full", algo, 0, 0)
+        try:
+            if "samplehash_v1" in hdrs:
+                cfg = parse_config_str(hdrs["samplehash_v1"])
+                algo = cfg.get("algo", resolved_sample_algo)
+                if algo not in _VALID_HASH_ALGOS:
+                    print(f"WARNING: Unknown hash algo {algo!r} in inventory header, skipping", file=sys.stderr)
+                    return None
+                chunks = int(cfg.get("chunks", str(args.sample_chunks)))
+                chunk_mib = float(cfg.get("chunk_mib", str(args.sample_chunk_mib)))
+                if chunks <= 0 or chunk_mib <= 0:
+                    print(f"WARNING: Invalid sample hash params (chunks={chunks}, chunk_mib={chunk_mib})", file=sys.stderr)
+                    return None
+                return InvHashConfig("sample", algo, chunks, int(chunk_mib * 1024 * 1024))
+            if "fullhash" in hdrs:
+                cfg = parse_config_str(hdrs.get("fullhash", ""))
+                algo = cfg.get("algo", resolved_full_algo)
+                if algo not in _VALID_HASH_ALGOS:
+                    print(f"WARNING: Unknown hash algo {algo!r} in inventory header, skipping", file=sys.stderr)
+                    return None
+                return InvHashConfig("full", algo, 0, 0)
+        except (ValueError, TypeError) as exc:
+            print(f"WARNING: Malformed hash config in inventory header: {exc}", file=sys.stderr)
+            return None
         return None
 
     print(f"Loading {len(inv_files)} inventory file(s)...")
@@ -645,7 +665,8 @@ def main() -> int:
             if exclude_re.search(match_path):
                 continue
 
-            base = os.path.basename(filepath).lower()
+            # Use forward slashes so os.path.basename works on Windows paths read on POSIX
+            base = os.path.basename(filepath.replace("\\", "/")).lower()
             if not base:
                 continue
             name_only_drives.setdefault(base, set()).add(drive)

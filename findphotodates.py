@@ -1133,7 +1133,7 @@ _DISCOVERY_QUEUE_SIZE = 10_000  # bounded queue: ~1 MB of path strings max
 class _DiscoveryState:
     """Shared state between discovery producer thread and consumer."""
 
-    __slots__ = ("discovered", "total", "done", "error")
+    __slots__ = ("discovered", "total", "done", "error", "done_time")
 
     def __init__(self):
         self.discovered = (
@@ -1142,6 +1142,7 @@ class _DiscoveryState:
         self.total = 0  # final count (valid only after done is set)
         self.done = threading.Event()
         self.error = None  # exception from producer, if any
+        self.done_time = 0.0  # wall-clock time when discovery finished
 
 
 def _discovery_producer(file_queue, directory, extensions, state):
@@ -1156,6 +1157,7 @@ def _discovery_producer(file_queue, directory, extensions, state):
     except Exception as e:
         state.error = e
     finally:
+        state.done_time = time.time()
         state.done.set()
         # Push sentinel so consumer doesn't block forever on get()
         try:
@@ -1235,8 +1237,15 @@ def run_scan(
     debug=False,
     hash_options=None,
     old_format=False,
+    perf_stats=None,
 ):
-    """Run a scan on the specified directory."""
+    """Run a scan on the specified directory.
+
+    If perf_stats is a dict, it will be populated with timing breakdowns:
+        wall_total, t_cache_load, t_discovery, t_exiftool, t_hashing,
+        t_write, files_total, files_cached, files_processed.
+    """
+    _t0 = time.time()
     if hash_options is None:
         hash_options = parse_hash_args(quiet=quiet)
 
@@ -1278,7 +1287,9 @@ def run_scan(
         )
 
     # Load existing cache
+    _t_cache_start = time.time()
     cache = load_cache(output, debug=debug)
+    _t_cache_load = time.time() - _t_cache_start
     if not quiet and cache:
         print(f"Loaded {len(cache)} entries from cache.")
 
@@ -1291,6 +1302,9 @@ def run_scan(
     file_counts = Counter()
     cached_count = 0
     processed_count = 0
+    _t_exiftool_total = 0.0
+    _t_hashing_total = 0.0
+    _t_checkpoint_total = 0.0
 
     def cleanup_all():
         if hash_conn is not None:
@@ -1312,6 +1326,7 @@ def run_scan(
         daemon=True,
     )
     producer.start()
+    _t_discovery_start = time.time()
 
     interrupted = False
 
@@ -1401,6 +1416,7 @@ def run_scan(
                                 cached_entry["location"] = location
 
                         if date_taken:
+                            _th0 = time.time()
                             content_hash = get_content_hash(
                                 key_path,
                                 size_bytes,
@@ -1409,6 +1425,7 @@ def run_scan(
                                 hash_conn,
                                 hash_cache_pending,
                             )
+                            _t_hashing_total += time.time() - _th0
                             photo_data.append(
                                 (
                                     out_path,
@@ -1430,15 +1447,18 @@ def run_scan(
 
                     else:
                         # Not cached — query exiftool
+                        _te0 = time.time()
                         date_taken, gps_lat, gps_lon = get_photo_data(
                             key_path, _exiftool=exiftool
                         )
+                        _t_exiftool_total += time.time() - _te0
                         location = None
                         if locate and gps_lat and gps_lon:
                             location = geolocate(gps_lat, gps_lon)
                             if location and is_coordinate_string(location):
                                 location = None
                         if date_taken:
+                            _th0 = time.time()
                             content_hash = get_content_hash(
                                 key_path,
                                 size_bytes,
@@ -1447,6 +1467,7 @@ def run_scan(
                                 hash_conn,
                                 hash_cache_pending,
                             )
+                            _t_hashing_total += time.time() - _th0
                             photo_data.append(
                                 (
                                     out_path,
@@ -1489,6 +1510,7 @@ def run_scan(
 
                 # Checkpoint every 500 files or 5 minutes
                 if total_seen % 500 == 0 or (current_time - last_save_time) > 300:
+                    _tc0 = time.time()
                     write_dates_to_file_atomic(
                         output,
                         photo_data,
@@ -1496,6 +1518,7 @@ def run_scan(
                         hash_options=hash_options,
                         old_format=old_format,
                     )
+                    _t_checkpoint_total += time.time() - _tc0
                     last_save_time = current_time
                     if not quiet:
                         print(
@@ -1571,6 +1594,7 @@ def run_scan(
             f"\nProcessing complete: {total_seen:,} files in {_format_duration(elapsed)}.                              "
         )
 
+    _tw0 = time.time()
     write_dates_to_file_atomic(
         output,
         photo_data,
@@ -1578,6 +1602,7 @@ def run_scan(
         hash_options=hash_options,
         old_format=old_format,
     )
+    _t_write = time.time() - _tw0
 
     if not quiet:
         print(f"Dates written to '{output}' ({len(photo_data):,} files listed).")
@@ -1588,7 +1613,47 @@ def run_scan(
 
     summarize_results(photo_data, file_counts, quiet, debug)
     cleanup_all()
+
+    if perf_stats is not None:
+        _t_total = time.time() - _t0
+        perf_stats["wall_total"] = _t_total
+        perf_stats["t_cache_load"] = _t_cache_load
+        perf_stats["t_discovery"] = discovery.done_time - _t_discovery_start if discovery.done_time else 0.0
+        perf_stats["t_exiftool"] = _t_exiftool_total
+        perf_stats["t_hashing"] = _t_hashing_total
+        perf_stats["t_checkpoints"] = _t_checkpoint_total
+        perf_stats["t_write"] = _t_write
+        perf_stats["files_total"] = total_seen
+        perf_stats["files_cached"] = cached_count
+        perf_stats["files_processed"] = processed_count
+
     return True
+
+
+def _print_perf_summary(label, stats):
+    """Print a performance timing breakdown for a single scan."""
+    wall = stats.get("wall_total", 0)
+    if wall <= 0:
+        return
+    print(f"\n--- Performance: {label} ---")
+    items = [
+        ("Cache load", stats.get("t_cache_load", 0)),
+        ("File discovery", stats.get("t_discovery", 0)),
+        ("ExifTool queries", stats.get("t_exiftool", 0)),
+        ("Content hashing", stats.get("t_hashing", 0)),
+        ("Checkpoints", stats.get("t_checkpoints", 0)),
+        ("Final write", stats.get("t_write", 0)),
+    ]
+    accounted = sum(v for _, v in items)
+    items.append(("Other", max(0, wall - accounted)))
+    for name, secs in items:
+        pct = secs / wall * 100 if wall else 0
+        print(f"  {name:<20s} {secs:7.2f}s  ({pct:5.1f}%)")
+    print(f"  {'Wall total':<20s} {wall:7.2f}s")
+    total = stats.get("files_total", 0)
+    cached = stats.get("files_cached", 0)
+    processed = stats.get("files_processed", 0)
+    print(f"  Files: {total:,} total ({cached:,} cached, {processed:,} processed)")
 
 
 def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
@@ -2009,6 +2074,11 @@ For more details on a specific option, you can also use:
         action="store_true",
         help="Fill in missing content hashes for an existing inventory TSV. Reads the TSV, computes hashes for rows with blank content_hash, writes back. Uses --hash to set mode (default: sample for --add-hashes).",
     )
+    parser.add_argument(
+        "--debugperformance",
+        action="store_true",
+        help="Print a performance timing summary after each scan.",
+    )
 
     args = parser.parse_args()
     output = args.output
@@ -2133,6 +2203,7 @@ For more details on a specific option, you can also use:
                     else (PHOTO_EXTENSIONS if args.only_photos else DEFAULT_EXTENSIONS)
                 )
             )
+            scan_perf = {}
             run_scan(
                 directory_abs,
                 output_abs,
@@ -2142,7 +2213,10 @@ For more details on a specific option, you can also use:
                 args.debug,
                 hash_options=hash_options,
                 old_format=args.old_format,
+                perf_stats=scan_perf,
             )
+            if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 3600):
+                _print_perf_summary(directory_abs, scan_perf)
             return
 
     if args.scan:
@@ -2151,6 +2225,7 @@ For more details on a specific option, you can also use:
             print("No saved scan configurations found.")
             return
 
+        all_perf = []
         print(f"Running {len(config['saved_scans'])} saved scan(s)...")
         for idx, entry in enumerate(config["saved_scans"], 1):
             resolved_dir = resolve_saved_directory(entry)
@@ -2173,6 +2248,7 @@ For more details on a specific option, you can also use:
                 quiet=args.quiet,
             )
             extensions = set(flags.get("extensions", DEFAULT_EXTENSIONS))
+            scan_perf = {}
             try:
                 run_scan(
                     resolved_dir,
@@ -2183,9 +2259,25 @@ For more details on a specific option, you can also use:
                     flags.get("debug", False),
                     hash_options=scan_hash_options,
                     old_format=flags.get("old_format", False),
+                    perf_stats=scan_perf,
                 )
             except Exception as e:
                 print(f"  Error: {e}")
+            if scan_perf:
+                if args.debugperformance or scan_perf.get("wall_total", 0) >= 3600:
+                    _print_perf_summary(resolved_dir, scan_perf)
+                all_perf.append((resolved_dir, scan_perf))
+
+        total_wall = sum(p["wall_total"] for _, p in all_perf) if all_perf else 0
+        if len(all_perf) > 1 and (args.debugperformance or total_wall >= 3600):
+            print("\n=== Overall Performance Summary ===")
+            total_files = sum(p.get("files_total", 0) for _, p in all_perf)
+            for label, stats in all_perf:
+                name = os.path.basename(label.rstrip("/")) or label
+                wall = stats.get("wall_total", 0)
+                files = stats.get("files_total", 0)
+                print(f"  {name:<30s} {wall:7.1f}s  {files:>8,} files")
+            print(f"  {'TOTAL':<30s} {total_wall:7.1f}s  {total_files:>8,} files")
         return
 
     directory_abs = _expand_path(args.directory)
@@ -2199,6 +2291,7 @@ For more details on a specific option, you can also use:
             else (PHOTO_EXTENSIONS if args.only_photos else DEFAULT_EXTENSIONS)
         )
     )
+    scan_perf = {}
     run_scan(
         directory_abs,
         output_abs,
@@ -2208,7 +2301,10 @@ For more details on a specific option, you can also use:
         args.debug,
         hash_options=hash_options,
         old_format=args.old_format,
+        perf_stats=scan_perf,
     )
+    if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 3600):
+        _print_perf_summary(directory_abs, scan_perf)
 
 
 def test_date_parsing():

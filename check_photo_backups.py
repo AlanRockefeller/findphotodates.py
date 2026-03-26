@@ -147,6 +147,11 @@ def iter_inventory_rows(
                               f"This inventory may be corrupt or from an unsupported version.", file=sys.stderr)
                         return
 
+                if len(parts) != len(fieldnames):
+                    if debug:
+                        print(f"DEBUG: Row has {len(parts)} fields, expected {len(fieldnames)}: {parts!r}", file=sys.stderr)
+                    skipped += 1
+                    continue
                 row = dict(zip(fieldnames, parts))
                 filepath = row.get("filepath", "")
                 if not filepath:
@@ -374,6 +379,19 @@ def parse_config_str(config_str: str) -> dict:
     return res
 
 
+@dataclass(frozen=True)
+class InvHashConfig:
+    """Hash configuration derived from an inventory's headers.
+
+    Used to compute target hashes with the exact same parameters
+    the inventory used, ensuring hash comparisons are valid.
+    """
+    mode: str        # "sample" or "full"
+    algo: str        # "blake3", "blake2b", or "sha256"
+    chunks: int      # number of sample chunks (0 for full)
+    chunk_bytes: int  # bytes per chunk (0 for full)
+
+
 # ---------------------------------------------------------------------------
 # Safe-to-delete classification — the SOLE gate for deletion decisions.
 # ---------------------------------------------------------------------------
@@ -425,7 +443,8 @@ def main() -> int:
     ap.add_argument("--drive-map", default="", help="Mapping of drive labels to roots: c=/mnt/c")
     ap.add_argument("--allow-strong-without-hash", action="store_true")
     ap.add_argument("--allow-weak-without-hash", action="store_true")
-    ap.add_argument("--allow-hash-config-mismatch", action="store_true")
+    ap.add_argument("--allow-hash-config-mismatch", action="store_true",
+                    help="Deprecated and ignored. Target hashes are now computed per-inventory config.")
     ap.add_argument("-q", "--quiet", action="store_true", help="Suppress normal output")
     ap.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = ap.parse_args()
@@ -457,18 +476,34 @@ def main() -> int:
     exts = {e.strip().lower() for e in args.exts.split(",") if e.strip()}
     drive_map = {k.strip(): v.strip() for item in args.drive_map.split(",") if "=" in item for k, v in [item.split("=", 1)]}
 
-    hash_drives: Dict[Tuple[int, str], Set[str]] = {}
-    hash_paths: Dict[Tuple[int, str], List[str]] = {}
-    hash_configs_per_key: Dict[Tuple[int, str], Set[str]] = {}
+    # hash_drives is keyed by (InvHashConfig, size_bytes, content_hash) so that
+    # verified_hash requires proving the inventory entry came from the same config
+    # family as the target hash.  This prevents cross-config collisions (however
+    # unlikely) from producing false verified_hash matches.
+    hash_drives: Dict[Tuple[InvHashConfig, int, str], Set[str]] = {}
+    hash_paths: Dict[Tuple[InvHashConfig, int, str], List[str]] = {}
     strong_drives, weak_drives, name_date_drives, name_only_drives = {}, {}, {}, {}
     strong_paths, weak_paths, name_date_paths, name_only_paths = {}, {}, {}, {}
-    inventory_hash_configs = {}
-    content_hash_formats_seen = set()
-    sizes_with_hashes = set()
+    inv_hash_configs: Set[InvHashConfig] = set()
+    sizes_with_hashes: Set[int] = set()
 
     def add_example_path(d, k, p):
         lst = d.setdefault(k, [])
         if len(lst) < 3: lst.append(p)
+
+    def _parse_inv_hash_config(hdrs: Dict[str, str]) -> Optional[InvHashConfig]:
+        """Parse an InvHashConfig from inventory comment headers, or None."""
+        if "samplehash_v1" in hdrs:
+            cfg = parse_config_str(hdrs["samplehash_v1"])
+            algo = cfg.get("algo", resolved_sample_algo)
+            chunks = int(cfg.get("chunks", str(args.sample_chunks)))
+            chunk_mib = float(cfg.get("chunk_mib", str(args.sample_chunk_mib)))
+            return InvHashConfig("sample", algo, chunks, int(chunk_mib * 1024 * 1024))
+        if "fullhash" in hdrs:
+            cfg = parse_config_str(hdrs.get("fullhash", ""))
+            algo = cfg.get("algo", resolved_full_algo)
+            return InvHashConfig("full", algo, 0, 0)
+        return None
 
     print(f"Loading {len(inv_files)} inventory file(s)...")
     for inv in inv_files:
@@ -476,27 +511,19 @@ def main() -> int:
         if not inv.exists(): continue
         drive = drive_label_from_inventory_filename(inv)
         kept, hashes_found_in_inv, inv_headers = 0, 0, {}
+        current_inv_cfg: Optional[InvHashConfig] = None  # resolved once per inventory
 
-        for filepath, date_taken, size_bytes, mtime_ns, content_hash, headers in iter_inventory_rows(inv, debug=args.debug):
+        for filepath, date_taken, size_bytes, _mtime_ns, content_hash, headers in iter_inventory_rows(inv, debug=args.debug):
             inv_headers = headers
+            # Parse config on first row (headers are stable for the whole file)
+            if current_inv_cfg is None:
+                current_inv_cfg = _parse_inv_hash_config(headers)
+
             display_path = resolve_inventory_display_path(filepath, headers.get("inventory_root") or drive_map.get(drive))
-            
+
             # Normalize to forward slashes for cross-platform regex matching
             match_path = display_path.replace(os.sep, "/").replace("\\", "/")
             if exclude_re.search(match_path): continue
-
-            if "content_hash_format" in headers: content_hash_formats_seen.add(headers["content_hash_format"])
-            
-            current_inv_hash_config = None
-            if "samplehash_v1" in headers:
-                current_inv_hash_config = headers["samplehash_v1"]
-                inventory_hash_configs[drive] = current_inv_hash_config
-            elif "fullhash" in headers:
-                # Safely parse fullhash config
-                fullhash_settings = parse_config_str(headers["fullhash"])
-                if "algo" in fullhash_settings:
-                    current_inv_hash_config = "mode=full algo=" + fullhash_settings["algo"]
-                    inventory_hash_configs[drive] = current_inv_hash_config
 
             base = os.path.basename(filepath).lower()
             if not base: continue
@@ -507,13 +534,11 @@ def main() -> int:
                 name_date_drives.setdefault(ndk, set()).add(drive)
                 add_example_path(name_date_paths, ndk, display_path)
             if size_bytes is not None:
-                if content_hash:
+                if content_hash and current_inv_cfg is not None:
                     sizes_with_hashes.add(size_bytes)
-                    hk = (size_bytes, content_hash)
+                    hk = (current_inv_cfg, size_bytes, content_hash)
                     hash_drives.setdefault(hk, set()).add(drive)
                     add_example_path(hash_paths, hk, display_path)
-                    if current_inv_hash_config:
-                        hash_configs_per_key.setdefault(hk, set()).add(current_inv_hash_config)
                     hashes_found_in_inv += 1
                 sk, wk = (base, size_bytes, date_taken), (base, size_bytes)
                 strong_drives.setdefault(sk, set()).add(drive)
@@ -521,23 +546,43 @@ def main() -> int:
                 weak_drives.setdefault(wk, set()).add(drive)
                 add_example_path(weak_paths, wk, display_path)
             kept += 1
-        
+
+        if current_inv_cfg is not None:
+            inv_hash_configs.add(current_inv_cfg)
+
         if args.debug:
             root = inv_headers.get("inventory_root") or drive_map.get(drive)
-            print(f"DEBUG: {inv.name}: rows={kept:,} hashes={hashes_found_in_inv:,} drive={drive} root={root}")
+            print(f"DEBUG: {inv.name}: rows={kept:,} hashes={hashes_found_in_inv:,} drive={drive} root={root} config={current_inv_cfg}")
         else:
             print(f"  {inv.name}: rows={kept:,} hashes={hashes_found_in_inv:,} drive={drive}")
 
-    target_full_hash_needed = "fullhash_v1" in content_hash_formats_seen
-    if target_full_hash_needed and not args.quiet:
-        print(f"Note: Full hashing will be used for targets because inventories require fullhash_v1 (using {resolved_full_algo}).")
+    # Warn if any inventory config requires an unavailable algorithm
+    for cfg in inv_hash_configs:
+        if cfg.algo == "blake3" and not _BLAKE3_AVAILABLE:
+            print("WARNING: Inventory uses blake3 but blake3 is not installed locally. "
+                  "Hash verification will fail for those inventories. Install: pip install blake3",
+                  file=sys.stderr)
+            break
+
+    if not inv_hash_configs and args.hash_mode != "off" and not args.quiet:
+        print("Note: No hash-bearing inventories loaded; no verification hashes will be computed.")
+
+    if not args.quiet and inv_hash_configs:
+        cfgs_desc = ", ".join(f"{c.mode}/{c.algo}" for c in sorted(inv_hash_configs, key=lambda c: (c.mode, c.algo)))
+        print(f"Will verify against {len(inv_hash_configs)} inventory hash config(s): {cfgs_desc}")
+
+    if args.allow_hash_config_mismatch:
+        print("WARNING: --allow-hash-config-mismatch is deprecated and ignored. "
+              "Target hashes are now computed per-inventory config, so config mismatches "
+              "no longer occur.", file=sys.stderr)
 
     cache = None
     if not args.no_fingerprint_cache: cache = FingerprintCache(Path(args.fingerprint_cache).expanduser())
 
     targets: List[TargetFile] = []
+    # Maps target path -> list of (config, hash) for multi-config verification
+    target_hashes: Dict[Path, List[Tuple[InvHashConfig, str]]] = {}
     print(f"Scanning target: {target_dir}")
-    chunk_bytes = int(args.sample_chunk_mib * 1024 * 1024)
 
     for p in target_dir.rglob("*"):
         if not is_photo_like(p, exts): continue
@@ -546,20 +591,32 @@ def main() -> int:
         base, date_taken = p.name.lower(), ""
         if p.suffix.lower() in (".jpg", ".jpeg"): date_taken = get_jpeg_date_taken(p)
 
-        content_hash, hash_mode = "", "off"
-        if args.hash_mode == "compute" or (args.hash_mode == "auto" and (st.st_size in sizes_with_hashes)):
-            hash_mode = "full" if target_full_hash_needed else "sample"
-        
-        if hash_mode != "off":
-            algo = resolved_full_algo if hash_mode == "full" else resolved_sample_algo
-            c_chunks = 0 if hash_mode == "full" else args.sample_chunks
-            c_chunk_bytes = 0 if hash_mode == "full" else chunk_bytes
-            
-            if cache: content_hash = cache.get(p, st.st_size, st.st_mtime_ns, hash_mode, c_chunks, c_chunk_bytes, algo)
-            if not content_hash:
-                content_hash = compute_fullhash(p, algo) if hash_mode == "full" else compute_samplehash_v1(p, chunk_bytes, args.sample_chunks, algo)
-                if cache and content_hash: cache.set(p, st.st_size, st.st_mtime_ns, hash_mode, c_chunks, c_chunk_bytes, algo, content_hash)
-        targets.append(TargetFile(p, base, st.st_size, st.st_mtime_ns, date_taken, content_hash))
+        hashes: List[Tuple[InvHashConfig, str]] = []
+        should_hash = (args.hash_mode == "compute" or
+                       (args.hash_mode == "auto" and st.st_size in sizes_with_hashes))
+
+        if should_hash:
+            for icfg in inv_hash_configs:
+                cached_h: Optional[str] = None
+                if cache:
+                    cached_h = cache.get(p, st.st_size, st.st_mtime_ns,
+                                         icfg.mode, icfg.chunks, icfg.chunk_bytes, icfg.algo)
+                if cached_h:
+                    hashes.append((icfg, cached_h))
+                else:
+                    if icfg.mode == "full":
+                        h = compute_fullhash(p, icfg.algo)
+                    else:
+                        h = compute_samplehash_v1(p, icfg.chunk_bytes, icfg.chunks, icfg.algo)
+                    if h:
+                        hashes.append((icfg, h))
+                        if cache:
+                            cache.set(p, st.st_size, st.st_mtime_ns,
+                                      icfg.mode, icfg.chunks, icfg.chunk_bytes, icfg.algo, h)
+
+        target_hashes[p] = hashes
+        display_hash = hashes[0][1] if hashes else ""
+        targets.append(TargetFile(p, base, st.st_size, st.st_mtime_ns, date_taken, display_hash))
 
     rows_out, missing, safe_to_delete, needs_hash, no_verified_match, hash_config_mismatch_list = [], [], [], [], [], []
     verified_hash_hits = strong_hits = weak_hits = name_date_hits = name_only_hits = metadata_matched_but_not_hashed = 0
@@ -568,53 +625,35 @@ def main() -> int:
 
     for t in targets:
         match_type, safety, drives, example_paths = "missing", "missing", set(), []
-        if t.content_hash:
-            hk = (t.size, t.content_hash)
+        # Try all computed hashes (one per inventory hash config).
+        # The lookup key includes the InvHashConfig, so a match proves
+        # both content identity AND same-config family.
+        for icfg, h in target_hashes.get(t.path, []):
+            hk = (icfg, t.size, h)
             if hk in hash_drives:
-                inv_cfgs = hash_configs_per_key.get(hk, set())
-                config_match = False
-                if not inv_cfgs:
-                    if args.allow_hash_config_mismatch: config_match = True
-                else:
-                    for inv_cfg in inv_cfgs:
-                        if inv_cfg.startswith("mode=full"): config_match = True; break
-                        inv_s = parse_config_str(inv_cfg)
-                        m = True
-                        for k in ["algo", "chunks", "chunk_mib"]:
-                            if k in inv_s and k == "chunk_mib":
-                                try:
-                                    if abs(float(inv_s[k]) - args.sample_chunk_mib) > 0.001: m = False; break
-                                except ValueError: m = False; break
-                            elif k in inv_s and inv_s[k] != (resolved_sample_algo if k == "algo" else str(args.sample_chunks)):
-                                m = False; break
-                        if m: config_match = True; break
-                
-                if config_match or args.allow_hash_config_mismatch:
-                    drives, example_paths = hash_drives[hk], hash_paths.get(hk, [])
-                    match_type = safety = "verified_hash"
-                    verified_hash_hits += 1
-                else: safety = "hash_config_mismatch"
+                drives, example_paths = hash_drives[hk], hash_paths.get(hk, [])
+                match_type = safety = "verified_hash"
+                verified_hash_hits += 1
+                break
 
         if not drives:
             sk, wk = (t.basename_lower, t.size, t.date_taken), (t.basename_lower, t.size)
             if t.date_taken and sk in strong_drives:
                 drives, example_paths, match_type = strong_drives[sk], strong_paths.get(sk, []), "strong"
-                if safety in ("missing", "hash_config_mismatch"):
-                    safety = "strong_nohash_allowed" if args.allow_strong_without_hash else "strong"
+                safety = "strong_nohash_allowed" if args.allow_strong_without_hash else "strong"
                 strong_hits += 1
             elif wk in weak_drives:
                 drives, example_paths, match_type = weak_drives[wk], weak_paths.get(wk, []), "weak"
-                if safety in ("missing", "hash_config_mismatch"):
-                    safety = "weak_nohash_allowed" if args.allow_weak_without_hash else "weak"
+                safety = "weak_nohash_allowed" if args.allow_weak_without_hash else "weak"
                 weak_hits += 1
             elif t.date_taken and (t.basename_lower, t.date_taken) in name_date_drives:
                 ndk = (t.basename_lower, t.date_taken)
                 drives, example_paths, match_type = name_date_drives[ndk], name_date_paths.get(ndk, []), "name_date"
-                if safety in ("missing", "hash_config_mismatch"): safety = "name_date"
+                safety = "name_date"
                 name_date_hits += 1
             elif t.basename_lower in name_only_drives:
                 drives, example_paths, match_type = name_only_drives[t.basename_lower], name_only_paths.get(t.basename_lower, []), "name_only"
-                if safety in ("missing", "hash_config_mismatch"): safety = "name_only"
+                safety = "name_only"
                 name_only_hits += 1
 
         if not drives: missing.append(t.path); total_size_missing += t.size
@@ -623,9 +662,10 @@ def main() -> int:
         
         if not is_safe and sizes_with_hashes:
             if match_type in ("strong", "weak"):
-                if not t.content_hash: metadata_matched_but_not_hashed += 1; needs_hash.append(t.path)
-                elif safety == "hash_config_mismatch": hash_config_mismatch_list.append(t.path)
-                else: no_verified_match.append(t.path)
+                if not target_hashes.get(t.path):
+                    metadata_matched_but_not_hashed += 1; needs_hash.append(t.path)
+                else:
+                    no_verified_match.append(t.path)
 
         file_dir = t.path.parent
         if file_dir not in dir_stats: dir_stats[file_dir] = {"total": 0, "found": 0, "found_safe": 0, "size": 0, "size_safe": 0}
@@ -641,10 +681,10 @@ def main() -> int:
         w = csv.DictWriter(f, fieldnames=["target_path", "basename", "size_bytes", "date_taken", "found", "safe_to_delete", "safety", "match_type", "found_drives", "example_backup_paths", "target_hash"])
         w.writeheader(); w.writerows(rows_out)
 
-    for p, l in [(args.missing_list, missing), (args.safe_list, safe_to_delete), (args.needs_hash_list, needs_hash), (args.no_verified_match_list, no_verified_match), (args.hash_config_mismatch_list, hash_config_mismatch_list)]:
+    for p, items in [(args.missing_list, missing), (args.safe_list, safe_to_delete), (args.needs_hash_list, needs_hash), (args.no_verified_match_list, no_verified_match), (args.hash_config_mismatch_list, hash_config_mismatch_list)]:
         path = Path(p).expanduser().resolve()
         with path.open("w", encoding="utf-8") as f:
-            for item in l: f.write(str(item) + "\n")
+            for item in items: f.write(str(item) + "\n")
 
     if args.delete_script:
         ds_path = Path(args.delete_script).expanduser().resolve()

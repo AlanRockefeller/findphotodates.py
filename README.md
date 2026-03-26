@@ -115,7 +115,7 @@ Both scripts use SQLite caches to avoid repeated hashing:
 ```
 
 ### Command Line Options
-```
+```text
 usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
                         [--video] [--only-photos] [--extension EXTENSION] [--locate]
                         [--hash {sample,full,off}] [--sample-chunks INT]
@@ -158,7 +158,7 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
 ```
 
 ### Command Line Options
-```
+```text
 usage: check_photo_backups.py [-h] --target TARGET [--inventories LIST]
                              [--hash-mode {auto,compute,off}]
                              [--hash-algo {auto,blake3,blake2b,sha256}]
@@ -193,7 +193,7 @@ usage: check_photo_backups.py [-h] --target TARGET [--inventories LIST]
 ## Inventory Output Format (findphotodates.py)
 
 The script generates a TSV file with metadata headers describing the scan parameters. (Note: Columns are separated by tabs; spacing below is for display only).
-```
+```text
 # inventory_root=/Users/alan/Photos
 # hash_mode=sample
 # content_hash_format=samplehash_v1
@@ -214,7 +214,6 @@ Output lists are generated for different states:
 - `safe_to_delete.txt`: Confirmed files.
 - `needs_hash.txt`: Metadata matches that weren't hashed (rerun with `--hash-mode compute`).
 - `no_verified_match.txt`: Hashed files where the digest wasn't found in any inventory.
-- `hash_config_mismatch.txt`: Digest found but sampling parameters differed.
 
 ## Troubleshooting
 

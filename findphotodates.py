@@ -1121,7 +1121,7 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
         print(f"Searching for files in '{directory}' with extensions: {', '.join(extensions)}...")
 
     if not quiet and old_format and output.lower().endswith('.tsv'):
-        print(f"Warning: Using .tsv extension for legacy line-based format. Recommended: .txt")
+        print("Warning: Using .tsv extension for legacy line-based format. Recommended: .txt")
 
     # Load existing cache
     cache = load_cache(output, debug=debug)
@@ -1365,8 +1365,15 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
                         print(f"  File '{tsv_path}' does not appear to be a valid findphotodates inventory.")
                         return False
                     continue
-                # Data row
-                parts = line.split('\t')
+                # Data row — use csv.reader to handle quoted fields containing
+                # tabs (the writer uses csv.writer with QUOTE_MINIMAL).
+                # Pad with empty strings if row has fewer fields than
+                # TSV_COLUMNS (e.g. older inventories without content_hash).
+                parts = next(csv.reader([line], delimiter='\t'))
+                if len(parts) > len(TSV_COLUMNS):
+                    if not quiet:
+                        print(f"WARNING: Row has {len(parts)} fields, expected {len(TSV_COLUMNS)}; "
+                              f"extra fields will be dropped: {parts[0]!r}")
                 row = dict(zip(TSV_COLUMNS, parts + [''] * (len(TSV_COLUMNS) - len(parts))))
                 rows.append(row)
     except (IOError, UnicodeDecodeError) as e:
@@ -1608,7 +1615,7 @@ For more details on a specific option, you can also use:
     parser.add_argument("--sample-chunks", type=int, default=3, help="Number of sample chunks (default: 3).")
     parser.add_argument("--sample-chunk-mib", type=float, default=0.0625, help="Size of each chunk in MiB (default: 0.0625 = 64 KiB).")
     parser.add_argument("--hash-algo", choices=["blake3", "blake2b", "sha256"], help="Override hash algorithm. (Delete cache file to reclaim space if needed).")
-    parser.add_argument("--hash-cache", metavar="PATH", default=None, help=f"Path to SQLite hash cache.")
+    parser.add_argument("--hash-cache", metavar="PATH", default=None, help="Path to SQLite hash cache.")
     parser.add_argument("--no-hash-cache", action="store_true", help="Disable hash cache.")
     parser.add_argument("--hash-exts", metavar="LIST", default=None, help="Comma-separated extensions to hash.")
     parser.add_argument("--old-format", action="store_true", help="Write legacy line-based output.")

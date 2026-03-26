@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from check_photo_backups import (
+    InvHashConfig,
     SAFE_SAFETY_VALUES,
     classify_safe_to_delete,
     iter_inventory_rows,
@@ -83,7 +84,7 @@ class TestIterInventoryRows(unittest.TestCase):
         inv = _write_tsv(self.tmp, lines)
         results = list(iter_inventory_rows(inv))
         self.assertEqual(len(results), 1)
-        filepath, date, size, mtime, chash, hdrs = results[0]
+        filepath, date, size, mtime, chash, _hdrs = results[0]
         self.assertEqual(filepath, "/photos/a.jpg")
         self.assertEqual(date, "2024:01:01 12:00:00")
         self.assertEqual(size, 1234)
@@ -206,6 +207,20 @@ class TestIterInventoryRows(unittest.TestCase):
         inv = _write_tsv(self.tmp, lines)
         results = list(iter_inventory_rows(inv))
         self.assertEqual(results[0][2], 0)
+
+    def test_column_count_mismatch_skipped(self):
+        """Rows with wrong number of columns should be skipped."""
+        lines = _make_tsv_rows([
+            # Valid row (8 columns)
+            ["/photos/a.jpg", "2024:01:01 12:00:00", "1234", "1700000000000000000",
+             "37.7", "-122.4", "", "abcdef01"],
+        ])
+        # Append a malformed row with only 3 columns
+        lines.append("/photos/bad.jpg\t2024:01:01\t999")
+        inv = _write_tsv(self.tmp, lines)
+        results = list(iter_inventory_rows(inv, debug=True))
+        self.assertEqual(len(results), 1, "Malformed row should be skipped")
+        self.assertEqual(results[0][0], "/photos/a.jpg")
 
     def test_uppercase_hex_hash_accepted(self):
         """Uppercase hex hashes should be accepted."""
@@ -373,57 +388,42 @@ class TestAddHashesHeaderValidation(unittest.TestCase):
 # ===========================================================================
 
 class TestSafeToDeleteIntegration(unittest.TestCase):
-    """Verify that the full matching logic produces correct safety values.
+    """Verify that the matching logic produces correct safety values.
 
-    These tests exercise the matching pipeline by building in-memory lookup dicts
-    (the same structures main() builds) and simulating the classification.
+    These tests use config-keyed hash_drives — the same structure main() builds —
+    so they exercise the real proof chain: a verified_hash requires that both the
+    InvHashConfig and digest match.
     """
 
-    def _classify(self, target_hash, target_size, target_name, target_date,
+    # Two distinct configs used throughout the tests.
+    CFG_SAMPLE_B2 = InvHashConfig("sample", "blake2b", 3, 65536)
+    CFG_SAMPLE_S256 = InvHashConfig("sample", "sha256", 3, 65536)
+    CFG_FULL_S256 = InvHashConfig("full", "sha256", 0, 0)
+
+    # NOTE: This is an intentional test-only reimplementation of the matching
+    # logic from check_photo_backups.py::main().  It avoids importing heavy
+    # production dependencies (argparse, file I/O, caching) while exercising
+    # the same classification decisions.  If the production matching logic in
+    # main() changes, this helper MUST be updated to stay in sync.
+    #
+    # hash_drives is keyed by (InvHashConfig, size, hash) — same as production.
+    # target_hashes is a list of (InvHashConfig, hash) pairs — same as production.
+    def _classify(self, target_hashes, target_size, target_name, target_date,
                   hash_drives, strong_drives, weak_drives,
-                  hash_configs_per_key=None,
-                  allow_strong=False, allow_weak=False,
-                  allow_hash_config_mismatch=False,
-                  sample_chunk_mib=0.0625, sample_chunks=3, sample_algo="blake2b"):
-        """Simulate the matching logic from main()."""
+                  allow_strong=False, allow_weak=False):
+        """Simulate the matching logic from main().
+
+        target_hashes: list of (InvHashConfig, hash_str) pairs.
+        hash_drives:   dict keyed by (InvHashConfig, size, hash) -> set of drives.
+        """
         match_type, safety, drives = "missing", "missing", set()
 
-        if target_hash:
-            hk = (target_size, target_hash)
+        for icfg, h in target_hashes:
+            hk = (icfg, target_size, h)
             if hk in hash_drives:
-                inv_cfgs = (hash_configs_per_key or {}).get(hk, set())
-                config_match = False
-                if not inv_cfgs:
-                    if allow_hash_config_mismatch:
-                        config_match = True
-                else:
-                    for inv_cfg in inv_cfgs:
-                        if inv_cfg.startswith("mode=full"):
-                            config_match = True
-                            break
-                        inv_s = parse_config_str(inv_cfg)
-                        m = True
-                        for k in ["algo", "chunks", "chunk_mib"]:
-                            if k in inv_s and k == "chunk_mib":
-                                try:
-                                    if abs(float(inv_s[k]) - sample_chunk_mib) > 0.001:
-                                        m = False
-                                        break
-                                except ValueError:
-                                    m = False
-                                    break
-                            elif k in inv_s and inv_s[k] != (sample_algo if k == "algo" else str(sample_chunks)):
-                                m = False
-                                break
-                        if m:
-                            config_match = True
-                            break
-
-                if config_match or allow_hash_config_mismatch:
-                    drives = hash_drives[hk]
-                    match_type = safety = "verified_hash"
-                else:
-                    safety = "hash_config_mismatch"
+                drives = hash_drives[hk]
+                match_type = safety = "verified_hash"
+                break
 
         if not drives:
             sk = (target_name, target_size, target_date)
@@ -431,42 +431,81 @@ class TestSafeToDeleteIntegration(unittest.TestCase):
             if target_date and sk in strong_drives:
                 drives = strong_drives[sk]
                 match_type = "strong"
-                if safety in ("missing", "hash_config_mismatch"):
-                    safety = "strong_nohash_allowed" if allow_strong else "strong"
+                safety = "strong_nohash_allowed" if allow_strong else "strong"
             elif wk in weak_drives:
                 drives = weak_drives[wk]
                 match_type = "weak"
-                if safety in ("missing", "hash_config_mismatch"):
-                    safety = "weak_nohash_allowed" if allow_weak else "weak"
+                safety = "weak_nohash_allowed" if allow_weak else "weak"
 
         return safety, match_type, classify_safe_to_delete(safety)
 
-    def test_verified_hash_match(self):
-        """File with matching hash in inventory -> verified_hash -> safe."""
+    def test_verified_hash_same_config(self):
+        """Hash + same config -> verified_hash -> safe."""
+        cfg = self.CFG_SAMPLE_B2
         safety, _, safe = self._classify(
-            target_hash="aabb", target_size=1000, target_name="a.jpg", target_date="",
-            hash_drives={(1000, "aabb"): {"drive1"}},
+            target_hashes=[(cfg, "aabb")],
+            target_size=1000, target_name="a.jpg", target_date="",
+            hash_drives={(cfg, 1000, "aabb"): {"drive1"}},
             strong_drives={}, weak_drives={},
-            hash_configs_per_key={(1000, "aabb"): {"algo=blake2b chunks=3 chunk_mib=0.0625"}},
         )
         self.assertEqual(safety, "verified_hash")
         self.assertTrue(safe)
 
-    def test_hash_config_mismatch_not_safe(self):
-        """Hash matches but config differs -> hash_config_mismatch -> NOT safe."""
-        safety, _, safe = self._classify(
-            target_hash="aabb", target_size=1000, target_name="a.jpg", target_date="",
-            hash_drives={(1000, "aabb"): {"drive1"}},
-            strong_drives={}, weak_drives={},
-            hash_configs_per_key={(1000, "aabb"): {"algo=sha256 chunks=3 chunk_mib=1.0"}},
+    def test_cross_config_same_digest_rejected(self):
+        """Same digest but different config -> NOT verified_hash.
+
+        This is the critical safety test: even if two configs produce the same
+        digest string for the same file size (astronomically unlikely in practice,
+        but must be handled correctly), the config-keyed lookup must reject it.
+        """
+        inv_cfg = self.CFG_SAMPLE_B2
+        target_cfg = self.CFG_SAMPLE_S256  # different algo
+        safety, mt, safe = self._classify(
+            target_hashes=[(target_cfg, "aabb")],  # computed with sha256
+            target_size=1000, target_name="a.jpg",
+            target_date="2024:01:01 12:00:00",
+            hash_drives={(inv_cfg, 1000, "aabb"): {"drive1"}},  # stored as blake2b
+            strong_drives={("a.jpg", 1000, "2024:01:01 12:00:00"): {"drive1"}},
+            weak_drives={},
         )
-        self.assertEqual(safety, "hash_config_mismatch")
+        # Must NOT be verified_hash — different config families
+        self.assertNotEqual(safety, "verified_hash")
+        # Falls through to strong (not safe without flag)
+        self.assertEqual(safety, "strong")
+        self.assertEqual(mt, "strong")
+        self.assertFalse(safe)
+
+    def test_multi_config_correct_one_matches(self):
+        """Multiple target hashes from different configs — only same-config match."""
+        cfg_a = self.CFG_SAMPLE_B2
+        cfg_b = self.CFG_SAMPLE_S256
+        safety, _, safe = self._classify(
+            target_hashes=[(cfg_a, "xxxx"), (cfg_b, "aabb")],
+            target_size=1000, target_name="a.jpg", target_date="",
+            hash_drives={(cfg_b, 1000, "aabb"): {"drive1"}},  # only cfg_b matches
+            strong_drives={}, weak_drives={},
+        )
+        self.assertEqual(safety, "verified_hash")
+        self.assertTrue(safe)
+
+    def test_hash_no_match_falls_through(self):
+        """Target hash computed but not found in hash_drives -> falls to metadata."""
+        cfg = self.CFG_SAMPLE_B2
+        safety, _, safe = self._classify(
+            target_hashes=[(cfg, "ccdd")],
+            target_size=1000, target_name="a.jpg",
+            target_date="2024:01:01 12:00:00",
+            hash_drives={(cfg, 1000, "aabb"): {"drive1"}},
+            strong_drives={("a.jpg", 1000, "2024:01:01 12:00:00"): {"drive1"}},
+            weak_drives={},
+        )
+        self.assertEqual(safety, "strong")
         self.assertFalse(safe)
 
     def test_strong_match_not_safe_by_default(self):
         """Strong match (name+size+date) without --allow-strong -> NOT safe."""
         safety, _, safe = self._classify(
-            target_hash="", target_size=1000, target_name="a.jpg",
+            target_hashes=[], target_size=1000, target_name="a.jpg",
             target_date="2024:01:01 12:00:00",
             hash_drives={},
             strong_drives={("a.jpg", 1000, "2024:01:01 12:00:00"): {"drive1"}},
@@ -478,7 +517,7 @@ class TestSafeToDeleteIntegration(unittest.TestCase):
     def test_strong_match_safe_with_flag(self):
         """Strong match + --allow-strong-without-hash -> safe."""
         safety, _, safe = self._classify(
-            target_hash="", target_size=1000, target_name="a.jpg",
+            target_hashes=[], target_size=1000, target_name="a.jpg",
             target_date="2024:01:01 12:00:00",
             hash_drives={},
             strong_drives={("a.jpg", 1000, "2024:01:01 12:00:00"): {"drive1"}},
@@ -491,7 +530,7 @@ class TestSafeToDeleteIntegration(unittest.TestCase):
     def test_weak_match_not_safe_by_default(self):
         """Weak match (name+size) -> NOT safe without flag."""
         safety, _, safe = self._classify(
-            target_hash="", target_size=1000, target_name="a.jpg", target_date="",
+            target_hashes=[], target_size=1000, target_name="a.jpg", target_date="",
             hash_drives={},
             strong_drives={},
             weak_drives={("a.jpg", 1000): {"drive1"}},
@@ -502,7 +541,7 @@ class TestSafeToDeleteIntegration(unittest.TestCase):
     def test_weak_match_safe_with_flag(self):
         """Weak match + --allow-weak-without-hash -> safe."""
         safety, _, safe = self._classify(
-            target_hash="", target_size=1000, target_name="a.jpg", target_date="",
+            target_hashes=[], target_size=1000, target_name="a.jpg", target_date="",
             hash_drives={},
             strong_drives={},
             weak_drives={("a.jpg", 1000): {"drive1"}},
@@ -514,51 +553,507 @@ class TestSafeToDeleteIntegration(unittest.TestCase):
     def test_no_match_is_missing(self):
         """File not found in any inventory -> missing -> NOT safe."""
         safety, _, safe = self._classify(
-            target_hash="", target_size=1000, target_name="unknown.jpg", target_date="",
+            target_hashes=[], target_size=1000, target_name="unknown.jpg", target_date="",
             hash_drives={}, strong_drives={}, weak_drives={},
         )
         self.assertEqual(safety, "missing")
         self.assertFalse(safe)
 
-    def test_full_hash_config_always_matches(self):
-        """Inventory with mode=full config should always be considered a config match."""
+    def test_full_hash_same_config(self):
+        """Full hash match with same config -> verified_hash -> safe."""
+        cfg = self.CFG_FULL_S256
         safety, _, safe = self._classify(
-            target_hash="aabb", target_size=1000, target_name="a.jpg", target_date="",
-            hash_drives={(1000, "aabb"): {"drive1"}},
+            target_hashes=[(cfg, "aabb")],
+            target_size=1000, target_name="a.jpg", target_date="",
+            hash_drives={(cfg, 1000, "aabb"): {"drive1"}},
             strong_drives={}, weak_drives={},
-            hash_configs_per_key={(1000, "aabb"): {"mode=full algo=sha256"}},
         )
         self.assertEqual(safety, "verified_hash")
         self.assertTrue(safe)
 
-    def test_hash_mismatch_falls_through_to_strong(self):
-        """Hash config mismatch should still fall through to strong match if available."""
-        safety, mt, safe = self._classify(
-            target_hash="aabb", target_size=1000, target_name="a.jpg",
-            target_date="2024:01:01 12:00:00",
-            hash_drives={(1000, "aabb"): {"drive1"}},
-            strong_drives={("a.jpg", 1000, "2024:01:01 12:00:00"): {"drive1"}},
-            weak_drives={},
-            hash_configs_per_key={(1000, "aabb"): {"algo=sha256 chunks=3 chunk_mib=1.0"}},
-        )
-        # Should fall through: hash_config_mismatch -> try strong -> strong (not safe)
-        self.assertEqual(safety, "strong")
-        self.assertEqual(mt, "strong")
-        self.assertFalse(safe)
-
-    def test_hash_mismatch_with_allow_strong(self):
-        """Hash config mismatch + --allow-strong -> strong_nohash_allowed -> safe."""
+    def test_no_hashes_falls_through_to_strong_with_flag(self):
+        """No target hashes + --allow-strong -> strong_nohash_allowed -> safe."""
+        cfg = self.CFG_SAMPLE_B2
         safety, _, safe = self._classify(
-            target_hash="aabb", target_size=1000, target_name="a.jpg",
+            target_hashes=[],
+            target_size=1000, target_name="a.jpg",
             target_date="2024:01:01 12:00:00",
-            hash_drives={(1000, "aabb"): {"drive1"}},
+            hash_drives={(cfg, 1000, "aabb"): {"drive1"}},
             strong_drives={("a.jpg", 1000, "2024:01:01 12:00:00"): {"drive1"}},
             weak_drives={},
-            hash_configs_per_key={(1000, "aabb"): {"algo=sha256 chunks=3 chunk_mib=1.0"}},
             allow_strong=True,
         )
         self.assertEqual(safety, "strong_nohash_allowed")
         self.assertTrue(safe)
+
+
+# ===========================================================================
+# End-to-end test using real on-disk inventories and production code paths
+# ===========================================================================
+
+class TestEndToEndInventoryMatching(unittest.TestCase):
+    """Build real inventory TSVs on disk and run the production loading +
+    matching flow to verify same-config verification end-to-end."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _build_inventory(self, name, rows, hash_mode="sample", algo="blake2b",
+                         chunks=3, chunk_mib=0.0625, inventory_root="/inv"):
+        """Write a complete inventory TSV with proper headers."""
+        lines = []
+        lines.append(f"# inventory_root={inventory_root}")
+        lines.append(f"# hash_mode={hash_mode}")
+        if hash_mode == "sample":
+            lines.append("# content_hash_format=samplehash_v1")
+            lines.append(f"# samplehash_v1 algo={algo} chunks={chunks} chunk_mib={chunk_mib}")
+        elif hash_mode == "full":
+            lines.append("# content_hash_format=fullhash_v1")
+            lines.append(f"# fullhash algo={algo}")
+        lines.append("# Generated by findphotodates.py")
+        lines.append("\t".join(["filepath", "date_taken", "size_bytes", "mtime_ns",
+                                "gps_lat", "gps_lon", "location", "content_hash"]))
+        for row in rows:
+            lines.append("\t".join(str(x) for x in row))
+        p = Path(self.tmp) / name
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def _load_inventory_into_dicts(self, inv_path, resolved_sample_algo="blake2b",
+                                    resolved_full_algo="sha256",
+                                    sample_chunks=3, sample_chunk_mib=0.0625):
+        """Run the production inventory-loading code path and return the
+        resulting data structures."""
+        from check_photo_backups import (
+            InvHashConfig, iter_inventory_rows, parse_config_str,
+            resolve_inventory_display_path, drive_label_from_inventory_filename,
+        )
+        hash_drives = {}
+        hash_paths = {}
+        strong_drives = {}
+        weak_drives = {}
+        inv_hash_configs = set()
+        sizes_with_hashes = set()
+
+        def _parse_inv_hash_config(hdrs):
+            if "samplehash_v1" in hdrs:
+                cfg = parse_config_str(hdrs["samplehash_v1"])
+                a = cfg.get("algo", resolved_sample_algo)
+                c = int(cfg.get("chunks", str(sample_chunks)))
+                cm = float(cfg.get("chunk_mib", str(sample_chunk_mib)))
+                return InvHashConfig("sample", a, c, int(cm * 1024 * 1024))
+            if "fullhash" in hdrs:
+                cfg = parse_config_str(hdrs.get("fullhash", ""))
+                a = cfg.get("algo", resolved_full_algo)
+                return InvHashConfig("full", a, 0, 0)
+            return None
+
+        drive = drive_label_from_inventory_filename(inv_path)
+        current_inv_cfg = None
+        inv_headers = {}
+
+        for filepath, date_taken, size_bytes, _mtime_ns, content_hash, headers in iter_inventory_rows(inv_path):
+            inv_headers = headers
+            if current_inv_cfg is None:
+                current_inv_cfg = _parse_inv_hash_config(headers)
+
+            base = os.path.basename(filepath).lower()
+            if not base:
+                continue
+            if date_taken and size_bytes is not None:
+                sk = (base, size_bytes, date_taken)
+                strong_drives.setdefault(sk, set()).add(drive)
+            if size_bytes is not None:
+                wk = (base, size_bytes)
+                weak_drives.setdefault(wk, set()).add(drive)
+                if content_hash and current_inv_cfg is not None:
+                    sizes_with_hashes.add(size_bytes)
+                    hk = (current_inv_cfg, size_bytes, content_hash)
+                    hash_drives.setdefault(hk, set()).add(drive)
+
+        if current_inv_cfg is not None:
+            inv_hash_configs.add(current_inv_cfg)
+
+        return hash_drives, strong_drives, weak_drives, inv_hash_configs, sizes_with_hashes
+
+    def test_same_config_verified(self):
+        """Inventory with blake2b sample hash — target computed with same config — verified."""
+        inv = self._build_inventory("drive1_inv.tsv", [
+            ["/inv/photo.jpg", "2024:01:01 12:00:00", 5000, 1700000000000000000,
+             "", "", "", "aabbccdd"],
+        ], algo="blake2b")
+
+        hd, sd, wd, cfgs, _ = self._load_inventory_into_dicts(inv)
+
+        # Simulate target hash computed with the same config
+        self.assertEqual(len(cfgs), 1)
+        cfg = next(iter(cfgs))
+        self.assertEqual(cfg.algo, "blake2b")
+
+        # Target hash matches
+        hk = (cfg, 5000, "aabbccdd")
+        self.assertIn(hk, hd, "Same-config hash should be in hash_drives")
+
+    def test_cross_config_not_verified(self):
+        """Inventory with blake2b — lookup with sha256 config — must NOT match."""
+        inv = self._build_inventory("drive1_inv.tsv", [
+            ["/inv/photo.jpg", "2024:01:01 12:00:00", 5000, 1700000000000000000,
+             "", "", "", "aabbccdd"],
+        ], algo="blake2b")
+
+        hd, _, _, cfgs, _ = self._load_inventory_into_dicts(inv)
+        cfg = next(iter(cfgs))
+
+        # A different config with same digest should NOT match
+        wrong_cfg = InvHashConfig("sample", "sha256", 3, 65536)
+        hk_wrong = (wrong_cfg, 5000, "aabbccdd")
+        self.assertNotIn(hk_wrong, hd,
+                         "Cross-config lookup must NOT find a match even with same digest")
+
+    def test_mixed_inventories_both_configs_loaded(self):
+        """Two inventories with different configs — both configs should be available."""
+        inv_a = self._build_inventory("a_inv.tsv", [
+            ["/inv/photo.jpg", "", 5000, 170000, "", "", "", "aaaa"],
+        ], algo="blake2b")
+        inv_b = self._build_inventory("b_inv.tsv", [
+            ["/inv/photo.jpg", "", 5000, 170000, "", "", "", "bbbb"],
+        ], algo="sha256")
+
+        hd_a, _, _, cfgs_a, _ = self._load_inventory_into_dicts(inv_a)
+        hd_b, _, _, cfgs_b, _ = self._load_inventory_into_dicts(inv_b)
+
+        # Merge (as main() does across inventories)
+        all_cfgs = cfgs_a | cfgs_b
+        all_hd = {**hd_a, **hd_b}
+
+        self.assertEqual(len(all_cfgs), 2, "Should have two distinct configs")
+        algos = {c.algo for c in all_cfgs}
+        self.assertEqual(algos, {"blake2b", "sha256"})
+
+        # Each config's entry is keyed correctly
+        cfg_b2 = next(c for c in all_cfgs if c.algo == "blake2b")
+        cfg_s2 = next(c for c in all_cfgs if c.algo == "sha256")
+        self.assertIn((cfg_b2, 5000, "aaaa"), all_hd)
+        self.assertIn((cfg_s2, 5000, "bbbb"), all_hd)
+        # Cross-config lookups fail
+        self.assertNotIn((cfg_s2, 5000, "aaaa"), all_hd)
+        self.assertNotIn((cfg_b2, 5000, "bbbb"), all_hd)
+
+
+# ===========================================================================
+# CLI-level integration: runs main() with real files and real inventories
+# ===========================================================================
+
+class TestCLIEndToEnd(unittest.TestCase):
+    """Run the production main() flow end-to-end.
+
+    Creates real files on disk, computes their actual hashes using production
+    hash functions, builds inventory TSVs, invokes main() via sys.argv, and
+    checks that the output files contain the expected entries.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cli_e2e_")
+        self.target_dir = os.path.join(self.tmp, "target")
+        os.makedirs(self.target_dir)
+        self.out_dir = os.path.join(self.tmp, "out")
+        os.makedirs(self.out_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _create_file(self, name, content):
+        """Create a file in target_dir with given content, return its Path and stat."""
+        p = Path(self.target_dir) / name
+        p.write_bytes(content)
+        st = p.stat()
+        return p, st.st_size, st.st_mtime_ns
+
+    def _build_inventory(self, name, rows, hash_mode="sample", algo="blake2b",
+                         chunks=3, chunk_mib=0.0625, inventory_root=None):
+        """Write a complete inventory TSV."""
+        if inventory_root is None:
+            inventory_root = self.target_dir
+        lines = [f"# inventory_root={inventory_root}"]
+        lines.append(f"# hash_mode={hash_mode}")
+        if hash_mode == "sample":
+            lines.append("# content_hash_format=samplehash_v1")
+            lines.append(f"# samplehash_v1 algo={algo} chunks={chunks} chunk_mib={chunk_mib}")
+        elif hash_mode == "full":
+            lines.append("# content_hash_format=fullhash_v1")
+            lines.append(f"# fullhash algo={algo}")
+        lines.append("# Generated by findphotodates.py")
+        lines.append("\t".join(["filepath", "date_taken", "size_bytes", "mtime_ns",
+                                "gps_lat", "gps_lon", "location", "content_hash"]))
+        for row in rows:
+            lines.append("\t".join(str(x) for x in row))
+        p = Path(self.tmp) / name
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    def _run_main(self, extra_args=None):
+        """Invoke check_photo_backups.main() with sys.argv and return exit code."""
+        import check_photo_backups
+        old_argv = sys.argv
+        try:
+            sys.argv = ["check_photo_backups.py"] + (extra_args or [])
+            return check_photo_backups.main()
+        finally:
+            sys.argv = old_argv
+
+    def _read_lines(self, filename):
+        """Read non-empty lines from an output file."""
+        p = Path(self.out_dir) / filename
+        if not p.exists():
+            return []
+        return [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def test_verified_hash_match_produces_safe(self):
+        """File whose sample hash matches same-config inventory -> safe_to_delete=yes."""
+        from check_photo_backups import compute_samplehash_v1
+
+        # Create a real file with enough content for sample hashing
+        content = b"A" * 300_000  # 300KB — enough for 3x64KB sample chunks
+        fpath, fsize, fmtime = self._create_file("photo.jpg", content)
+
+        # Compute its actual hash using the production function
+        chunk_bytes = int(0.0625 * 1024 * 1024)  # 65536
+        real_hash = compute_samplehash_v1(fpath, chunk_bytes, 3, "blake2b")
+        self.assertTrue(real_hash, "Should compute a non-empty hash")
+
+        # Build an inventory with this hash
+        inv = self._build_inventory("backup_inv.tsv", [
+            [str(fpath), "2024:01:01 12:00:00", fsize, fmtime,
+             "", "", "", real_hash],
+        ], algo="blake2b")
+
+        safe_list = os.path.join(self.out_dir, "safe.txt")
+        missing_list = os.path.join(self.out_dir, "missing.txt")
+        csv_report = os.path.join(self.out_dir, "report.csv")
+
+        self._run_main([
+            "--target", self.target_dir,
+            "--inventories", str(inv),
+            "--safe-list", safe_list,
+            "--missing-list", missing_list,
+            "--out-csv", csv_report,
+            "--needs-hash-list", os.path.join(self.out_dir, "needs.txt"),
+            "--no-verified-match-list", os.path.join(self.out_dir, "no_match.txt"),
+            "--hash-config-mismatch-list", os.path.join(self.out_dir, "mismatch.txt"),
+            "--no-fingerprint-cache",
+            "-q",
+        ])
+
+        # The file should appear in safe_to_delete
+        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(safe_lines), 1)
+        self.assertIn("photo.jpg", safe_lines[0])
+
+        # CSV should show verified_hash / safe_to_delete=yes
+        csv_lines = Path(csv_report).read_text().splitlines()
+        self.assertTrue(len(csv_lines) >= 2, "CSV should have header + data row")
+        import csv as csv_mod
+        reader = csv_mod.DictReader(csv_lines)
+        rows = list(reader)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["safety"], "verified_hash")
+        self.assertEqual(rows[0]["safe_to_delete"], "yes")
+
+    def test_cross_config_hash_not_verified(self):
+        """File hashed with blake2b but inventory uses sha256 -> NOT safe (falls to metadata)."""
+        from check_photo_backups import compute_samplehash_v1
+
+        content = b"B" * 300_000
+        fpath, fsize, fmtime = self._create_file("cross.jpg", content)
+
+        # Compute hash with sha256 and put it in a blake2b-labeled inventory
+        # This simulates a real mismatch — the inventory claims blake2b but
+        # the hash was actually computed with sha256
+        sha256_hash = compute_samplehash_v1(fpath, 65536, 3, "sha256")
+        self.assertTrue(sha256_hash)
+
+        # Inventory says blake2b but contains a sha256 hash — this shouldn't
+        # verify because the target will re-hash with blake2b and get a
+        # different digest
+        inv = self._build_inventory("mismatched_inv.tsv", [
+            [str(fpath), "", fsize, fmtime, "", "", "", sha256_hash],
+        ], algo="blake2b")
+
+        safe_list = os.path.join(self.out_dir, "safe.txt")
+        csv_report = os.path.join(self.out_dir, "report.csv")
+
+        self._run_main([
+            "--target", self.target_dir,
+            "--inventories", str(inv),
+            "--safe-list", safe_list,
+            "--out-csv", csv_report,
+            "--missing-list", os.path.join(self.out_dir, "missing.txt"),
+            "--needs-hash-list", os.path.join(self.out_dir, "needs.txt"),
+            "--no-verified-match-list", os.path.join(self.out_dir, "no_match.txt"),
+            "--hash-config-mismatch-list", os.path.join(self.out_dir, "mismatch.txt"),
+            "--no-fingerprint-cache",
+            "-q",
+        ])
+
+        # Should NOT be in safe list (hash mismatch, no --allow-strong flag)
+        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(safe_lines), 0, "Cross-config hash should not be safe")
+
+        # CSV should show it fell through to metadata match (strong or weak), not verified_hash
+        import csv as csv_mod
+        rows = list(csv_mod.DictReader(Path(csv_report).read_text().splitlines()))
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0]["safety"], "verified_hash",
+                           "Cross-config should never produce verified_hash")
+
+    def test_mixed_config_inventories(self):
+        """Two inventories with different hash configs — only same-config match is safe."""
+        from check_photo_backups import compute_samplehash_v1
+
+        content_a = b"C" * 300_000
+        content_b = b"D" * 300_000
+        fpath_a, fsize_a, fmtime_a = self._create_file("matched.jpg", content_a)
+        fpath_b, fsize_b, fmtime_b = self._create_file("unmatched.jpg", content_b)
+
+        # Compute correct hashes
+        hash_a_b2 = compute_samplehash_v1(fpath_a, 65536, 3, "blake2b")
+        hash_b_s256 = compute_samplehash_v1(fpath_b, 65536, 3, "sha256")
+
+        # Inventory 1: blake2b, has file A with correct hash
+        inv1 = self._build_inventory("inv_blake2b.tsv", [
+            [str(fpath_a), "2024:01:01", fsize_a, fmtime_a, "", "", "", hash_a_b2],
+        ], algo="blake2b")
+
+        # Inventory 2: sha256, has file B with correct hash BUT stored under
+        # sha256 config. File A is NOT in this inventory.
+        inv2 = self._build_inventory("inv_sha256.tsv", [
+            [str(fpath_b), "2024:02:02", fsize_b, fmtime_b, "", "", "", hash_b_s256],
+        ], algo="sha256")
+
+        safe_list = os.path.join(self.out_dir, "safe.txt")
+        csv_report = os.path.join(self.out_dir, "report.csv")
+
+        self._run_main([
+            "--target", self.target_dir,
+            "--inventories", f"{inv1},{inv2}",
+            "--safe-list", safe_list,
+            "--out-csv", csv_report,
+            "--missing-list", os.path.join(self.out_dir, "missing.txt"),
+            "--needs-hash-list", os.path.join(self.out_dir, "needs.txt"),
+            "--no-verified-match-list", os.path.join(self.out_dir, "no_match.txt"),
+            "--hash-config-mismatch-list", os.path.join(self.out_dir, "mismatch.txt"),
+            "--no-fingerprint-cache",
+            "-q",
+        ])
+
+        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(safe_lines), 2, "Both files should be safe (each matches its own inventory)")
+
+        # CSV should show both as verified_hash
+        import csv as csv_mod
+        rows = list(csv_mod.DictReader(Path(csv_report).read_text().splitlines()))
+        rows_by_name = {os.path.basename(r["target_path"]): r for r in rows}
+        self.assertEqual(rows_by_name["matched.jpg"]["safety"], "verified_hash")
+        self.assertEqual(rows_by_name["unmatched.jpg"]["safety"], "verified_hash")
+
+    def test_metadata_fallback_with_allow_weak(self):
+        """File without hash in inventory, matched by name+size with --allow-weak -> safe.
+
+        Uses weak match because synthetic test files have no EXIF date, so
+        the target's date_taken is "" and the strong-match branch is skipped.
+        This is the realistic path for non-JPEG or EXIF-less files.
+        """
+        content = b"E" * 5000
+        fpath, fsize, fmtime = self._create_file("meta.jpg", content)
+
+        # Inventory with no hash (hash_mode=off — no samplehash header)
+        lines = [
+            f"# inventory_root={self.target_dir}",
+            "# hash_mode=off",
+            "# Generated by findphotodates.py",
+            "\t".join(["filepath", "date_taken", "size_bytes", "mtime_ns",
+                        "gps_lat", "gps_lon", "location", "content_hash"]),
+            f"{fpath}\t2024:06:15 10:30:00\t{fsize}\t{fmtime}\t\t\t\t",
+        ]
+        inv_path = Path(self.tmp) / "nohash_inv.tsv"
+        inv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        safe_list = os.path.join(self.out_dir, "safe.txt")
+        csv_report = os.path.join(self.out_dir, "report.csv")
+        common_args = [
+            "--target", self.target_dir,
+            "--inventories", str(inv_path),
+            "--safe-list", safe_list,
+            "--out-csv", csv_report,
+            "--missing-list", os.path.join(self.out_dir, "missing.txt"),
+            "--needs-hash-list", os.path.join(self.out_dir, "needs.txt"),
+            "--no-verified-match-list", os.path.join(self.out_dir, "no_match.txt"),
+            "--hash-config-mismatch-list", os.path.join(self.out_dir, "mismatch.txt"),
+            "--no-fingerprint-cache",
+            "--exts", "jpg",
+            "-q",
+        ]
+
+        # Without --allow-weak: not safe
+        self._run_main(common_args)
+
+        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(safe_lines), 0, "Without --allow-weak, metadata match is not safe")
+
+        import csv as csv_mod
+        rows = list(csv_mod.DictReader(Path(csv_report).read_text().splitlines()))
+        self.assertEqual(rows[0]["safety"], "weak", "Should be weak match (no EXIF date on target)")
+
+        # With --allow-weak: safe
+        self._run_main(common_args + ["--allow-weak-without-hash"])
+
+        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(safe_lines), 1, "With --allow-weak, metadata match should be safe")
+
+        rows = list(csv_mod.DictReader(Path(csv_report).read_text().splitlines()))
+        self.assertEqual(rows[0]["safety"], "weak_nohash_allowed")
+
+    def test_output_files_populated(self):
+        """Verify that missing files appear in the missing list and delete script works."""
+        # Create a file with no inventory match at all
+        content = b"Z" * 1000
+        self._create_file("orphan.jpg", content)
+
+        # Empty inventory (valid format but no matching entries)
+        inv = self._build_inventory("empty_inv.tsv", [], algo="blake2b")
+
+        safe_list = os.path.join(self.out_dir, "safe.txt")
+        missing_list = os.path.join(self.out_dir, "missing.txt")
+        delete_script = os.path.join(self.out_dir, "delete.sh")
+
+        self._run_main([
+            "--target", self.target_dir,
+            "--inventories", str(inv),
+            "--safe-list", safe_list,
+            "--missing-list", missing_list,
+            "--out-csv", os.path.join(self.out_dir, "report.csv"),
+            "--needs-hash-list", os.path.join(self.out_dir, "needs.txt"),
+            "--no-verified-match-list", os.path.join(self.out_dir, "no_match.txt"),
+            "--hash-config-mismatch-list", os.path.join(self.out_dir, "mismatch.txt"),
+            "--delete-script", delete_script,
+            "--no-fingerprint-cache",
+            "-q",
+        ])
+
+        missing_lines = [l for l in Path(missing_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(missing_lines), 1)
+        self.assertIn("orphan.jpg", missing_lines[0])
+
+        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        self.assertEqual(len(safe_lines), 0, "No matches means nothing is safe")
+
+        # Delete script should be empty (no safe files to delete)
+        ds_text = Path(delete_script).read_text()
+        self.assertIn("#!/bin/bash", ds_text)
+        self.assertNotIn("orphan.jpg", ds_text)
 
 
 if __name__ == "__main__":

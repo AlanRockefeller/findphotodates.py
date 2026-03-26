@@ -551,7 +551,7 @@ _coord_cache = {}  # (round(lat,5), round(lon,5)) -> location
 
 def geolocate(lat, lon):
     """Convert GPS coordinates to a human-readable location using Nominatim API."""
-    global _last_geolocate_time, _coord_cache
+    global _last_geolocate_time
 
     if not lat or not lon:
         return None
@@ -1315,7 +1315,7 @@ def run_scan(
 
     interrupted = False
 
-    with open(error_log_path, "w") as error_log:
+    with open(error_log_path, "w", encoding="utf-8") as error_log:
         try:
             exiftool.start()
         except FileNotFoundError:
@@ -1544,10 +1544,10 @@ def run_scan(
                 print(f"Progress saved to '{output}'.")
             except Exception as save_err:
                 print(f"WARNING: Could not save progress: {save_err}")
-            print(f"\nTo resume, run the same command again:")
+            print("\nTo resume, run the same command again:")
             print(f'  findphotodates.py --directory "{directory}" -o "{output}"')
             print(
-                f"The scan will pick up where it left off using the saved inventory as cache."
+                "The scan will pick up where it left off using the saved inventory as cache."
             )
 
         exiftool.stop()
@@ -1742,7 +1742,6 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
                 current_time = time.time()
                 if current_time - last_progress_time >= 2.0:
                     elapsed = current_time - start_time
-                    total_done = filled + skipped + errors
                     print(
                         f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]",
                         end="\r",
@@ -1861,9 +1860,9 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
         print(
             f"Saved {filled:,} hashes to '{tsv_path}'. {remaining:,} rows still need hashes."
         )
-        print(f"\nTo resume, run the same command again:")
+        print("\nTo resume, run the same command again:")
         print(f'  findphotodates.py -o "{tsv_path}" --add-hashes')
-        print(f"Already-hashed rows will be skipped automatically.")
+        print("Already-hashed rows will be skipped automatically.")
         return False
 
     if not quiet:
@@ -2213,8 +2212,6 @@ For more details on a specific option, you can also use:
 
 
 def test_date_parsing():
-    from collections import Counter, defaultdict
-
     test_photo_data = [
         (
             "/path/to/file1.jpg",

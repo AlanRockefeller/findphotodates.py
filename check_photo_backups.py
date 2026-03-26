@@ -656,24 +656,47 @@ def main() -> int:
                 safety = "name_only"
                 name_only_hits += 1
 
-        if not drives: missing.append(t.path); total_size_missing += t.size
+        if not drives:
+            missing.append(t.path)
+            total_size_missing += t.size
+
         is_safe = classify_safe_to_delete(safety)
-        if is_safe: safe_to_delete.append(t.path); total_size_safe += t.size
-        
+        if is_safe:
+            safe_to_delete.append(t.path)
+            total_size_safe += t.size
+
         if not is_safe and sizes_with_hashes:
             if match_type in ("strong", "weak"):
                 if not target_hashes.get(t.path):
-                    metadata_matched_but_not_hashed += 1; needs_hash.append(t.path)
+                    metadata_matched_but_not_hashed += 1
+                    needs_hash.append(t.path)
                 else:
                     no_verified_match.append(t.path)
 
         file_dir = t.path.parent
-        if file_dir not in dir_stats: dir_stats[file_dir] = {"total": 0, "found": 0, "found_safe": 0, "size": 0, "size_safe": 0}
-        dir_stats[file_dir]["total"] += 1; dir_stats[file_dir]["size"] += t.size
-        if drives: dir_stats[file_dir]["found"] += 1
-        if is_safe: dir_stats[file_dir]["found_safe"] += 1; dir_stats[file_dir]["size_safe"] += t.size
+        if file_dir not in dir_stats:
+            dir_stats[file_dir] = {"total": 0, "found": 0, "found_safe": 0, "size": 0, "size_safe": 0}
+        dir_stats[file_dir]["total"] += 1
+        dir_stats[file_dir]["size"] += t.size
+        if drives:
+            dir_stats[file_dir]["found"] += 1
+        if is_safe:
+            dir_stats[file_dir]["found_safe"] += 1
+            dir_stats[file_dir]["size_safe"] += t.size
 
-        rows_out.append({"target_path": str(t.path), "basename": t.basename_lower, "size_bytes": t.size, "date_taken": t.date_taken, "found": "yes" if drives else "no", "safe_to_delete": "yes" if is_safe else "no", "safety": safety, "match_type": match_type, "found_drives": ",".join(sorted(drives)), "example_backup_paths": " | ".join(example_paths[:3]), "target_hash": t.content_hash})
+        rows_out.append({
+            "target_path": str(t.path),
+            "basename": t.basename_lower,
+            "size_bytes": t.size,
+            "date_taken": t.date_taken,
+            "found": "yes" if drives else "no",
+            "safe_to_delete": "yes" if is_safe else "no",
+            "safety": safety,
+            "match_type": match_type,
+            "found_drives": ",".join(sorted(drives)),
+            "example_backup_paths": " | ".join(example_paths[:3]),
+            "target_hash": t.content_hash,
+        })
 
     if cache: cache.close()
     out_csv = Path(args.out_csv).expanduser().resolve()

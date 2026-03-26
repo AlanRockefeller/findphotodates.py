@@ -21,6 +21,7 @@ import urllib.error
 import json
 import platform
 import queue
+import signal
 import string
 import threading
 import types
@@ -1159,6 +1160,8 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
     )
     producer.start()
 
+    interrupted = False
+
     with open(error_log_path, "w") as error_log:
         try:
             exiftool.start()
@@ -1174,7 +1177,8 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
         discovery_complete = False  # local flag: have we printed the discovery-done message?
         total_files = 0             # set once discovery finishes
 
-        while True:
+        try:
+          while True:
             # --- Get next file from queue ---
             try:
                 file = file_queue.get(timeout=1.0)
@@ -1299,10 +1303,26 @@ def run_scan(directory, output, extensions, locate=False, quiet=False, debug=Fal
                           end="\r")
                 last_progress_time = current_time
 
+        except KeyboardInterrupt:
+            interrupted = True
+            print(f"\n\nInterrupted! Saving progress ({len(photo_data):,} files processed so far)...")
+            try:
+                write_dates_to_file_atomic(output, photo_data, inventory_root=inventory_root, hash_options=hash_options, old_format=old_format)
+                print(f"Progress saved to '{output}'.")
+            except Exception as save_err:
+                print(f"WARNING: Could not save progress: {save_err}")
+            print(f"\nTo resume, run the same command again:")
+            print(f"  findphotodates.py --directory \"{directory}\" -o \"{output}\"")
+            print(f"The scan will pick up where it left off using the saved inventory as cache.")
+
         exiftool.stop()
 
     # Wait for producer thread to finish (should already be done)
     producer.join(timeout=5)
+
+    if interrupted:
+        cleanup_all()
+        return False
 
     total_seen = cached_count + processed_count
     if total_seen == 0:
@@ -1374,7 +1394,7 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
                     if not quiet:
                         print(f"WARNING: Row has {len(parts)} fields, expected {len(TSV_COLUMNS)}; "
                               f"extra fields will be dropped: {parts[0]!r}")
-                row = dict(zip(TSV_COLUMNS, parts + [''] * (len(TSV_COLUMNS) - len(parts))))
+                row = dict(zip(TSV_COLUMNS, parts + [''] * (len(TSV_COLUMNS) - len(parts)), strict=False))
                 rows.append(row)
     except (IOError, UnicodeDecodeError) as e:
         print(f"Error reading '{tsv_path}': {e}")
@@ -1406,51 +1426,61 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
     filled = 0
     skipped = 0
     errors = 0
+    interrupted = False
     start_time = time.time()
     last_progress_time = start_time
 
-    for row in rows:
-        if row.get('content_hash', '').strip():
-            continue  # already has hash
+    try:
+        for row in rows:
+            if row.get('content_hash', '').strip():
+                continue  # already has hash
 
-        filepath = row.get('filepath', '')
-        if not filepath:
-            continue
+            filepath = row.get('filepath', '')
+            if not filepath:
+                continue
 
-        try:
-            key_path = os.path.realpath(filepath)
-            stat_info = os.stat(key_path)
-            size_bytes = stat_info.st_size
-            mtime_ns = stat_info.st_mtime_ns
+            try:
+                key_path = os.path.realpath(filepath)
+                stat_info = os.stat(key_path)
+                size_bytes = stat_info.st_size
+                mtime_ns = stat_info.st_mtime_ns
 
-            # Verify file hasn't changed since indexing
-            row_size = int(row.get('size_bytes', 0))
-            row_mtime = int(row.get('mtime_ns', 0))
-            if row_size != size_bytes or row_mtime != mtime_ns:
-                if debug:
-                    print(f"  Skipping (changed): {filepath}")
+                # Verify file hasn't changed since indexing
+                row_size = int(row.get('size_bytes', 0))
+                row_mtime = int(row.get('mtime_ns', 0))
+                if row_size != size_bytes or row_mtime != mtime_ns:
+                    if debug:
+                        print(f"  Skipping (changed): {filepath}")
+                    skipped += 1
+                    continue
+
+                content_hash = get_content_hash(key_path, size_bytes, mtime_ns, hash_options, hash_conn, hash_cache_pending)
+                if content_hash:
+                    row['content_hash'] = content_hash
+                    filled += 1
+                else:
+                    errors += 1
+
+            except OSError:
                 skipped += 1
                 continue
 
-            content_hash = get_content_hash(key_path, size_bytes, mtime_ns, hash_options, hash_conn, hash_cache_pending)
-            if content_hash:
-                row['content_hash'] = content_hash
-                filled += 1
-            else:
-                errors += 1
+            # Progress every 2 seconds
+            if not quiet:
+                current_time = time.time()
+                if current_time - last_progress_time >= 2.0:
+                    elapsed = current_time - start_time
+                    total_done = filled + skipped + errors
+                    print(f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]", end="\r")
+                    last_progress_time = current_time
 
-        except OSError:
-            skipped += 1
-            continue
-
-        # Progress every 2 seconds
-        if not quiet:
-            current_time = time.time()
-            if current_time - last_progress_time >= 2.0:
-                elapsed = current_time - start_time
-                total_done = filled + skipped + errors
-                print(f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]", end="\r")
-                last_progress_time = current_time
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n\nInterrupted! {filled:,} hashes computed so far.")
+        if filled > 0:
+            print("Saving partial progress...")
+        else:
+            print("No hashes were added. File unchanged.")
 
     # Commit any pending hash cache writes
     if hash_conn:
@@ -1461,14 +1491,14 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
         except Exception:
             pass
 
-    if not quiet:
+    if not interrupted and not quiet:
         elapsed = time.time() - start_time
         print(f"\n  Done: {filled:,} hashes added, {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]")
 
     if filled == 0:
-        if not quiet:
+        if not interrupted and not quiet:
             print("No hashes were added. File unchanged.")
-        return True
+        return not interrupted
 
     # Reconstruct the hash_options comment lines to reflect current settings
     # Update or add hash_mode/content_hash_format headers
@@ -1540,12 +1570,28 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
             pass
         raise
 
+    if interrupted:
+        remaining = len(need_hash) - filled - skipped - errors
+        print(f"Saved {filled:,} hashes to '{tsv_path}'. {remaining:,} rows still need hashes.")
+        print(f"\nTo resume, run the same command again:")
+        print(f"  findphotodates.py -o \"{tsv_path}\" --add-hashes")
+        print(f"Already-hashed rows will be skipped automatically.")
+        return False
+
     if not quiet:
         print(f"Updated '{tsv_path}' with {filled:,} new hashes.")
     return True
 
 
+def _sigterm_handler(signum, frame):
+    """Convert SIGTERM into KeyboardInterrupt so graceful shutdown paths are used."""
+    raise KeyboardInterrupt
+
+
 def main():
+    # Install SIGTERM handler so 'kill' triggers the same graceful shutdown as Ctrl-C.
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     if len(sys.argv) == 1:
         print("""
 Find Photo Dates - A tool to index and geolocate your media collection.
@@ -1661,10 +1707,14 @@ For more details on a specific option, you can also use:
         drive_root, path_relative = detect_drive_root(directory_abs)
         drive_hint_value = get_drive_hint(drive_root)
         
-        if args.extension: extensions_list = [args.extension.lower()]
-        elif args.video: extensions_list = sorted(list(VIDEO_EXTENSIONS))
-        elif args.only_photos: extensions_list = sorted(list(PHOTO_EXTENSIONS))
-        else: extensions_list = sorted(list(DEFAULT_EXTENSIONS))
+        if args.extension:
+            extensions_list = [args.extension.lower()]
+        elif args.video:
+            extensions_list = sorted(list(VIDEO_EXTENSIONS))
+        elif args.only_photos:
+            extensions_list = sorted(list(PHOTO_EXTENSIONS))
+        else:
+            extensions_list = sorted(list(DEFAULT_EXTENSIONS))
         
         flags = {
             "video": args.video, "only_photos": args.only_photos, "locate": args.locate,

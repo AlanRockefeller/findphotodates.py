@@ -686,7 +686,7 @@ class TestEndToEndInventoryMatching(unittest.TestCase):
              "", "", "", "aabbccdd"],
         ], algo="blake2b")
 
-        hd, sd, wd, cfgs, _ = self._load_inventory_into_dicts(inv)
+        hd, _sd, _wd, cfgs, _ = self._load_inventory_into_dicts(inv)
 
         # Simulate target hash computed with the same config
         self.assertEqual(len(cfgs), 1)
@@ -809,7 +809,7 @@ class TestCLIEndToEnd(unittest.TestCase):
         p = Path(self.out_dir) / filename
         if not p.exists():
             return []
-        return [l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return [line for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def test_verified_hash_match_produces_safe(self):
         """File whose sample hash matches same-config inventory -> safe_to_delete=yes."""
@@ -848,7 +848,7 @@ class TestCLIEndToEnd(unittest.TestCase):
         ])
 
         # The file should appear in safe_to_delete
-        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        safe_lines = [line for line in Path(safe_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(safe_lines), 1)
         self.assertIn("photo.jpg", safe_lines[0])
 
@@ -899,7 +899,7 @@ class TestCLIEndToEnd(unittest.TestCase):
         ])
 
         # Should NOT be in safe list (hash mismatch, no --allow-strong flag)
-        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        safe_lines = [line for line in Path(safe_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(safe_lines), 0, "Cross-config hash should not be safe")
 
         # CSV should show it fell through to metadata match (strong or weak), not verified_hash
@@ -949,7 +949,7 @@ class TestCLIEndToEnd(unittest.TestCase):
             "-q",
         ])
 
-        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        safe_lines = [line for line in Path(safe_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(safe_lines), 2, "Both files should be safe (each matches its own inventory)")
 
         # CSV should show both as verified_hash
@@ -1000,7 +1000,7 @@ class TestCLIEndToEnd(unittest.TestCase):
         # Without --allow-weak: not safe
         self._run_main(common_args)
 
-        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        safe_lines = [line for line in Path(safe_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(safe_lines), 0, "Without --allow-weak, metadata match is not safe")
 
         import csv as csv_mod
@@ -1010,7 +1010,7 @@ class TestCLIEndToEnd(unittest.TestCase):
         # With --allow-weak: safe
         self._run_main(common_args + ["--allow-weak-without-hash"])
 
-        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        safe_lines = [line for line in Path(safe_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(safe_lines), 1, "With --allow-weak, metadata match should be safe")
 
         rows = list(csv_mod.DictReader(Path(csv_report).read_text().splitlines()))
@@ -1043,11 +1043,11 @@ class TestCLIEndToEnd(unittest.TestCase):
             "-q",
         ])
 
-        missing_lines = [l for l in Path(missing_list).read_text().splitlines() if l.strip()]
+        missing_lines = [line for line in Path(missing_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(missing_lines), 1)
         self.assertIn("orphan.jpg", missing_lines[0])
 
-        safe_lines = [l for l in Path(safe_list).read_text().splitlines() if l.strip()]
+        safe_lines = [line for line in Path(safe_list).read_text().splitlines() if line.strip()]
         self.assertEqual(len(safe_lines), 0, "No matches means nothing is safe")
 
         # Delete script should be empty (no safe files to delete)

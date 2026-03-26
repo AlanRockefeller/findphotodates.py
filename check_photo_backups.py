@@ -279,25 +279,24 @@ def compute_samplehash_v1(
 
 
 def compute_fullhash(path: Path, algo: str = "sha256") -> str:
-    """Compute full-file hash."""
-    if algo == "blake3" and _BLAKE3_AVAILABLE:
-        try:
-            with path.open("rb") as f:
-                h = blake3.blake3()
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-                return h.hexdigest()
-        except OSError:
-            return ""
-    else:
-        try:
+    """Compute full-file hash. algo is 'blake3', 'blake2b', or 'sha256'."""
+    try:
+        if algo == "blake3" and _BLAKE3_AVAILABLE:
+            h = blake3.blake3()
+        elif algo == "blake2b":
+            h = hashlib.blake2b()
+        elif algo in ("sha256", "blake3"):
+            # blake3 requested but not available — fall back to sha256
             h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except OSError:
-            return ""
+        else:
+            print(f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256", file=sys.stderr)
+            h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 class FingerprintCache:

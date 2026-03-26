@@ -193,25 +193,24 @@ def compute_samplehash_v1(path, chunk_bytes, num_chunks, algo="blake3"):
 
 
 def compute_fullhash(path, algo="blake3"):
-    """Compute full-file hash. algo is 'blake3' or 'sha256'. Returns hex digest or None."""
-    if algo == "blake3" and _BLAKE3_AVAILABLE:
-        try:
-            with open(path, "rb") as f:
-                h = blake3.blake3()
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-                return h.hexdigest()
-        except OSError:
-            return None
-    else:
-        try:
+    """Compute full-file hash. algo is 'blake3', 'blake2b', or 'sha256'. Returns hex digest or None."""
+    try:
+        if algo == "blake3" and _BLAKE3_AVAILABLE:
+            h = blake3.blake3()
+        elif algo == "blake2b":
+            h = hashlib.blake2b()
+        elif algo in ("sha256", "blake3"):
+            # blake3 requested but not available — fall back to sha256
             h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except OSError:
-            return None
+        else:
+            print(f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256", file=sys.stderr)
+            h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def open_sqlite_cache(cache_path, debug=False):
@@ -1635,7 +1634,7 @@ def _print_perf_summary(label, stats):
     wall = stats.get("wall_total", 0)
     if wall <= 0:
         return
-    print(f"\n--- Performance: {label} ---")
+    print(f"\n--- Observed scan timings (overlapping; not additive): {label} ---")
     items = [
         ("Cache load", stats.get("t_cache_load", 0)),
         ("File discovery", stats.get("t_discovery", 0)),
@@ -1644,11 +1643,9 @@ def _print_perf_summary(label, stats):
         ("Checkpoints", stats.get("t_checkpoints", 0)),
         ("Final write", stats.get("t_write", 0)),
     ]
-    accounted = sum(v for _, v in items)
-    items.append(("Other", max(0, wall - accounted)))
     for name, secs in items:
         pct = secs / wall * 100 if wall else 0
-        print(f"  {name:<20s} {secs:7.2f}s  ({pct:5.1f}%)")
+        print(f"  {name:<20s} {secs:7.2f}s  ({pct:5.1f}% of wall)")
     print(f"  {'Wall total':<20s} {wall:7.2f}s")
     total = stats.get("files_total", 0)
     cached = stats.get("files_cached", 0)
@@ -2270,7 +2267,7 @@ For more details on a specific option, you can also use:
 
         total_wall = sum(p["wall_total"] for _, p in all_perf) if all_perf else 0
         if len(all_perf) > 1 and (args.debugperformance or total_wall >= 3600):
-            print("\n=== Overall Performance Summary ===")
+            print("\n=== Overall scan summary ===")
             total_files = sum(p.get("files_total", 0) for _, p in all_perf)
             for label, stats in all_perf:
                 name = os.path.basename(label.rstrip("/")) or label

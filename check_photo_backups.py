@@ -617,10 +617,11 @@ def main() -> int:
                     return None
                 chunks = int(cfg.get("chunks", str(args.sample_chunks)))
                 chunk_mib = float(cfg.get("chunk_mib", str(args.sample_chunk_mib)))
-                if chunks <= 0 or chunk_mib <= 0:
+                chunk_bytes = int(chunk_mib * 1024 * 1024)
+                if chunks <= 0 or chunk_bytes <= 0:
                     print(f"WARNING: Invalid sample hash params (chunks={chunks}, chunk_mib={chunk_mib})", file=sys.stderr)
                     return None
-                return InvHashConfig("sample", algo, chunks, int(chunk_mib * 1024 * 1024))
+                return InvHashConfig("sample", algo, chunks, chunk_bytes)
             if "fullhash" in hdrs:
                 cfg = parse_config_str(hdrs.get("fullhash", ""))
                 algo = cfg.get("algo", resolved_full_algo)

@@ -1101,7 +1101,9 @@ class TestCLIEndToEnd(unittest.TestCase):
 
         # The file should appear in safe_to_delete
         safe_lines = [
-            line for line in Path(safe_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(safe_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(len(safe_lines), 1)
         self.assertIn("photo.jpg", safe_lines[0])
@@ -1169,14 +1171,20 @@ class TestCLIEndToEnd(unittest.TestCase):
 
         # Should NOT be in safe list (hash mismatch, no --allow-strong flag)
         safe_lines = [
-            line for line in Path(safe_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(safe_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(len(safe_lines), 0, "Cross-config hash should not be safe")
 
         # CSV should show it fell through to metadata match (strong or weak), not verified_hash
         import csv as csv_mod
 
-        rows = list(csv_mod.DictReader(Path(csv_report).read_text(encoding="utf-8").splitlines()))
+        rows = list(
+            csv_mod.DictReader(
+                Path(csv_report).read_text(encoding="utf-8").splitlines()
+            )
+        )
         self.assertEqual(len(rows), 1)
         self.assertNotEqual(
             rows[0]["safety"],
@@ -1252,7 +1260,9 @@ class TestCLIEndToEnd(unittest.TestCase):
         )
 
         safe_lines = [
-            line for line in Path(safe_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(safe_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(
             len(safe_lines),
@@ -1263,7 +1273,11 @@ class TestCLIEndToEnd(unittest.TestCase):
         # CSV should show both as verified_hash
         import csv as csv_mod
 
-        rows = list(csv_mod.DictReader(Path(csv_report).read_text(encoding="utf-8").splitlines()))
+        rows = list(
+            csv_mod.DictReader(
+                Path(csv_report).read_text(encoding="utf-8").splitlines()
+            )
+        )
         rows_by_name = {os.path.basename(r["target_path"]): r for r in rows}
         self.assertEqual(rows_by_name["matched.jpg"]["safety"], "verified_hash")
         self.assertEqual(rows_by_name["unmatched.jpg"]["safety"], "verified_hash")
@@ -1329,7 +1343,9 @@ class TestCLIEndToEnd(unittest.TestCase):
         self._run_main(common_args)
 
         safe_lines = [
-            line for line in Path(safe_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(safe_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(
             len(safe_lines), 0, "Without --allow-weak, metadata match is not safe"
@@ -1337,7 +1353,11 @@ class TestCLIEndToEnd(unittest.TestCase):
 
         import csv as csv_mod
 
-        rows = list(csv_mod.DictReader(Path(csv_report).read_text(encoding="utf-8").splitlines()))
+        rows = list(
+            csv_mod.DictReader(
+                Path(csv_report).read_text(encoding="utf-8").splitlines()
+            )
+        )
         self.assertEqual(
             rows[0]["safety"], "weak", "Should be weak match (no EXIF date on target)"
         )
@@ -1346,13 +1366,19 @@ class TestCLIEndToEnd(unittest.TestCase):
         self._run_main(common_args + ["--allow-weak-without-hash"])
 
         safe_lines = [
-            line for line in Path(safe_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(safe_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(
             len(safe_lines), 1, "With --allow-weak, metadata match should be safe"
         )
 
-        rows = list(csv_mod.DictReader(Path(csv_report).read_text(encoding="utf-8").splitlines()))
+        rows = list(
+            csv_mod.DictReader(
+                Path(csv_report).read_text(encoding="utf-8").splitlines()
+            )
+        )
         self.assertEqual(rows[0]["safety"], "weak_nohash_allowed")
 
     def test_output_files_populated(self):
@@ -1394,13 +1420,17 @@ class TestCLIEndToEnd(unittest.TestCase):
         )
 
         missing_lines = [
-            line for line in Path(missing_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(missing_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(len(missing_lines), 1)
         self.assertIn("orphan.jpg", missing_lines[0])
 
         safe_lines = [
-            line for line in Path(safe_list).read_text(encoding="utf-8").splitlines() if line.strip()
+            line
+            for line in Path(safe_list).read_text(encoding="utf-8").splitlines()
+            if line.strip()
         ]
         self.assertEqual(len(safe_lines), 0, "No matches means nothing is safe")
 

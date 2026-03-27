@@ -289,7 +289,10 @@ def compute_fullhash(path: Path, algo: str = "sha256") -> str:
             # blake3 requested but not available — fall back to sha256
             h = hashlib.sha256()
         else:
-            print(f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256", file=sys.stderr)
+            print(
+                f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256",
+                file=sys.stderr,
+            )
             h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
@@ -613,24 +616,36 @@ def main() -> int:
                 cfg = parse_config_str(hdrs["samplehash_v1"])
                 algo = cfg.get("algo", resolved_sample_algo)
                 if algo not in _VALID_HASH_ALGOS:
-                    print(f"WARNING: Unknown hash algo {algo!r} in inventory header, skipping", file=sys.stderr)
+                    print(
+                        f"WARNING: Unknown hash algo {algo!r} in inventory header, skipping",
+                        file=sys.stderr,
+                    )
                     return None
                 chunks = int(cfg.get("chunks", str(args.sample_chunks)))
                 chunk_mib = float(cfg.get("chunk_mib", str(args.sample_chunk_mib)))
                 chunk_bytes = int(chunk_mib * 1024 * 1024)
                 if chunks <= 0 or chunk_bytes <= 0:
-                    print(f"WARNING: Invalid sample hash params (chunks={chunks}, chunk_mib={chunk_mib})", file=sys.stderr)
+                    print(
+                        f"WARNING: Invalid sample hash params (chunks={chunks}, chunk_mib={chunk_mib})",
+                        file=sys.stderr,
+                    )
                     return None
                 return InvHashConfig("sample", algo, chunks, chunk_bytes)
             if "fullhash" in hdrs:
                 cfg = parse_config_str(hdrs.get("fullhash", ""))
                 algo = cfg.get("algo", resolved_full_algo)
                 if algo not in _VALID_HASH_ALGOS:
-                    print(f"WARNING: Unknown hash algo {algo!r} in inventory header, skipping", file=sys.stderr)
+                    print(
+                        f"WARNING: Unknown hash algo {algo!r} in inventory header, skipping",
+                        file=sys.stderr,
+                    )
                     return None
                 return InvHashConfig("full", algo, 0, 0)
         except (ValueError, TypeError) as exc:
-            print(f"WARNING: Malformed hash config in inventory header: {exc}", file=sys.stderr)
+            print(
+                f"WARNING: Malformed hash config in inventory header: {exc}",
+                file=sys.stderr,
+            )
             return None
         return None
 

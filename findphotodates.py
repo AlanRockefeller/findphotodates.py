@@ -203,7 +203,10 @@ def compute_fullhash(path, algo="blake3"):
             # blake3 requested but not available — fall back to sha256
             h = hashlib.sha256()
         else:
-            print(f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256", file=sys.stderr)
+            print(
+                f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256",
+                file=sys.stderr,
+            )
             h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
@@ -1617,7 +1620,9 @@ def run_scan(
         _t_total = time.time() - _t0
         perf_stats["wall_total"] = _t_total
         perf_stats["t_cache_load"] = _t_cache_load
-        perf_stats["t_discovery"] = discovery.done_time - _t_discovery_start if discovery.done_time else 0.0
+        perf_stats["t_discovery"] = (
+            discovery.done_time - _t_discovery_start if discovery.done_time else 0.0
+        )
         perf_stats["t_exiftool"] = _t_exiftool_total
         perf_stats["t_hashing"] = _t_hashing_total
         perf_stats["t_checkpoints"] = _t_checkpoint_total
@@ -2212,7 +2217,9 @@ For more details on a specific option, you can also use:
                 old_format=args.old_format,
                 perf_stats=scan_perf,
             )
-            if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 3600):
+            if scan_perf and (
+                args.debugperformance or scan_perf.get("wall_total", 0) >= 3600
+            ):
                 _print_perf_summary(directory_abs, scan_perf)
             return
 

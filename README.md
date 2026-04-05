@@ -1,8 +1,8 @@
 # findphotodates.py
 
-**Version 1.4 (2026-03-24)** — Alan Rockefeller
+**Version 1.5 (2026-04-05)** — Alan Rockefeller
 
-A versatile Python tool for extracting and organizing dates from your media files.
+A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
 ## Table of Contents
 1. [What is this?](#what-is-this)
@@ -18,21 +18,26 @@ A versatile Python tool for extracting and organizing dates from your media file
 
 ## What is this?
 
-Ever found yourself with thousands of photos and videos scattered across your drives, wondering when they were actually taken? `findphotodates.py` is the solution. This script scans your photos and videos, extracts the dates they were created (from EXIF data), and organizes this information in a neat text file.
+`findphotodates.py` recursively indexes all files in a directory tree, producing a TSV inventory with filepath, size, mtime, and content hash for every file. For media files (photos, videos, RAW images), it also extracts EXIF creation dates and GPS coordinates via ExifTool. The result is a complete filesystem inventory that doubles as a media date catalog.
 
 ## Features
 
-- Works with common photo formats (JPG, JPEG, NEF, ORF)
-- Supports popular video formats (MP4, MOV, AVI, MKV, etc.)
+- **Indexes all file types** by default — documents, archives, media, everything
+- Extracts creation dates and GPS from media files via ExifTool (photos, videos, RAW formats)
+- Only sends ExifTool-eligible file types to ExifTool — other files get fast filesystem-only indexing
+- Works with common photo formats (JPG, JPEG, NEF, ORF, CR2, CR3, ARW, DNG, HEIC, HEIF, AVIF, and more)
+- Supports popular video formats (MP4, MOV, AVI, MKV, WMV, FLV, WEBM, M4V, 3GP, MTS, etc.)
 - Recursively searches directories
-- Extracts creation dates from EXIF data
 - Optional geolocation data extraction (when GPS coordinates are available)
-- Provides useful summaries of your media collection
+- Provides useful summaries of your collection
 - Estimates processing time for large collections
-- Creates a detailed TSV file with a list of your media and when it was created
+- Creates a detailed TSV file with a complete inventory of your files
 - **Content hashing** - Generates unique fingerprints (fast sample hash or full-file hash) for backup and deduplication safety
 - **Smart caching** - Uses filesystem metadata and a SQLite hash cache to skip re-processing unchanged files
 - Saves progress every 5 minutes or 500 files - and handles errors from disconnecting drives gracefully. Picks up where it left off.
+- **Batched ExifTool** - Queries multiple files per ExifTool round-trip for faster metadata extraction on large scans
+- **Fast directory walking** - Uses `os.scandir()` instead of `os.walk()` for faster file discovery
+- **Detailed timing breakdown** - Shows where time is actually spent (discovery, exiftool, stat, hashing, etc.)
 
 ## Requirements
 
@@ -96,11 +101,18 @@ Both scripts use SQLite caches to avoid repeated hashing:
 
 ### Basic Usage
 ```bash
-./findphotodates.py --directory "/path/to/your/media"
+# Index all files in a directory (default)
+./findphotodates.py --directory "/path/to/your/files"
+
+# Index only media files (photos + videos)
+./findphotodates.py --directory "/path/to/your/media" --only-media
 ```
 
 ### Examples
 ```bash
+# Full inventory of an external drive
+./findphotodates.py --directory "/mnt/o" -o ~/o_inventory.tsv --save
+
 # Scan for videos only
 ./findphotodates.py --video -o my_videos.tsv
 
@@ -117,8 +129,8 @@ Both scripts use SQLite caches to avoid repeated hashing:
 ### Command Line Options
 ```text
 usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
-                        [--video] [--only-photos] [--extension EXTENSION] [--locate]
-                        [--hash {sample,full,off}] [--sample-chunks INT]
+                        [--only-media] [--video] [--only-photos] [--extension EXTENSION]
+                        [--locate] [--hash {sample,full,off}] [--sample-chunks INT]
                         [--sample-chunk-mib FLOAT] [--hash-algo {blake3,blake2b,sha256}]
                         [--hash-cache PATH] [--no-hash-cache] [--hash-exts LIST]
                         [--old-format] [--save] [--scan]
@@ -130,9 +142,10 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
 | `-o`, `--output`, `--out` | Output file path (default: photo.dates.tsv or .txt) |
 | `-q`, `--quiet` | Run quietly without printing progress |
 | `--debug` | Run in debug mode with verbose output |
-| `--video` | Search for video files only |
-| `--only-photos` | Search for photo files only |
-| `--extension` | Specify a custom file extension (e.g., "cr2") |
+| `--only-media` | Index only media files (photos + videos) instead of all files |
+| `--video` | Index only video files |
+| `--only-photos` | Index only photo files |
+| `--extension` | Index only files with a specific extension (e.g., "pdf") |
 | `--locate` | Try to extract location data (if available) |
 | `--hash` | Hashing mode: `off` (default), `sample`, or `full` |
 | `--add-hashes` | Fill in missing hashes for an existing inventory TSV |

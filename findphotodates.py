@@ -388,7 +388,12 @@ def put_cached_hash(
 
 
 def get_content_hash(
-    key_path, size_bytes, mtime_ns, hash_options, hash_conn, pending_counter=None,
+    key_path,
+    size_bytes,
+    mtime_ns,
+    hash_options,
+    hash_conn,
+    pending_counter=None,
     os_path=None,
 ):
     """Return content_hash for a file: from cache or compute. Returns '' if hashing off or restricted by ext.
@@ -1937,7 +1942,9 @@ def run_scan(
         elapsed = time.time() - start_time
         # Clear \r progress line, then print clean completion summary
         print("\r\033[2K", end="")
-        print(f"Processing complete: {total_seen:,} files in {_format_duration(elapsed)}.")
+        print(
+            f"Processing complete: {total_seen:,} files in {_format_duration(elapsed)}."
+        )
 
     _tw0 = time.time()
     write_dates_to_file_atomic(
@@ -2592,7 +2599,8 @@ For more details on a specific option, you can also use:
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
-                args.debugperformance or scan_perf.get("wall_total", 0) >= 1000
+                args.debugperformance
+                or scan_perf.get("wall_total", 0) >= 1000
             ):
                 _print_perf_summary(directory_abs, scan_perf)
             return

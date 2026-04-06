@@ -54,11 +54,31 @@ EXIFTOOL_EXTENSIONS = (
     | VIDEO_EXTENSIONS
     | {
         # RAW photo formats
-        "cr2", "cr3", "arw", "dng", "rw2", "raf", "srw", "pef", "x3f",
+        "cr2",
+        "cr3",
+        "arw",
+        "dng",
+        "rw2",
+        "raf",
+        "srw",
+        "pef",
+        "x3f",
         # Other image formats that can carry EXIF
-        "tif", "tiff", "heic", "heif", "avif", "webp", "png", "jxl",
+        "tif",
+        "tiff",
+        "heic",
+        "heif",
+        "avif",
+        "webp",
+        "png",
+        "jxl",
         # Additional video containers with date metadata
-        "mts", "m2ts", "ts", "vob", "mpg", "mpeg",
+        "mts",
+        "m2ts",
+        "ts",
+        "vob",
+        "mpg",
+        "mpeg",
     }
 )
 
@@ -407,9 +427,10 @@ def is_supported_file(filename, extensions):
 def find_files(directory, extensions):
     """Recursively find all files with the specified extensions using os.scandir().
 
-    Yields (filepath, is_symlink) tuples.  The is_symlink flag tells the caller
-    whether realpath() is needed for this entry (True) or abspath() suffices (False).
-    Uses os.scandir() for speed — avoids a separate stat() per entry during walk.
+    Yields (filepath, is_symlink, size_bytes, mtime_ns) tuples.
+    For non-symlink files, size_bytes and mtime_ns come from the DirEntry stat
+    cache (no extra syscall on Linux).  For symlinks, they are None so the
+    consumer stats the resolved target itself.
 
     Symlinked directories are NOT recursed into (avoids duplicate traversal and
     infinite loops from symlink cycles).  Symlinked files are still yielded.
@@ -432,7 +453,11 @@ def find_files(directory, extensions):
                     pass
                 elif entry.is_file(follow_symlinks=True):
                     if is_supported_file(entry.name, extensions):
-                        yield entry.path, is_link
+                        if is_link:
+                            yield entry.path, True, None, None
+                        else:
+                            st = entry.stat(follow_symlinks=False)
+                            yield entry.path, False, st.st_size, st.st_mtime_ns
             except (PermissionError, OSError):
                 continue
 
@@ -457,7 +482,7 @@ class ExifToolPersistent:
         "-GPSLongitude",
     ]
     _DATE_TAG_COUNT = 3  # first 3 are date tags
-    _DATE_KEYS = ["DateTimeOriginal", "CreateDate", "MediaCreateDate"]
+    _DATE_KEYS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate")
 
     def __init__(self):
         self._proc = None
@@ -524,7 +549,7 @@ class ExifToolPersistent:
 
     def query(self, filepath):
         """Query a single file. Returns (date, gps_lat, gps_lon)."""
-        args = ["-n", "-f", "-s", "-s", "-s"] + self._TAGS + [filepath]
+        args = ["-n", "-f", "-s", "-s", "-s", *self._TAGS, filepath]
         lines = self._send_and_read(args)
         if lines is None:
             return None, None, None
@@ -544,7 +569,7 @@ class ExifToolPersistent:
         if not filepaths:
             return {}
 
-        args = ["-json", "-n", "-f"] + list(self._TAGS) + list(filepaths)
+        args = ["-json", "-n", "-f", *self._TAGS, *filepaths]
         lines = self._send_and_read(args)
 
         results = {fp: (None, None, None) for fp in filepaths}
@@ -832,8 +857,9 @@ def load_cache(output_file, debug=False):
                 filepath = row.get("filepath", "")
                 if filepath:
                     try:
-                        # Normalize to real path (follows symlinks) for cache key consistency
-                        abs_filepath = os.path.realpath(filepath)
+                        # Use abspath to match the out_path written to the TSV.
+                        # The main loop writes abspath; we read it back the same way.
+                        abs_filepath = os.path.abspath(filepath)
                         size_bytes = int(row.get("size_bytes", "0"))
                         mtime_ns = int(row.get("mtime_ns", "0"))
                         date_taken = row.get("date_taken", "") or None
@@ -957,11 +983,21 @@ def summarize_results(photo_data, file_counts, quiet, debug=False):
     dated_files = sum(1 for e in photo_data if e[1])
     print(f"Files indexed: {total_files:,} ({dated_files:,} with EXIF dates)")
 
-    # Print counts by file type
+    # Print counts by file type (top 15 by count, rest grouped as "Other")
+    # (no extension) is always shown separately if present.
     print("\nFiles by extension:")
-    for ext, count in sorted(file_counts.items()):
-        label = ext.upper() if ext else "(no extension)"
-        print(f"  {label}: {count}")
+    no_ext_count = file_counts.pop("", None)
+    sorted_exts = sorted(file_counts.items(), key=lambda x: (-x[1], x[0]))
+    top = sorted_exts[:15]
+    rest = sorted_exts[15:]
+    for ext, count in top:
+        print(f"  {ext.upper()}: {count:,}")
+    if rest:
+        other_count = sum(c for _, c in rest)
+        print(f"  Other ({len(rest)} types): {other_count:,}")
+    if no_ext_count is not None:
+        print(f"  (no extension): {no_ext_count:,}")
+        file_counts[""] = no_ext_count  # restore for downstream use
 
     # Calculate date summaries
     date_counter = Counter()
@@ -1292,12 +1328,12 @@ class _DiscoveryState:
 
     __slots__ = (
         "discovered",
-        "total",
         "done",
-        "error",
         "done_time",
-        "t_walk",
+        "error",
         "t_queue_wait",
+        "t_walk",
+        "total",
     )
 
     def __init__(self):
@@ -1313,7 +1349,11 @@ class _DiscoveryState:
 
 
 def _discovery_producer(file_queue, directory, extensions, state):
-    """Producer thread: walk directory, enqueue matching (path, is_symlink), signal done.
+    """Producer thread: walk directory, enqueue file tuples, signal done.
+
+    Each queued item is (filepath, is_symlink, size_bytes, mtime_ns).
+    For non-symlinks, size/mtime come from the scandir stat cache (free on Linux).
+    For symlinks, size/mtime are None — the consumer stats the resolved target.
 
     Measures two non-overlapping time buckets inside the loop:
       t_walk  — time spent advancing the find_files generator (scandir I/O)
@@ -1328,14 +1368,14 @@ def _discovery_producer(file_queue, directory, extensions, state):
         while True:
             tw0 = time.monotonic()
             try:
-                filepath, is_symlink = next(it)
+                item = next(it)  # (filepath, is_symlink, size_bytes, mtime_ns)
             except StopIteration:
                 t_walk += time.monotonic() - tw0
                 break
             t_walk += time.monotonic() - tw0
 
             tq0 = time.monotonic()
-            file_queue.put((filepath, is_symlink))  # blocks if queue full
+            file_queue.put(item)  # blocks if queue full
             t_queue += time.monotonic() - tq0
 
             count += 1
@@ -1622,8 +1662,9 @@ def run_scan(
                     _flush_exiftool_batch()
                     break
 
-                file, is_symlink = item
-                ext = file.rsplit(".", 1)[-1].lower() if "." in file else ""
+                file, is_symlink, prod_size, prod_mtime = item
+                basename = os.path.basename(file)
+                ext = os.path.splitext(basename)[1].lstrip(".").lower()
                 file_counts[ext] += 1
 
                 # Check if discovery just completed (for progress phase transition)
@@ -1631,25 +1672,27 @@ def run_scan(
                     discovery_complete = True
                     total_files = discovery.total
                     if not quiet:
-                        print(
-                            f"\nDiscovery complete: {total_files:,} files found.                              "
-                        )
+                        # Clear \r progress line, then print clean discovery summary
+                        print("\r\033[2K", end="")
+                        print(f"Discovery complete: {total_files:,} files found.")
 
                 try:
                     out_path = os.path.abspath(file)
-                    # Only call realpath() for symlinks; abspath suffices otherwise
                     if is_symlink:
+                        # Symlink: resolve target path and stat it
                         _tr0 = time.time()
                         key_path = os.path.realpath(out_path)
                         _t_realpath_total += time.time() - _tr0
+                        _ts0 = time.time()
+                        stat_info = os.stat(key_path)
+                        size_bytes = stat_info.st_size
+                        mtime_ns = stat_info.st_mtime_ns
+                        _t_stat_total += time.time() - _ts0
                     else:
+                        # Non-symlink: reuse producer-side metadata (no stat syscall)
                         key_path = out_path
-
-                    _ts0 = time.time()
-                    stat_info = os.stat(key_path)
-                    size_bytes = stat_info.st_size
-                    mtime_ns = stat_info.st_mtime_ns
-                    _t_stat_total += time.time() - _ts0
+                        size_bytes = prod_size
+                        mtime_ns = prod_mtime
 
                     # Check TSV cache
                     _tcl0 = time.time()
@@ -1752,8 +1795,8 @@ def run_scan(
                 # Record rate sample
                 rate_tracker.record(current_time, total_seen)
 
-                # Checkpoint every 500 files or 5 minutes
-                if total_seen % 500 == 0 or (current_time - last_save_time) > 300:
+                # Checkpoint every 15 minutes
+                if total_seen > 0 and (current_time - last_save_time) > 900:
                     _tc0 = time.time()
                     write_dates_to_file_atomic(
                         output,
@@ -1765,9 +1808,8 @@ def run_scan(
                     _t_checkpoint_total += time.time() - _tc0
                     last_save_time = current_time
                     if not quiet:
-                        print(
-                            f"\n[Checkpoint: {len(photo_data):,} files saved]", end=""
-                        )
+                        print("\r\033[2K", end="")
+                        print(f"[Checkpoint: {len(photo_data):,} files saved]")
 
                 # Progress line every 2 seconds
                 if not quiet and (current_time - last_progress_time) >= 2.0:
@@ -1834,9 +1876,9 @@ def run_scan(
 
     if not quiet:
         elapsed = time.time() - start_time
-        print(
-            f"\nProcessing complete: {total_seen:,} files in {_format_duration(elapsed)}.                              "
-        )
+        # Clear \r progress line, then print clean completion summary
+        print("\r\033[2K", end="")
+        print(f"Processing complete: {total_seen:,} files in {_format_duration(elapsed)}.")
 
     _tw0 = time.time()
     write_dates_to_file_atomic(
@@ -2272,9 +2314,7 @@ For more details on a specific option, you can also use:
         action="store_true",
         help="Index only media files (photos + videos) instead of all files.",
     )
-    parser.add_argument(
-        "--video", action="store_true", help="Index only video files."
-    )
+    parser.add_argument("--video", action="store_true", help="Index only video files.")
     parser.add_argument(
         "--only-photos", action="store_true", help="Index only photo files."
     )
@@ -2473,7 +2513,8 @@ For more details on a specific option, you can also use:
                 perf_stats=scan_perf,
             )
             if scan_perf and (
-                args.debugperformance or scan_perf.get("wall_total", 0) >= 3600
+                # Print a performance summary if the run takes more than 1000 seconds
+                args.debugperformance or scan_perf.get("wall_total", 0) >= 1000
             ):
                 _print_perf_summary(directory_abs, scan_perf)
             return
@@ -2523,8 +2564,9 @@ For more details on a specific option, you can also use:
                 )
             except Exception as e:
                 print(f"  Error: {e}")
+            # Add summary if the --debugperformance option is used, or if the run takes more than 1000 seconds
             if scan_perf:
-                if args.debugperformance or scan_perf.get("wall_total", 0) >= 3600:
+                if args.debugperformance or scan_perf.get("wall_total", 0) >= 1000:
                     _print_perf_summary(resolved_dir, scan_perf)
                 all_perf.append((resolved_dir, scan_perf))
 

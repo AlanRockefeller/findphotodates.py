@@ -100,6 +100,50 @@ DEFAULT_HASH_CACHE_DIR = Path.home() / ".cache" / "findphotodates"
 DEFAULT_HASH_CACHE_PATH = DEFAULT_HASH_CACHE_DIR / "hash_cache.sqlite"
 HASH_CACHE_BATCH_COMMIT_EVERY = 1000
 
+# ---------------------------------------------------------------------------
+# Cross-platform cache-key normalization (WSL ↔ Windows)
+# ---------------------------------------------------------------------------
+# WSL mount paths like /mnt/f/Photos and Windows paths like F:\Photos refer
+# to the same file.  We normalize both forms to a lowercase-drive forward-slash
+# canonical key so that inventories created under one environment get cache
+# hits when re-read under the other.
+#
+# Canonical form:  /mnt/<drive>/<rest-with-forward-slashes>
+#   /mnt/f/Documents/file.jpg  →  /mnt/f/Documents/file.jpg   (unchanged)
+#   F:\Documents\file.jpg      →  /mnt/f/Documents/file.jpg
+#
+# Non-drive paths (Linux home dirs, UNC paths, etc.) pass through unchanged
+# after backslash → forward-slash conversion.
+
+_WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
+_WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
+
+
+def _normalize_cache_key(path):
+    """Normalize a filepath into a cross-platform canonical cache key.
+
+    Maps Windows drive paths (F:\\...) and WSL mount paths (/mnt/f/...) to a
+    shared canonical form so the same physical file gets the same key regardless
+    of whether the inventory was created under WSL or native Windows.
+    """
+    # Normalize backslashes to forward slashes first
+    p = path.replace("\\", "/")
+
+    # Windows drive letter  →  /mnt/<lower-drive>/rest
+    m = _WIN_DRIVE_RE.match(p)
+    if m:
+        drive = m.group(1).lower()
+        rest = p[3:]  # skip  X:/
+        return f"/mnt/{drive}/{rest}"
+
+    # WSL mount  →  ensure lowercase drive letter
+    m = _WSL_MOUNT_RE.match(p)
+    if m:
+        drive = m.group(1).lower()
+        return f"/mnt/{drive}/{p[len(m.group(0)):]}"
+
+    return p
+
 
 def parse_hash_args(
     hash_mode="off",
@@ -344,14 +388,21 @@ def put_cached_hash(
 
 
 def get_content_hash(
-    key_path, size_bytes, mtime_ns, hash_options, hash_conn, pending_counter=None
+    key_path, size_bytes, mtime_ns, hash_options, hash_conn, pending_counter=None,
+    os_path=None,
 ):
-    """Return content_hash for a file: from cache or compute. Returns '' if hashing off or restricted by ext."""
+    """Return content_hash for a file: from cache or compute. Returns '' if hashing off or restricted by ext.
+
+    key_path is used for cache lookups (normalized for cross-platform reuse).
+    os_path is the actual filesystem path for reading (defaults to key_path).
+    """
     if hash_options.hash_mode == "off":
         return ""
     ext = (os.path.splitext(key_path)[1] or "").lstrip(".").lower()
     if hash_options.hash_exts is not None and ext not in hash_options.hash_exts:
         return ""
+    if os_path is None:
+        os_path = key_path
     chunk_bytes = int(hash_options.sample_chunk_mib * 1024 * 1024)
     chunk_bytes = max(1, chunk_bytes)
     if hash_options.hash_mode == "sample":
@@ -368,7 +419,7 @@ def get_content_hash(
         if cached is not None:
             return cached
         digest = compute_samplehash_v1(
-            key_path,
+            os_path,
             chunk_bytes,
             hash_options.sample_chunks,
             algo=hash_options.sample_algo,
@@ -400,7 +451,7 @@ def get_content_hash(
         )
         if cached is not None:
             return cached
-        digest = compute_fullhash(key_path, hash_options.full_algo)
+        digest = compute_fullhash(os_path, hash_options.full_algo)
         if digest and hash_conn:
             put_cached_hash(
                 hash_conn,
@@ -857,9 +908,8 @@ def load_cache(output_file, debug=False):
                 filepath = row.get("filepath", "")
                 if filepath:
                     try:
-                        # Use abspath to match the out_path written to the TSV.
-                        # The main loop writes abspath; we read it back the same way.
-                        abs_filepath = os.path.abspath(filepath)
+                        # Normalize for cross-platform cache hits (WSL ↔ Windows).
+                        abs_filepath = _normalize_cache_key(filepath)
                         size_bytes = int(row.get("size_bytes", "0"))
                         mtime_ns = int(row.get("mtime_ns", "0"))
                         date_taken = row.get("date_taken", "") or None
@@ -1582,21 +1632,25 @@ def run_scan(
         total_files = 0  # set once discovery finishes
 
         # Batch buffer for files that need exiftool queries
-        exiftool_batch = []  # list of (out_path, key_path, size_bytes, mtime_ns)
+        # Each entry: (out_path, os_path, key_path, size_bytes, mtime_ns)
+        #   out_path  — abspath written to TSV (human-visible)
+        #   os_path   — actual filesystem path for exiftool / hashing I/O
+        #   key_path  — normalized cache key for TSV cache and hash cache lookups
+        exiftool_batch = []
 
         def _flush_exiftool_batch():
             """Send accumulated files to exiftool as one batch and process results."""
             nonlocal processed_count, _t_exiftool_total, _t_hashing_total
             if not exiftool_batch:
                 return
-            key_paths = [item[1] for item in exiftool_batch]
+            os_paths = [item[1] for item in exiftool_batch]
             _te0 = time.time()
-            batch_results = exiftool.batch_query(key_paths)
+            batch_results = exiftool.batch_query(os_paths)
             _t_exiftool_total += time.time() - _te0
 
-            for out_path, key_path, size_bytes, mtime_ns in exiftool_batch:
+            for out_path, os_path, key_path, size_bytes, mtime_ns in exiftool_batch:
                 date_taken, gps_lat, gps_lon = batch_results.get(
-                    key_path, (None, None, None)
+                    os_path, (None, None, None)
                 )
                 location = None
                 if locate and gps_lat and gps_lon:
@@ -1611,6 +1665,7 @@ def run_scan(
                     hash_options,
                     hash_conn,
                     hash_cache_pending,
+                    os_path=os_path,
                 )
                 _t_hashing_total += time.time() - _th0
                 photo_data.append(
@@ -1681,16 +1736,18 @@ def run_scan(
                     if is_symlink:
                         # Symlink: resolve target path and stat it
                         _tr0 = time.time()
-                        key_path = os.path.realpath(out_path)
+                        fs_path = os.path.realpath(out_path)
                         _t_realpath_total += time.time() - _tr0
+                        key_path = _normalize_cache_key(fs_path)
                         _ts0 = time.time()
-                        stat_info = os.stat(key_path)
+                        stat_info = os.stat(fs_path)
                         size_bytes = stat_info.st_size
                         mtime_ns = stat_info.st_mtime_ns
                         _t_stat_total += time.time() - _ts0
                     else:
                         # Non-symlink: reuse producer-side metadata (no stat syscall)
-                        key_path = out_path
+                        fs_path = out_path
+                        key_path = _normalize_cache_key(out_path)
                         size_bytes = prod_size
                         mtime_ns = prod_mtime
 
@@ -1722,6 +1779,7 @@ def run_scan(
                             hash_options,
                             hash_conn,
                             hash_cache_pending,
+                            os_path=fs_path,
                         )
                         _t_hashing_total += time.time() - _th0
                         photo_data.append(
@@ -1743,7 +1801,7 @@ def run_scan(
                         # Not cached — check if exiftool-eligible
                         if ext in EXIFTOOL_EXTENSIONS:
                             exiftool_batch.append(
-                                (out_path, key_path, size_bytes, mtime_ns)
+                                (out_path, fs_path, key_path, size_bytes, mtime_ns)
                             )
                             if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
                                 _flush_exiftool_batch()
@@ -1757,6 +1815,7 @@ def run_scan(
                                 hash_options,
                                 hash_conn,
                                 hash_cache_pending,
+                                os_path=fs_path,
                             )
                             _t_hashing_total += time.time() - _th0
                             photo_data.append(
@@ -2068,8 +2127,9 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
                 continue
 
             try:
-                key_path = os.path.realpath(filepath)
-                stat_info = os.stat(key_path)
+                real_path = os.path.realpath(filepath)
+                key_path = _normalize_cache_key(real_path)
+                stat_info = os.stat(real_path)
                 size_bytes = stat_info.st_size
                 mtime_ns = stat_info.st_mtime_ns
 
@@ -2089,6 +2149,7 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
                     hash_options,
                     hash_conn,
                     hash_cache_pending,
+                    os_path=real_path,
                 )
                 if content_hash:
                     row["content_hash"] = content_hash
@@ -2240,7 +2301,9 @@ def _sigterm_handler(signum, frame):
 
 def main():
     # Install SIGTERM handler so 'kill' triggers the same graceful shutdown as Ctrl-C.
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    # SIGTERM is not available on Windows, so guard the registration.
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _sigterm_handler)
 
     if len(sys.argv) == 1:
         print(
@@ -2251,6 +2314,12 @@ Indexes all files in a directory tree and extracts EXIF creation dates and
 GPS coordinates from media files.  Non-media files are indexed with filesystem
 metadata only (size, mtime, content hash).
 
+Works on Linux, macOS, WSL, and Windows.  Inventories created under WSL can be
+reused from native Windows and vice versa — cache keys are normalized across
+path formats so reruns get cache hits regardless of environment.
+
+Requires ExifTool installed and available on PATH (run 'exiftool -ver' to check).
+
 Key Features:
   - Indexes all file types by default (use --only-media to limit to photos/videos).
   - Extracts 'Date Taken' and GPS from media files via ExifTool.
@@ -2260,6 +2329,15 @@ Key Features:
   - Can save and manage multiple scan configurations (--save, --scan).
 
 Usage: findphotodates.py [options]
+
+Examples:
+  # Linux / WSL
+  ./findphotodates.py --directory /mnt/f/Photos -o f_inventory.tsv
+  ./findphotodates.py --directory /mnt/o -o o_inventory.tsv --only-media
+
+  # Windows (PowerShell or Command Prompt)
+  python findphotodates.py --directory F:\\Photos -o f_inventory.tsv
+  python findphotodates.py --directory "O:\\" -o o_inventory.tsv --only-media
 
 Options:
   --directory DIR    The directory to search (default: current directory).

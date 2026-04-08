@@ -50,11 +50,31 @@ EXIFTOOL_EXTENSIONS = (
     | VIDEO_EXTENSIONS
     | {
         # RAW photo formats
-        "cr2", "cr3", "arw", "dng", "rw2", "raf", "srw", "pef", "x3f",
+        "cr2",
+        "cr3",
+        "arw",
+        "dng",
+        "rw2",
+        "raf",
+        "srw",
+        "pef",
+        "x3f",
         # Other image formats that can carry EXIF
-        "tif", "tiff", "heic", "heif", "avif", "webp", "png", "jxl",
+        "tif",
+        "tiff",
+        "heic",
+        "heif",
+        "avif",
+        "webp",
+        "png",
+        "jxl",
         # Additional video containers with date metadata
-        "mts", "m2ts", "ts", "vob", "mpg", "mpeg",
+        "mts",
+        "m2ts",
+        "ts",
+        "vob",
+        "mpg",
+        "mpeg",
     }
 )
 
@@ -1713,9 +1733,7 @@ def run_scan(
                     _flush_exiftool_batch()
                     if discovery.error is not None:
                         if not quiet:
-                            print(
-                                f"\nError during file discovery: {discovery.error}"
-                            )
+                            print(f"\nError during file discovery: {discovery.error}")
                     break
 
                 file, is_symlink, prod_size, prod_mtime = item

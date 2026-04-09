@@ -1735,7 +1735,7 @@ def run_scan(
                         # Producer finished and queue is drained
                         if discovery.error is not None:
                             print(f"\nError during file discovery: {discovery.error}")
-                            raise discovery.error
+                            raise discovery.error from None
                         break
                     continue
 

@@ -632,8 +632,18 @@ class ExifToolPersistent:
         args = ["-json", "-n", "-f", *self._TAGS, *filepaths]
         lines = self._send_and_read(args)
 
+        retries = 3
+        while lines is None and retries > 0:
+            import time
+            time.sleep(0.1)
+            lines = self._send_and_read(args)
+            retries -= 1
+
         results = {fp: (None, None, None) for fp in filepaths}
         if lines is None:
+            # Fallback: query one at a time
+            for fp in filepaths:
+                results[fp] = self.query(fp)
             return results
 
         # Parse the JSON array from the collected lines
@@ -1725,6 +1735,7 @@ def run_scan(
                         # Producer finished and queue is drained
                         if discovery.error is not None:
                             print(f"\nError during file discovery: {discovery.error}")
+                            raise discovery.error
                         break
                     continue
 
@@ -1734,12 +1745,12 @@ def run_scan(
                     if discovery.error is not None:
                         if not quiet:
                             print(f"\nError during file discovery: {discovery.error}")
+                        raise discovery.error
                     break
 
                 file, is_symlink, prod_size, prod_mtime = item
                 basename = os.path.basename(file)
                 ext = os.path.splitext(basename)[1].lstrip(".").lower()
-                file_counts[ext] += 1
 
                 # Check if discovery just completed (for progress phase transition)
                 if not discovery_complete and discovery.done.is_set():
@@ -1857,6 +1868,8 @@ def run_scan(
                                 )
                             )
                             processed_count += 1
+
+                    file_counts[ext] += 1
 
                 except OSError as e:
                     error_log.write(f"Warning: Could not access '{file}': {str(e)}\n")

@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.5 (2026-04-05)
+
+### Performance
+
+- **Batched ExifTool queries**: Instead of querying one file at a time, files are now sent to exiftool in batches (default 50) using `-json` output. This reduces per-file IPC overhead significantly on large scans. Tunable via `EXIFTOOL_BATCH_SIZE` constant.
+- **`os.scandir()`-based discovery**: Replaced `os.walk()` with a recursive `os.scandir()` walker. This is faster because `scandir()` returns file type info from the directory entry itself, avoiding extra `stat()` calls during the walk.
+- **Symlink-aware `realpath()` skip**: `realpath()` is now only called for symlinks (detected during `scandir()` traversal). Regular files use `os.path.abspath()` instead. On trees with few symlinks this eliminates hundreds of thousands of unnecessary syscalls.
+- **Larger discovery queue**: Queue size increased from 10K to 50K entries, reducing producer thread blocking on large scans where the consumer processes files faster than discovery can fill the queue.
+
+### Timing statistics
+
+- **Detailed timing breakdown**: The `--debugperformance` summary now reports more granular and accurately named buckets:
+  - `Inventory cache load` — time to read and parse the existing TSV
+  - `Discovery (wall)` — total producer thread lifetime
+  - `queue put-wait` — time the producer spent blocked waiting for queue space
+  - `realpath() calls` — time spent resolving symlinks only
+  - `stat() calls` — time spent in `os.stat()` on the consumer side
+  - `TSV cache lookups` — time spent checking the in-memory cache dict
+  - `ExifTool batches` — time waiting for exiftool batch responses
+  - `Content hashing`, `Checkpoints`, `Final write` — unchanged
+- The old "File discovery" label (which measured producer thread lifetime, not walk time) is renamed to "Discovery (wall)" and supplemented with the queue-wait sub-timing.
+
+### Scan model changes
+
+- **All files indexed by default**: The tool now indexes every file in the directory tree, not just media files. Non-media files get filesystem metadata (filepath, size, mtime, content hash) but skip ExifTool. Use `--only-media` to get the old behavior of indexing only photos and videos.
+- **New `--only-media` flag**: Limits indexing to photo + video extensions (JPG, JPEG, NEF, ORF, MP4, MOV, AVI, MKV, WMV, FLV, WEBM, M4V, 3GP). Equivalent to the old default behavior.
+- **ExifTool is now extension-gated**: Only files with extensions likely to contain useful EXIF dates or GPS are sent to ExifTool. The allowlist (`EXIFTOOL_EXTENSIONS`) covers common photo RAW formats (CR2, CR3, ARW, DNG, RW2, RAF, SRW, PEF, X3F), image formats with EXIF support (TIF, TIFF, HEIC, HEIF, AVIF, WEBP, PNG, JXL), and video containers (MTS, M2TS, TS, VOB, MPG, MPEG) in addition to the original photo/video sets. All other files are indexed with filesystem metadata only.
+- **Files without EXIF dates are now included in the inventory**: Previously, files where ExifTool found no date were omitted from the TSV. Now all discovered files are listed, with an empty `date_taken` field if no date was extracted. This means the inventory is a complete filesystem index.
+- **Summary updated**: The end-of-scan summary now shows total files indexed vs. files with EXIF dates, and uses a broader label when non-media files are present.
+- `--only-photos`, `--video`, and `--extension` continue to work as before but are now explicit opt-ins for narrowing the scope. The priority is: `--extension` > `--video` > `--only-photos` > `--only-media` > all files.
+
+### Compatibility
+
+- Existing inventory TSV files and SQLite hash caches remain fully compatible. Cache keys use the same path for non-symlink files (`abspath == realpath` when no symlinks are involved).
+- The `--debugperformance` flag and the automatic timing display for scans over 1 hour both use the new breakdown format.
+- Saved scan configs (`--save`/`--scan`) from v1.4 will continue to use whatever extension list was saved. New saves without a filter flag will save `extensions: null` (all files).
+
 ## v1.4 (2026-03-24)
 
 ### Performance

@@ -1,8 +1,8 @@
 # findphotodates.py
 
-**Version 1.4 (2026-03-24)** — Alan Rockefeller
+**Version 1.5 (2026-04-05)** — Alan Rockefeller
 
-A versatile Python tool for extracting and organizing dates from your media files.
+A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
 ## Table of Contents
 1. [What is this?](#what-is-this)
@@ -18,26 +18,32 @@ A versatile Python tool for extracting and organizing dates from your media file
 
 ## What is this?
 
-Ever found yourself with thousands of photos and videos scattered across your drives, wondering when they were actually taken? `findphotodates.py` is the solution. This script scans your photos and videos, extracts the dates they were created (from EXIF data), and organizes this information in a neat text file.
+`findphotodates.py` recursively indexes all files in a directory tree, producing a TSV inventory with filepath, size, mtime, and content hash for every file. For media files (photos, videos, RAW images), it also extracts EXIF creation dates and GPS coordinates via ExifTool. The result is a complete filesystem inventory that doubles as a media date catalog.
 
 ## Features
 
-- Works with common photo formats (JPG, JPEG, NEF, ORF)
-- Supports popular video formats (MP4, MOV, AVI, MKV, etc.)
+- **Indexes all file types** by default — documents, archives, media, everything
+- Extracts creation dates and GPS from media files via ExifTool (photos, videos, RAW formats)
+- Only sends ExifTool-eligible file types to ExifTool — other files get fast filesystem-only indexing
+- Works with common photo formats (JPG, JPEG, NEF, ORF, CR2, CR3, ARW, DNG, HEIC, HEIF, AVIF, and more)
+- Supports popular video formats (MP4, MOV, AVI, MKV, WMV, FLV, WEBM, M4V, 3GP, MTS, etc.)
 - Recursively searches directories
-- Extracts creation dates from EXIF data
 - Optional geolocation data extraction (when GPS coordinates are available)
-- Provides useful summaries of your media collection
+- Provides useful summaries of your collection
 - Estimates processing time for large collections
-- Creates a detailed TSV file with a list of your media and when it was created
+- Creates a detailed TSV file with a complete inventory of your files
 - **Content hashing** - Generates unique fingerprints (fast sample hash or full-file hash) for backup and deduplication safety
 - **Smart caching** - Uses filesystem metadata and a SQLite hash cache to skip re-processing unchanged files
-- Saves progress every 5 minutes or 500 files - and handles errors from disconnecting drives gracefully. Picks up where it left off.
+- **Cross-platform cache reuse** - Inventories created under WSL get cache hits when re-read from native Windows and vice versa
+- Saves progress every 15 minutes and handles errors from disconnecting drives gracefully. Picks up where it left off.
+- **Batched ExifTool** - Queries multiple files per ExifTool round-trip for faster metadata extraction on large scans
+- **Fast directory walking** - Uses `os.scandir()` instead of `os.walk()` for faster file discovery
+- **Detailed timing breakdown** - Shows where time is actually spent (discovery, exiftool, stat, hashing, etc.)
 
 ## Requirements
 
 - Python 3.x
-- **ExifTool** (required for `findphotodates.py`; must be in PATH)
+- **ExifTool** must be installed and available on your system PATH. Run `exiftool -ver` to verify. This applies on Linux, macOS, WSL, **and** native Windows.
 - (Optional) `blake3` library for significantly faster hashing (`pip install blake3`)
 - (Optional) `exifread` library for `check_photo_backups.py` JPEG date reading (`pip install exifread`)
 
@@ -45,10 +51,11 @@ Ever found yourself with thousands of photos and videos scattered across your dr
 
 1. **Install ExifTool:**
    - **macOS:** `brew install exiftool`
-   - **Ubuntu/Debian:** `sudo apt-get install libimage-exiftool-perl`
-   - **Windows:** Download from [ExifTool website](https://exiftool.org/) and add to PATH
+   - **Ubuntu/Debian / WSL:** `sudo apt-get install libimage-exiftool-perl`
+   - **Windows:** Download from [ExifTool website](https://exiftool.org/) and add to PATH. Verify with `exiftool -ver` in PowerShell or Command Prompt.
 2. **Download scripts:** Download `findphotodates.py` and `check_photo_backups.py`.
-3. **Make executable:** `chmod +x findphotodates.py check_photo_backups.py`
+3. **Make executable (Linux/macOS/WSL):** `chmod +x findphotodates.py check_photo_backups.py`
+   On Windows, run with `python findphotodates.py`.
 
 ## Content Hashing
 
@@ -66,7 +73,7 @@ Both scripts use SQLite caches to avoid repeated hashing:
 - `findphotodates.py` uses a cache at `~/.cache/findphotodates/hash_cache.sqlite` (configurable via `--hash-cache`).
 - `check_photo_backups.py` uses a cache at `~/.cache/check_photo_backups/fingerprints.sqlite` (configurable via `--fingerprint-cache`).
 
-**Tradeoff Note:** Cache keys include the absolute file path to prevent false identity carryover. This means if you move a file or change its drive mount point (e.g., changing drive letters on Windows), it must be re-hashed once. First runs on a collection will be slower while hashes are computed. SQLite caches can grow over time; simply delete the `.sqlite` file to reclaim space.
+**Tradeoff Note:** Cache keys include a normalized file path to prevent false identity carryover. WSL mount paths (`/mnt/f/...`) and Windows drive paths (`F:\...`) are normalized to the same key, so switching between WSL and native Windows does not cause cache misses. However, if you move a file to a different directory or rename it, the file must be re-hashed once. First runs on a collection will be slower while hashes are computed. SQLite caches can grow over time; simply delete the `.sqlite` file to reclaim space.
 
 ### Algorithms
 
@@ -78,17 +85,24 @@ Both scripts use SQLite caches to avoid repeated hashing:
 
 1.  **Generate Inventories:** Generate a fast inventory for each backup drive (no hashing by default).
     ```bash
-    ./findphotodates.py --directory "/Volumes/Drive1" -o Drive1_inventory.tsv
-    ./findphotodates.py --directory "/Volumes/Drive2" -o Drive2_inventory.tsv
+    # Linux / WSL
+    ./findphotodates.py --directory /mnt/f/Photos -o f_inventory.tsv
+    ./findphotodates.py --directory /mnt/o -o o_inventory.tsv
+
+    # Windows (PowerShell)
+    python findphotodates.py --directory F:\Photos -o f_inventory.tsv
+    python findphotodates.py --directory O:\ -o o_inventory.tsv
     ```
+    Inventories are cross-platform — a TSV created under WSL gets cache hits when re-read from native Windows and vice versa.
+
 2.  **Add Hashes (when needed):** Before verifying backups, add content hashes to enable verified matching.
     ```bash
-    ./findphotodates.py -o Drive1_inventory.tsv --add-hashes
-    ./findphotodates.py -o Drive2_inventory.tsv --add-hashes
+    ./findphotodates.py -o f_inventory.tsv --add-hashes
+    ./findphotodates.py -o o_inventory.tsv --add-hashes
     ```
 3.  **Verify Target Folder:** Use `check_photo_backups.py` to compare a staging area against those inventories.
     ```bash
-    ./check_photo_backups.py --target "/home/user/Staging" --inventories "Drive1_inventory.tsv,Drive2_inventory.tsv"
+    ./check_photo_backups.py --target "/home/user/Staging" --inventories "f_inventory.tsv,o_inventory.tsv"
     ```
 4.  **Review and Cleanup:** Confirmed files are listed in `safe_to_delete.txt`. You can also use the generated `delete_safe.sh` script for semi-automated removal.
 
@@ -96,11 +110,21 @@ Both scripts use SQLite caches to avoid repeated hashing:
 
 ### Basic Usage
 ```bash
-./findphotodates.py --directory "/path/to/your/media"
+# Index all files in a directory (default)
+./findphotodates.py --directory "/path/to/your/files"
+
+# Index only media files (photos + videos)
+./findphotodates.py --directory "/path/to/your/media" --only-media
 ```
 
 ### Examples
 ```bash
+# Linux / WSL — full inventory of an external drive
+./findphotodates.py --directory /mnt/o -o o_inventory.tsv --save
+
+# Windows (PowerShell) — same drive, same inventory file gets cache hits
+python findphotodates.py --directory O:\ -o o_inventory.tsv
+
 # Scan for videos only
 ./findphotodates.py --video -o my_videos.tsv
 
@@ -108,17 +132,17 @@ Both scripts use SQLite caches to avoid repeated hashing:
 ./findphotodates.py --only-photos --locate
 
 # Save a scan configuration for an external drive
-./findphotodates.py --directory "/Volumes/Backup" --save
+./findphotodates.py --directory /mnt/f -o f_inventory.tsv --save
 
 # Write legacy format output
-./findphotodates.py --directory "/Volumes/Drive1" --old-format -o Drive1_inventory.txt
+./findphotodates.py --directory /mnt/f --old-format -o f_inventory.txt
 ```
 
 ### Command Line Options
 ```text
 usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
-                        [--video] [--only-photos] [--extension EXTENSION] [--locate]
-                        [--hash {sample,full,off}] [--sample-chunks INT]
+                        [--only-media] [--video] [--only-photos] [--extension EXTENSION]
+                        [--locate] [--hash {sample,full,off}] [--sample-chunks INT]
                         [--sample-chunk-mib FLOAT] [--hash-algo {blake3,blake2b,sha256}]
                         [--hash-cache PATH] [--no-hash-cache] [--hash-exts LIST]
                         [--old-format] [--save] [--scan]
@@ -130,9 +154,10 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
 | `-o`, `--output`, `--out` | Output file path (default: photo.dates.tsv or .txt) |
 | `-q`, `--quiet` | Run quietly without printing progress |
 | `--debug` | Run in debug mode with verbose output |
-| `--video` | Search for video files only |
-| `--only-photos` | Search for photo files only |
-| `--extension` | Specify a custom file extension (e.g., "cr2") |
+| `--only-media` | Index only media files (photos + videos) instead of all files |
+| `--video` | Index only video files |
+| `--only-photos` | Index only photo files |
+| `--extension` | Index only files with a specific extension (e.g., "pdf") |
 | `--locate` | Try to extract location data (if available) |
 | `--hash` | Hashing mode: `off` (default), `sample`, or `full` |
 | `--add-hashes` | Fill in missing hashes for an existing inventory TSV |
@@ -217,10 +242,11 @@ Output lists are generated for different states:
 
 ## Troubleshooting
 
-- **ExifTool missing:** Ensure `exiftool` is in your PATH. Try running `exiftool -ver`.
+- **ExifTool missing:** Ensure `exiftool` is installed and in your PATH. Run `exiftool -ver` to check. On Windows, make sure the ExifTool directory is in your system PATH environment variable.
 - **No dates found:** Some files may lack EXIF data. The script will leave the date blank.
 - **Slow performance:** First runs compute hashes. Install the `blake3` library for best performance.
 - **Drive disconnects:** If a drive is unplugged, progress is saved. Reconnect and run again to resume.
+- **Cross-platform cache misses:** Inventory cache keys normalize WSL (`/mnt/f/...`) and Windows (`F:\...`) paths to a shared form. If you still see cache misses switching environments, ensure you are scanning the same physical drive.
 
 ## License
 

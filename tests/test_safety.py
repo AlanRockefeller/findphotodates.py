@@ -22,17 +22,25 @@ import unittest
 from pathlib import Path
 
 try:
-    from check_photo_backups import (
-        InvHashConfig,
-        SAFE_SAFETY_VALUES,
-        classify_safe_to_delete,
-        iter_inventory_rows,
-        parse_config_str,
-        resolve_inventory_display_path,
-    )
-
-    HAS_CHECK_PHOTO = True
+    import sqlite3  # noqa: F401 — check availability before importing check_photo_backups
 except ImportError:
+    sqlite3 = None
+
+if sqlite3 is not None:
+    try:
+        from check_photo_backups import (
+            InvHashConfig,
+            SAFE_SAFETY_VALUES,
+            classify_safe_to_delete,
+            iter_inventory_rows,
+            parse_config_str,
+            resolve_inventory_display_path,
+        )
+
+        HAS_CHECK_PHOTO = True
+    except ImportError:
+        raise  # let real import errors propagate
+else:
     HAS_CHECK_PHOTO = False
     InvHashConfig = lambda *a, **k: None
     SAFE_SAFETY_VALUES = []

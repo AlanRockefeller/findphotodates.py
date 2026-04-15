@@ -1828,7 +1828,7 @@ def run_scan(
 
         def _flush_exiftool_batch():
             """Send accumulated files to exiftool as one batch and process results."""
-            nonlocal processed_count, _t_exiftool_total, _t_hashing_total
+            nonlocal processed_count, _t_exiftool_total, _t_hashing_total, _t_checkpoint_total
             if not exiftool_batch:
                 return
             os_paths = [item[1] for item in exiftool_batch]

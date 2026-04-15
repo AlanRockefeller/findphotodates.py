@@ -248,7 +248,7 @@ class TestAddHashesPreservesStyle:
             "\t".join(fpd.TSV_COLUMNS),
             "C:\\Photos\\a.jpg\t2023:01:01\t100\t0\t\t\t\t",
         ]
-        with open(tsv, "w") as f:
+        with open(tsv, "w", encoding="utf-8") as f:
             for line in lines:
                 f.write(line + "\n")
         # Resolve auto -> should detect windows
@@ -263,7 +263,7 @@ class TestAddHashesPreservesStyle:
             "\t".join(fpd.TSV_COLUMNS),
             "/mnt/c/Photos/a.jpg\t2023:01:01\t100\t0\t\t\t\t",
         ]
-        with open(tsv, "w") as f:
+        with open(tsv, "w", encoding="utf-8") as f:
             for line in lines:
                 f.write(line + "\n")
         resolved = fpd.resolve_output_path_style("auto", tsv, None)
@@ -322,7 +322,7 @@ class TestOldFormat:
             old_format=True,
             path_style="windows",
         )
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             content = f.read()
         # Should produce a relative path, not a bogus absolute one
         assert content.strip().startswith("./") or content.strip().startswith("C:\\")
@@ -340,7 +340,7 @@ class TestOldFormat:
             old_format=True,
             path_style="linux",
         )
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             content = f.read()
         assert content.strip().startswith("./a.jpg:")
 
@@ -388,7 +388,7 @@ class TestCheckpointConsistency:
         )
         fpd.write_dates_to_file_atomic(out1, data, **kwargs)
         fpd.write_dates_to_file_atomic(out2, data, **kwargs)
-        with open(out1) as f1, open(out2) as f2:
+        with open(out1, encoding="utf-8") as f1, open(out2, encoding="utf-8") as f2:
             assert f1.read() == f2.read()
 
 

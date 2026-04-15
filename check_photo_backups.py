@@ -314,10 +314,10 @@ class FingerprintCache:
         if self._conn is None:
             try:
                 import sqlite3
-            except ImportError:
+            except ImportError as exc:
                 raise RuntimeError(
                     "sqlite3 is not available; use --no-fingerprint-cache"
-                )
+                ) from exc
             self._conn = sqlite3.connect(str(self.cache_path))
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")

@@ -149,10 +149,11 @@ python findphotodates.py --directory O:\ -o o_inventory.tsv
 ```text
 usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
                         [--only-media] [--video] [--only-photos] [--extension EXTENSION]
-                        [--locate] [--hash {sample,full,off}] [--sample-chunks INT]
-                        [--sample-chunk-mib FLOAT] [--hash-algo {blake3,blake2b,sha256}]
+                        [--locate] [--hash {sample,full,off}] [--add-hashes]
+                        [--sample-chunks INT] [--sample-chunk-mib FLOAT]
+                        [--hash-algo {blake3,blake2b,sha256}]
                         [--hash-cache PATH] [--no-hash-cache] [--hash-exts LIST]
-                        [--old-format] [--save] [--scan]
+                        [--old-format] [--linux] [--windows] [--save] [--scan]
 ```
 
 | Option                    | Description                                                   |

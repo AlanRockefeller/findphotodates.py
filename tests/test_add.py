@@ -22,7 +22,8 @@ def test_add_hashes():
         fname = f.name
 
     try:
-        fpd.add_hashes_to_inventory(fname, DummyArgs())
+        result = fpd.add_hashes_to_inventory(fname, DummyArgs())
+        assert result is False, "hash_mode='off' should return False (early exit)"
     finally:
         if os.path.exists(fname):
             os.unlink(fname)

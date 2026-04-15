@@ -3,6 +3,7 @@
 
 import csv
 import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -59,8 +60,12 @@ def main():
                     if ch:
                         has_hash += 1
                 elif len(parts) == 1:
-                    # old format - no size info
-                    filepath = parts[0].split(":")[0] if ":" in parts[0] else parts[0]
+                    # old format - e.g. "./foo/bar.jpg: 2016:01:03 18:03:43"
+                    m = re.match(
+                        r"^(?P<path>.+?):\s+\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}\s*$",
+                        parts[0],
+                    )
+                    filepath = m.group("path") if m else parts[0]
                     sz = 0
                 else:
                     continue

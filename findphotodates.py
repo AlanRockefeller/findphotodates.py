@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# findphotodates.py - Version 1.5 (2026-04-05) - By Alan Rockefeller
+# findphotodates.py - Version 1.5.1 (2026-04-09) - By Alan Rockefeller
 # Generates inventory TSV with filepath, date_taken, size, mtime, GPS, location, and content_hash
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
@@ -25,6 +25,7 @@ import signal
 import string
 import threading
 import types
+import unicodedata
 
 # Optional fast hash (prefer over stdlib when available)
 try:
@@ -122,6 +123,28 @@ HASH_CACHE_BATCH_COMMIT_EVERY = 1000
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 _WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
 
+_QUOTE_TABLE = str.maketrans(
+    {
+        "\u2018": "'",  # Left single quotation mark
+        "\u2019": "'",  # Right single quotation mark
+        "\u2032": "'",  # Prime
+        "\u201a": "'",  # Single low-9 quote
+        "\u0060": "'",  # Backtick
+        "\uf027": "'",  # WSL private-use single quote
+        "\u201c": '"',  # Left double quotation mark
+        "\u201d": '"',  # Right double quotation mark
+        "\u2033": '"',  # Double prime
+        "\u201e": '"',  # Double low-9 quote
+        "\u00ab": '"',  # Guillemet left
+        "\u00bb": '"',  # Guillemet right
+        "\uf022": '"',  # WSL private-use double quote mapping
+    }
+)
+# Fallback sweep: strip any other codepoints in the Private Use Area range U+F000 to U+F0FF
+for _cp in range(0xF000, 0xF100):
+    if _cp not in _QUOTE_TABLE:
+        _QUOTE_TABLE[_cp] = None
+
 
 def _normalize_cache_key(path):
     """Normalize a filepath into a cross-platform canonical cache key.
@@ -130,8 +153,14 @@ def _normalize_cache_key(path):
     shared canonical form so the same physical file gets the same key regardless
     of whether the inventory was created under WSL or native Windows.
     """
-    # Normalize backslashes to forward slashes first
-    p = path.replace("\\", "/")
+    # 1. Normalize Unicode composition
+    p = unicodedata.normalize("NFC", path)
+
+    # 2. Map known problematic quote variants and strip undefined GUI/PUA glyphs
+    p = p.translate(_QUOTE_TABLE)
+
+    # 3. Normalize backslashes to forward slashes first
+    p = p.replace("\\", "/")
 
     # Windows drive letter  →  /mnt/<lower-drive>/rest
     m = _WIN_DRIVE_RE.match(p)
@@ -144,9 +173,101 @@ def _normalize_cache_key(path):
     m = _WSL_MOUNT_RE.match(p)
     if m:
         drive = m.group(1).lower()
-        return f"/mnt/{drive}/{p[len(m.group(0)):]}"
+        return f"/mnt/{drive}/{p[len(m.group(0)) :]}"
 
     return p
+
+
+def format_path_style(path, style):
+    """Convert paths to the specified style (linux or windows)."""
+    if style == "linux":
+        path = path.replace("\\", "/")
+        m = _WIN_DRIVE_RE.match(path)
+        if m:
+            drive = m.group(1).lower()
+            rest = path[3:]
+            path = f"/mnt/{drive}/{rest}"
+    elif style == "windows":
+        m = _WSL_MOUNT_RE.match(path)
+        if m:
+            drive = m.group(1).upper()
+            rest = path[len(m.group(0)) :]
+            path = f"{drive}:\\{rest}"
+        path = path.replace("/", "\\")
+    return path
+
+
+def detect_inventory_path_style(tsv_path):
+    """Detect the path style used in an existing inventory file.
+
+    Checks the ``# inventory_root=`` comment first, then falls back to the
+    first data row's filepath column.  Returns ``"linux"``, ``"windows"``,
+    or ``None`` if the file is empty / unreadable / style cannot be determined.
+    """
+    try:
+        with open(tsv_path, "r", encoding="utf-8") as f:
+            past_header = False
+            for line in f:
+                line = line.rstrip("\n\r")
+                if not line:
+                    continue
+                if line.startswith("# inventory_root="):
+                    sample = line.split("=", 1)[1]
+                    return _detect_style_from_path(sample)
+                if line.startswith("#"):
+                    continue
+                if not past_header:
+                    # This is the TSV column header row — skip it
+                    past_header = True
+                    continue
+                # First data row — extract the filepath field
+                parts = line.split("\t", 1)
+                if parts:
+                    return _detect_style_from_path(parts[0])
+    except (IOError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def _detect_style_from_path(sample):
+    """Return ``"windows"`` or ``"linux"`` based on a single path string."""
+    if _WIN_DRIVE_RE.match(sample) or "\\" in sample:
+        return "windows"
+    if sample.startswith("/"):
+        return "linux"
+    return None
+
+
+def resolve_output_path_style(requested_style, output_file, directory):
+    """Resolve the effective path style for inventory output.
+
+    *requested_style* is ``"auto"``, ``"linux"``, or ``"windows"``.
+
+    Resolution order for ``"auto"``:
+    1. If *output_file* already exists, preserve its detected style.
+    2. If *directory* looks like a Windows path (``C:\\...``), use ``"windows"``.
+    3. If *directory* looks like a WSL mount (``/mnt/c/...``), use ``"linux"``.
+    4. Fall back to the current platform's natural style.
+    """
+    if requested_style in ("linux", "windows"):
+        return requested_style
+
+    # Auto mode — try to preserve existing inventory style
+    if output_file and os.path.exists(output_file):
+        detected = detect_inventory_path_style(output_file)
+        if detected:
+            return detected
+
+    # Infer from the scan directory
+    if directory:
+        dir_style = _detect_style_from_path(directory)
+        if dir_style:
+            return dir_style
+
+    # Platform fallback
+    if platform.system() == "Windows":
+        return "windows"
+    return "linux"
 
 
 def parse_hash_args(
@@ -317,8 +438,7 @@ def open_sqlite_cache(cache_path, debug=False):
         conn = sqlite3.connect(cache_path)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS hash_cache (
                 path TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
@@ -330,8 +450,7 @@ def open_sqlite_cache(cache_path, debug=False):
                 digest TEXT NOT NULL,
                 PRIMARY KEY (path, size_bytes, mtime_ns, hash_mode, chunk_bytes, chunks, algo)
             )
-        """
-        )
+        """)
         conn.commit()
         return conn
     except Exception as e:
@@ -635,6 +754,7 @@ class ExifToolPersistent:
         retries = 3
         while lines is None and retries > 0:
             import time
+
             time.sleep(0.1)
             lines = self._send_and_read(args)
             retries -= 1
@@ -959,7 +1079,12 @@ def load_cache(output_file, debug=False):
 
 
 def write_dates_to_file_atomic(
-    output_file, photo_data, inventory_root=None, hash_options=None, old_format=False
+    output_file,
+    photo_data,
+    inventory_root=None,
+    hash_options=None,
+    old_format=False,
+    path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
 ):
     """Write photo data to file atomically.
 
@@ -971,6 +1096,24 @@ def write_dates_to_file_atomic(
     output_dir = os.path.dirname(os.path.abspath(output_file))
     if not output_dir:
         output_dir = "."
+
+    # Compute the display-formatted inventory root once.  os.path.abspath()
+    # must be called *before* format_path_style() — calling it after would
+    # mangle cross-platform display paths (e.g. os.path.abspath("C:\\Photos")
+    # on Linux produces a bogus POSIX path).
+    display_root = None
+    local_root = None
+    if inventory_root is not None:
+        local_root = os.path.abspath(inventory_root)
+        display_root = format_path_style(local_root, path_style)
+
+    formatted_data = []
+    for row in photo_data:
+        new_row = list(row)
+        new_row[0] = format_path_style(row[0], path_style)
+        formatted_data.append(tuple(new_row))
+    photo_data = formatted_data
+
     suffix = ".txt" if old_format else ".tsv"
     fd, temp_file = tempfile.mkstemp(
         dir=output_dir, suffix=suffix, prefix=".findphotodates_"
@@ -980,23 +1123,28 @@ def write_dates_to_file_atomic(
             sorted_data = sorted(photo_data, key=lambda r: r[0])
             if old_format:
                 # OLD format: ./relative/path: YYYY:MM:DD HH:MM:SS (no hashes)
-                root = (
-                    (os.path.abspath(inventory_root) + os.sep) if inventory_root else ""
-                )
+                # Use the display-formatted root with a style-appropriate
+                # separator so that prefix stripping works correctly even
+                # when the display style differs from the host OS.
+                if display_root:
+                    sep = "\\" if path_style == "windows" else "/"
+                    root = display_root + sep
+                else:
+                    root = ""
                 for row in sorted_data:
                     filepath = row[0]
                     date_taken = (row[1] or "").strip()
                     if not date_taken:
                         continue
                     if root and filepath.startswith(root):
-                        rel = "./" + filepath[len(root) :].replace(os.sep, "/")
+                        rel = "./" + filepath[len(root) :].replace("\\", "/")
                     else:
                         rel = filepath
                     f.write(f"{rel}: {date_taken}\n")
             else:
                 # NEW format: comment block, then TSV with content_hash column
-                if inventory_root is not None:
-                    f.write(f"# inventory_root={os.path.abspath(inventory_root)}\n")
+                if display_root is not None:
+                    f.write(f"# inventory_root={display_root}\n")
                 if hash_options is not None:
                     f.write(f"# hash_mode={hash_options.hash_mode}\n")
                     if hash_options.hash_mode == "sample":
@@ -1364,7 +1512,14 @@ def _format_duration(seconds):
 
 
 def _check_drive_disconnect(
-    error, output, photo_data, inventory_root, hash_options, old_format, cleanup_fn
+    error,
+    output,
+    photo_data,
+    inventory_root,
+    hash_options,
+    old_format,
+    cleanup_fn,
+    path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
 ):
     """Check for drive disconnect errors and save progress. Returns True if disconnect detected."""
     if any(
@@ -1378,6 +1533,7 @@ def _check_drive_disconnect(
             inventory_root=inventory_root,
             hash_options=hash_options,
             old_format=old_format,
+            path_style=path_style,
         )
         print(f"Saved {len(photo_data)} files to '{output}'")
         print("Reconnect drive and run again to resume.")
@@ -1537,12 +1693,18 @@ def run_scan(
     hash_options=None,
     old_format=False,
     perf_stats=None,
+    path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
 ):
     """Run a scan on the specified directory.
 
     If perf_stats is a dict, it will be populated with detailed timing breakdowns.
     """
     _t0 = time.time()
+
+    # Resolve "auto" path style once, before any writes.
+    if path_style == "auto":
+        path_style = resolve_output_path_style("auto", output, directory)
+
     if hash_options is None:
         hash_options = parse_hash_args(quiet=quiet)
 
@@ -1707,6 +1869,21 @@ def run_scan(
                     )
                 )
                 processed_count += 1
+                if (
+                    processed_count > 0
+                    and (processed_count % HASH_CACHE_BATCH_COMMIT_EVERY == 0)
+                    and hash_options.use_hash_cache
+                ):
+                    _tw0 = time.time()
+                    write_dates_to_file_atomic(
+                        output,
+                        photo_data,
+                        inventory_root=inventory_root,
+                        hash_options=hash_options,
+                        old_format=old_format,
+                        path_style=path_style,
+                    )
+                    _t_checkpoint_total += time.time() - _tw0
             exiftool_batch.clear()
 
         try:
@@ -1881,6 +2058,7 @@ def run_scan(
                         hash_options,
                         old_format,
                         cleanup_all,
+                        path_style=path_style,
                     ):
                         exiftool.stop()
                         return False
@@ -1902,6 +2080,7 @@ def run_scan(
                         inventory_root=inventory_root,
                         hash_options=hash_options,
                         old_format=old_format,
+                        path_style=path_style,
                     )
                     _t_checkpoint_total += time.time() - _tc0
                     last_save_time = current_time
@@ -1947,6 +2126,7 @@ def run_scan(
                     inventory_root=inventory_root,
                     hash_options=hash_options,
                     old_format=old_format,
+                    path_style=path_style,
                 )
                 print(f"Progress saved to '{output}'.")
             except Exception as save_err:
@@ -1987,6 +2167,7 @@ def run_scan(
         inventory_root=inventory_root,
         hash_options=hash_options,
         old_format=old_format,
+        path_style=path_style,
     )
     _t_write = time.time() - _tw0
 
@@ -2054,7 +2235,13 @@ def _print_perf_summary(label, stats):
     print(f"  Files: {total:,} total ({cached:,} cached, {processed:,} processed)")
 
 
-def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
+def add_hashes_to_inventory(
+    tsv_path,
+    hash_options,
+    quiet=False,
+    debug=False,
+    path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
+):
     """Fill in missing content hashes for an existing inventory TSV.
 
     Reads the TSV, computes hashes for rows with blank content_hash
@@ -2249,7 +2436,12 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
     has_hash_mode = False
     has_hash_format = False
     for line in comment_lines:
-        if line.startswith("# hash_mode="):
+        if line.startswith("# inventory_root="):
+            root = line.split("=", 1)[1]
+            new_comments.append(
+                f"# inventory_root={format_path_style(root, path_style)}"
+            )
+        elif line.startswith("# hash_mode="):
             new_comments.append(f"# hash_mode={hash_options.hash_mode}")
             has_hash_mode = True
         elif line.startswith("# content_hash_format="):
@@ -2304,7 +2496,7 @@ def add_hashes_to_inventory(tsv_path, hash_options, quiet=False, debug=False):
             for row in sorted_rows:
                 writer.writerow(
                     [
-                        row.get("filepath", ""),
+                        format_path_style(row.get("filepath", ""), path_style),
                         row.get("date_taken", ""),
                         row.get("size_bytes", ""),
                         row.get("mtime_ns", ""),
@@ -2349,8 +2541,7 @@ def main():
         signal.signal(signal.SIGTERM, _sigterm_handler)
 
     if len(sys.argv) == 1:
-        print(
-            """
+        print("""
 Find Photo Dates - A filesystem inventory and media date extraction tool.
 
 Indexes all files in a directory tree and extracts EXIF creation dates and
@@ -2401,8 +2592,7 @@ Options:
 
 For more details on a specific option, you can also use:
   findphotodates.py --help
-"""
-        )
+""")
         return
 
     try:
@@ -2502,6 +2692,21 @@ For more details on a specific option, you can also use:
         action="store_true",
         help="Print a performance timing summary after each scan.",
     )
+    parser.add_argument(
+        "--linux",
+        action="store_const",
+        dest="path_style",
+        const="linux",
+        default="auto",
+        help="Force Linux-style paths (/mnt/c/...) in the output (overrides auto-detection).",
+    )
+    parser.add_argument(
+        "--windows",
+        action="store_const",
+        dest="path_style",
+        const="windows",
+        help="Force Windows-style paths (C:\\...) in the output (overrides auto-detection).",
+    )
 
     args = parser.parse_args()
     output = args.output
@@ -2530,8 +2735,13 @@ For more details on a specific option, you can also use:
 
     if args.add_hashes:
         output_abs = _expand_path(output)
+        resolved_style = resolve_output_path_style(args.path_style, output_abs, None)
         add_hashes_to_inventory(
-            output_abs, hash_options, quiet=args.quiet, debug=args.debug
+            output_abs,
+            hash_options,
+            quiet=args.quiet,
+            debug=args.debug,
+            path_style=resolved_style,
         )
         return
 
@@ -2572,6 +2782,7 @@ For more details on a specific option, you can also use:
             "no_hash_cache": args.no_hash_cache,
             "hash_exts": args.hash_exts,
             "old_format": args.old_format,
+            "path_style": args.path_style,
         }
 
         config = load_config()
@@ -2632,6 +2843,7 @@ For more details on a specific option, you can also use:
                 hash_options=hash_options,
                 old_format=args.old_format,
                 perf_stats=scan_perf,
+                path_style=args.path_style,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
@@ -2683,6 +2895,7 @@ For more details on a specific option, you can also use:
                     hash_options=scan_hash_options,
                     old_format=flags.get("old_format", False),
                     perf_stats=scan_perf,
+                    path_style=flags.get("path_style", "auto"),
                 )
             except Exception as e:
                 print(f"  Error: {e}")
@@ -2718,6 +2931,7 @@ For more details on a specific option, you can also use:
         hash_options=hash_options,
         old_format=args.old_format,
         perf_stats=scan_perf,
+        path_style=args.path_style,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)

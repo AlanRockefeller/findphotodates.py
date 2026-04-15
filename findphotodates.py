@@ -186,15 +186,47 @@ def format_path_style(path, style):
         if m:
             drive = m.group(1).lower()
             rest = path[3:]
-            path = f"/mnt/{drive}/{rest}"
+            path = f"/mnt/{drive}" + (f"/{rest}" if rest else "")
     elif style == "windows":
         m = _WSL_MOUNT_RE.match(path)
         if m:
             drive = m.group(1).upper()
             rest = path[len(m.group(0)) :]
-            path = f"{drive}:\\{rest}"
+            path = f"{drive}:\\" + rest if rest else f"{drive}:\\"
+        elif (
+            path.startswith("/mnt/")
+            and len(path) == 6
+            and path[5].isalpha()
+            and path[4] == "/"
+        ):
+            path = f"{path[5].upper()}:\\"
         path = path.replace("/", "\\")
     return path
+
+
+def _host_path_style():
+    """Return the current platform's natural path style."""
+    if platform.system() == "Windows":
+        return "windows"
+    return "linux"
+
+
+def _resolve_local_inventory_path(path):
+    """Convert a stored inventory filepath into a host-resolvable local path."""
+    if not path:
+        return path
+    return os.path.abspath(format_path_style(path, _host_path_style()))
+
+
+def _should_write_hash_batch_checkpoint(processed_count, hash_options, hash_conn):
+    """Return True when a hash-batch boundary should trigger a TSV checkpoint."""
+    return (
+        processed_count > 0
+        and (processed_count % HASH_CACHE_BATCH_COMMIT_EVERY == 0)
+        and hash_options.hash_mode != "off"
+        and hash_options.use_hash_cache
+        and hash_conn is not None
+    )
 
 
 def detect_inventory_path_style(tsv_path):
@@ -1869,10 +1901,8 @@ def run_scan(
                     )
                 )
                 processed_count += 1
-                if (
-                    processed_count > 0
-                    and (processed_count % HASH_CACHE_BATCH_COMMIT_EVERY == 0)
-                    and hash_options.use_hash_cache
+                if _should_write_hash_batch_checkpoint(
+                    processed_count, hash_options, hash_conn
                 ):
                     _tw0 = time.time()
                     write_dates_to_file_atomic(
@@ -2357,8 +2387,9 @@ def add_hashes_to_inventory(
             try:
                 # key_path from stored filepath (matches load_cache keying)
                 key_path = _normalize_cache_key(filepath)
-                # real_path for actual I/O (follows symlinks)
-                real_path = os.path.realpath(filepath)
+                # Resolve cross-platform display paths back to a local path
+                # before following symlinks for stat/hash I/O.
+                real_path = os.path.realpath(_resolve_local_inventory_path(filepath))
                 stat_info = os.stat(real_path)
                 size_bytes = stat_info.st_size
                 mtime_ns = stat_info.st_mtime_ns

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# findphotodates.py - Version 1.5.1 (2026-04-09) - By Alan Rockefeller
+# findphotodates.py - Version 1.5.1 (2026-04-15) - By Alan Rockefeller
 # Generates inventory TSV with filepath, date_taken, size, mtime, GPS, location, and content_hash
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
@@ -216,17 +216,6 @@ def _resolve_local_inventory_path(path):
     if not path:
         return path
     return os.path.abspath(format_path_style(path, _host_path_style()))
-
-
-def _should_write_hash_batch_checkpoint(processed_count, hash_options, hash_conn):
-    """Return True when a hash-batch boundary should trigger a TSV checkpoint."""
-    return (
-        processed_count > 0
-        and (processed_count % HASH_CACHE_BATCH_COMMIT_EVERY == 0)
-        and hash_options.hash_mode != "off"
-        and hash_options.use_hash_cache
-        and hash_conn is not None
-    )
 
 
 def detect_inventory_path_style(tsv_path):
@@ -785,8 +774,6 @@ class ExifToolPersistent:
 
         retries = 3
         while lines is None and retries > 0:
-            import time
-
             time.sleep(0.1)
             lines = self._send_and_read(args)
             retries -= 1
@@ -1860,7 +1847,7 @@ def run_scan(
 
         def _flush_exiftool_batch():
             """Send accumulated files to exiftool as one batch and process results."""
-            nonlocal processed_count, _t_exiftool_total, _t_hashing_total, _t_checkpoint_total
+            nonlocal processed_count, _t_exiftool_total, _t_hashing_total
             if not exiftool_batch:
                 return
             os_paths = [item[1] for item in exiftool_batch]
@@ -1901,19 +1888,6 @@ def run_scan(
                     )
                 )
                 processed_count += 1
-                if _should_write_hash_batch_checkpoint(
-                    processed_count, hash_options, hash_conn
-                ):
-                    _tw0 = time.time()
-                    write_dates_to_file_atomic(
-                        output,
-                        photo_data,
-                        inventory_root=inventory_root,
-                        hash_options=hash_options,
-                        old_format=old_format,
-                        path_style=path_style,
-                    )
-                    _t_checkpoint_total += time.time() - _tw0
             exiftool_batch.clear()
 
         try:
@@ -2878,8 +2852,7 @@ For more details on a specific option, you can also use:
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
-                args.debugperformance
-                or scan_perf.get("wall_total", 0) >= 1000
+                args.debugperformance or scan_perf.get("wall_total", 0) >= 1000
             ):
                 _print_perf_summary(directory_abs, scan_perf)
             return

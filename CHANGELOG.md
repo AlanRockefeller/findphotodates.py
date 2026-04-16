@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.5.1 (2026-04-09)
+## v1.5.1 (2026-04-15)
 
 - Made sure it works well in both Windows and Linux. On my WSL system, it works a whole lot faster when running in Windows vs. a drive mounted via WSL.
 - Added some tests and configured them to work with Pytest.

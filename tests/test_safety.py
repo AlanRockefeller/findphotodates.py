@@ -26,6 +26,11 @@ try:
 except ImportError:
     sqlite3 = None
 
+
+def _missing_inv_hash_config(*args, **kwargs):
+    return None
+
+
 if sqlite3 is not None:
     try:
         from check_photo_backups import (
@@ -42,7 +47,7 @@ if sqlite3 is not None:
         raise  # let real import errors propagate
 else:
     HAS_CHECK_PHOTO = False
-    InvHashConfig = lambda *a, **k: None
+    InvHashConfig = _missing_inv_hash_config
     SAFE_SAFETY_VALUES = []
     classify_safe_to_delete = None
     iter_inventory_rows = None

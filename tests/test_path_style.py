@@ -186,7 +186,7 @@ class TestWriteInventoryRoot:
             hash_options=DummyHashOpts(),
             path_style="windows",
         )
-        comments, _, rows = _read_tsv(out)
+        comments, _, _rows = _read_tsv(out)
         root_lines = [c for c in comments if c.startswith("# inventory_root=")]
         assert len(root_lines) == 1
         root_val = root_lines[0].split("=", 1)[1]
@@ -208,7 +208,7 @@ class TestWriteInventoryRoot:
             hash_options=DummyHashOpts(),
             path_style="linux",
         )
-        comments, _, rows = _read_tsv(out)
+        comments, _, _rows = _read_tsv(out)
         root_lines = [c for c in comments if c.startswith("# inventory_root=")]
         assert len(root_lines) == 1
         root_val = root_lines[0].split("=", 1)[1]
@@ -294,9 +294,7 @@ class TestAddHashesPreservesStyle:
 
         native_path = str(photo)
         native_root = str(tmp_path)
-        opposite_style = (
-            "linux" if platform.system() == "Windows" else "windows"
-        )
+        opposite_style = "linux" if platform.system() == "Windows" else "windows"
         stored_path = fpd.format_path_style(native_path, opposite_style)
         stored_root = fpd.format_path_style(native_root, opposite_style)
 
@@ -407,26 +405,6 @@ class TestOldFormat:
         with open(out, encoding="utf-8") as f:
             content = f.read()
         assert content.strip().startswith("./a.jpg:")
-
-
-# ---------------------------------------------------------------------------
-# Batch checkpoint gating
-# ---------------------------------------------------------------------------
-
-
-class TestHashBatchCheckpointGate:
-    def test_disabled_when_hashing_off_even_if_cache_default_is_on(self):
-        hash_opts = fpd.parse_hash_args(hash_mode="off", quiet=True)
-        assert hash_opts.use_hash_cache is True
-        assert not fpd._should_write_hash_batch_checkpoint(
-            fpd.HASH_CACHE_BATCH_COMMIT_EVERY, hash_opts, object()
-        )
-
-    def test_enabled_when_hashing_and_cache_commit_boundary_are_active(self):
-        hash_opts = fpd.parse_hash_args(hash_mode="sample", quiet=True)
-        assert fpd._should_write_hash_batch_checkpoint(
-            fpd.HASH_CACHE_BATCH_COMMIT_EVERY, hash_opts, object()
-        )
 
 
 # ---------------------------------------------------------------------------

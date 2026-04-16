@@ -1,10 +1,11 @@
 # findphotodates.py
 
-**Version 1.5 (2026-04-05)** — Alan Rockefeller
+**Version 1.5.1 (2026-04-09)** — Alan Rockefeller
 
 A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
 ## Table of Contents
+
 1. [What is this?](#what-is-this)
 2. [Features](#features)
 3. [Requirements](#requirements)
@@ -34,7 +35,7 @@ A filesystem inventory tool that indexes all files and extracts EXIF dates and G
 - Creates a detailed TSV file with a complete inventory of your files
 - **Content hashing** - Generates unique fingerprints (fast sample hash or full-file hash) for backup and deduplication safety
 - **Smart caching** - Uses filesystem metadata and a SQLite hash cache to skip re-processing unchanged files
-- **Cross-platform cache reuse** - Inventories created under WSL get cache hits when re-read from native Windows and vice versa
+- **Cross-platform cache reuse** - Inventories created under WSL get cache hits when re-read from native Windows and vice versa, including transparent normalization for "funny characters" (like quotes) that are represented differently.
 - Saves progress every 15 minutes and handles errors from disconnecting drives gracefully. Picks up where it left off.
 - **Batched ExifTool** - Queries multiple files per ExifTool round-trip for faster metadata extraction on large scans
 - **Fast directory walking** - Uses `os.scandir()` instead of `os.walk()` for faster file discovery
@@ -70,6 +71,7 @@ A filesystem inventory tool that indexes all files and extracts EXIF dates and G
 ### Hash Caching
 
 Both scripts use SQLite caches to avoid repeated hashing:
+
 - `findphotodates.py` uses a cache at `~/.cache/findphotodates/hash_cache.sqlite` (configurable via `--hash-cache`).
 - `check_photo_backups.py` uses a cache at `~/.cache/check_photo_backups/fingerprints.sqlite` (configurable via `--fingerprint-cache`).
 
@@ -84,6 +86,7 @@ Both scripts use SQLite caches to avoid repeated hashing:
 ## Recommended Workflow
 
 1.  **Generate Inventories:** Generate a fast inventory for each backup drive (no hashing by default).
+
     ```bash
     # Linux / WSL
     ./findphotodates.py --directory /mnt/f/Photos -o f_inventory.tsv
@@ -93,6 +96,7 @@ Both scripts use SQLite caches to avoid repeated hashing:
     python findphotodates.py --directory F:\Photos -o f_inventory.tsv
     python findphotodates.py --directory O:\ -o o_inventory.tsv
     ```
+
     Inventories are cross-platform — a TSV created under WSL gets cache hits when re-read from native Windows and vice versa.
 
 2.  **Add Hashes (when needed):** Before verifying backups, add content hashes to enable verified matching.
@@ -109,6 +113,7 @@ Both scripts use SQLite caches to avoid repeated hashing:
 ## Usage (findphotodates.py)
 
 ### Basic Usage
+
 ```bash
 # Index all files in a directory (default)
 ./findphotodates.py --directory "/path/to/your/files"
@@ -118,6 +123,7 @@ Both scripts use SQLite caches to avoid repeated hashing:
 ```
 
 ### Examples
+
 ```bash
 # Linux / WSL — full inventory of an external drive
 ./findphotodates.py --directory /mnt/o -o o_inventory.tsv --save
@@ -139,37 +145,41 @@ python findphotodates.py --directory O:\ -o o_inventory.tsv
 ```
 
 ### Command Line Options
+
 ```text
 usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
                         [--only-media] [--video] [--only-photos] [--extension EXTENSION]
-                        [--locate] [--hash {sample,full,off}] [--sample-chunks INT]
-                        [--sample-chunk-mib FLOAT] [--hash-algo {blake3,blake2b,sha256}]
+                        [--locate] [--hash {sample,full,off}] [--add-hashes]
+                        [--sample-chunks INT] [--sample-chunk-mib FLOAT]
+                        [--hash-algo {blake3,blake2b,sha256}]
                         [--hash-cache PATH] [--no-hash-cache] [--hash-exts LIST]
-                        [--old-format] [--save] [--scan]
+                        [--old-format] [--linux] [--windows] [--save] [--scan]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `--directory` | Directory to search (default: current directory) |
-| `-o`, `--output`, `--out` | Output file path (default: photo.dates.tsv or .txt) |
-| `-q`, `--quiet` | Run quietly without printing progress |
-| `--debug` | Run in debug mode with verbose output |
-| `--only-media` | Index only media files (photos + videos) instead of all files |
-| `--video` | Index only video files |
-| `--only-photos` | Index only photo files |
-| `--extension` | Index only files with a specific extension (e.g., "pdf") |
-| `--locate` | Try to extract location data (if available) |
-| `--hash` | Hashing mode: `off` (default), `sample`, or `full` |
-| `--add-hashes` | Fill in missing hashes for an existing inventory TSV |
-| `--sample-chunks` | Number of chunks for sample hash (default: 3) |
-| `--sample-chunk-mib` | Size of each chunk in MiB (default: 0.0625 = 64 KiB) |
-| `--hash-algo` | Override hash algorithm (`blake3`, `blake2b`, or `sha256`) |
-| `--hash-cache` | Path to SQLite hash cache |
-| `--no-hash-cache` | Disable hash cache |
-| `--hash-exts` | Comma-separated extensions to hash (default: hash all) |
-| `--old-format` | Write legacy output (`./path: YYYY:MM:DD`) without hashes |
-| `--save` | Save current scan configuration for later use with --scan |
-| `--scan` | Run all saved scan configurations |
+| Option                    | Description                                                   |
+| ------------------------- | ------------------------------------------------------------- |
+| `--directory`             | Directory to search (default: current directory)              |
+| `-o`, `--output`, `--out` | Output file path (default: photo.dates.tsv or .txt)           |
+| `-q`, `--quiet`           | Run quietly without printing progress                         |
+| `--debug`                 | Run in debug mode with verbose output                         |
+| `--only-media`            | Index only media files (photos + videos) instead of all files |
+| `--video`                 | Index only video files                                        |
+| `--only-photos`           | Index only photo files                                        |
+| `--extension`             | Index only files with a specific extension (e.g., "pdf")      |
+| `--locate`                | Try to extract location data (if available)                   |
+| `--hash`                  | Hashing mode: `off` (default), `sample`, or `full`            |
+| `--add-hashes`            | Fill in missing hashes for an existing inventory TSV          |
+| `--sample-chunks`         | Number of chunks for sample hash (default: 3)                 |
+| `--sample-chunk-mib`      | Size of each chunk in MiB (default: 0.0625 = 64 KiB)          |
+| `--hash-algo`             | Override hash algorithm (`blake3`, `blake2b`, or `sha256`)    |
+| `--hash-cache`            | Path to SQLite hash cache                                     |
+| `--no-hash-cache`         | Disable hash cache                                            |
+| `--hash-exts`             | Comma-separated extensions to hash (default: hash all)        |
+| `--old-format`            | Write legacy output (`./path: YYYY:MM:DD`) without hashes     |
+| `--linux`                 | Force Linux-style paths (/mnt/c/...) in output (default: auto-detect) |
+| `--windows`               | Force Windows-style paths (C:\...) in output (default: auto-detect) |
+| `--save`                  | Save current scan configuration for later use with --scan     |
+| `--scan`                  | Run all saved scan configurations                             |
 
 ## Backup Checking (check_photo_backups.py)
 
@@ -183,6 +193,7 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
 ```
 
 ### Command Line Options
+
 ```text
 usage: check_photo_backups.py [-h] --target TARGET [--inventories LIST]
                              [--hash-mode {auto,compute,off}]
@@ -200,24 +211,25 @@ usage: check_photo_backups.py [-h] --target TARGET [--inventories LIST]
                              [-q] [--debug]
 ```
 
-| Option | Description |
-|--------|-------------|
-| `--target` | Folder to verify (staging area) |
-| `--inventories` | Comma-separated inventory files from backup drives |
-| `--hash-mode` | Hashing mode: `auto` (default — compute only when inventories have hashes), `compute`, or `off` |
-| `--out-csv` | Path to the detailed CSV report |
-| `--safe-list` | List of confirmed safe-to-delete files |
-| `--needs-hash-list` | Files that matched by metadata but were not hashed |
-| `--delete-script` | Generates a shell script to delete safe files |
-| `--drive-map` | Map drive labels to roots (e.g., c=/mnt/c,d=/mnt/d) |
-| `--fingerprint-cache` | Path to the target-side fingerprint cache |
-| `--allow-strong-without-hash` | Mark strong matches (name+size+date) as safe |
-| `--allow-weak-without-hash` | Mark weak matches (name+size) as safe |
-| `-q`, `--quiet` | Suppress normal output |
+| Option                        | Description                                                                                     |
+| ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| `--target`                    | Folder to verify (staging area)                                                                 |
+| `--inventories`               | Comma-separated inventory files from backup drives                                              |
+| `--hash-mode`                 | Hashing mode: `auto` (default — compute only when inventories have hashes), `compute`, or `off` |
+| `--out-csv`                   | Path to the detailed CSV report                                                                 |
+| `--safe-list`                 | List of confirmed safe-to-delete files                                                          |
+| `--needs-hash-list`           | Files that matched by metadata but were not hashed                                              |
+| `--delete-script`             | Generates a shell script to delete safe files                                                   |
+| `--drive-map`                 | Map drive labels to roots (e.g., c=/mnt/c,d=/mnt/d)                                             |
+| `--fingerprint-cache`         | Path to the target-side fingerprint cache                                                       |
+| `--allow-strong-without-hash` | Mark strong matches (name+size+date) as safe                                                    |
+| `--allow-weak-without-hash`   | Mark weak matches (name+size) as safe                                                           |
+| `-q`, `--quiet`               | Suppress normal output                                                                          |
 
 ## Inventory Output Format (findphotodates.py)
 
 The script generates a TSV file with metadata headers describing the scan parameters. (Note: Columns are separated by tabs; spacing below is for display only).
+
 ```text
 # inventory_root=/Users/alan/Photos
 # hash_mode=sample
@@ -231,11 +243,13 @@ filepath	date_taken	size_bytes	mtime_ns	gps_lat	gps_lon	location	content_hash
 ## Reports Output (check_photo_backups.py)
 
 The detailed CSV report (`backup_check_report.csv`) provides safety and matching information:
+
 - `safety`: Security status (e.g., `verified_hash`, `strong`, `missing`, `hash_config_mismatch`).
 - `match_type`: The level of matching found (e.g., `verified_hash`, `strong`, `weak`).
 - `safe_to_delete`: `yes` if the file meets safety criteria.
 
 Output lists are generated for different states:
+
 - `safe_to_delete.txt`: Confirmed files.
 - `needs_hash.txt`: Metadata matches that weren't hashed (rerun with `--hash-mode compute`).
 - `no_verified_match.txt`: Hashed files where the digest wasn't found in any inventory.

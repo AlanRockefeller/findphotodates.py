@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.1 (2026-04-15)
+
+- Made sure it works well in both Windows and Linux. On my WSL system, it works a whole lot faster when running in Windows vs. a drive mounted via WSL.
+- Added some tests and configured them to work with Pytest.
+
+### Bug Fixes
+
+- **Cross-platform character normalization**: Fixed cache mismatch issues caused by Windows vs WSL representing certain "funny characters" (like quotes) differently in filenames.
+
+### Features
+
+- **Path Style Options**: Added `--linux` and `--windows` flags to specify the path format in the output inventory. Defaults to auto-detection (preserves existing inventory style, then infers from directory path, then falls back to platform default).
+
 ## v1.5 (2026-04-05)
 
 ### Performance

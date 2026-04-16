@@ -21,17 +21,38 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# Ensure the project root is importable
-sys.path.insert(0, str(Path(__file__).parent))
+try:
+    import sqlite3  # noqa: F401 — check availability before importing check_photo_backups
+except ImportError:
+    sqlite3 = None
 
-from check_photo_backups import (
-    InvHashConfig,
-    SAFE_SAFETY_VALUES,
-    classify_safe_to_delete,
-    iter_inventory_rows,
-    parse_config_str,
-    resolve_inventory_display_path,
-)
+
+def _missing_inv_hash_config(*args, **kwargs):
+    return None
+
+
+if sqlite3 is not None:
+    try:
+        from check_photo_backups import (
+            InvHashConfig,
+            SAFE_SAFETY_VALUES,
+            classify_safe_to_delete,
+            iter_inventory_rows,
+            parse_config_str,
+            resolve_inventory_display_path,
+        )
+
+        HAS_CHECK_PHOTO = True
+    except ImportError:
+        raise  # let real import errors propagate
+else:
+    HAS_CHECK_PHOTO = False
+    InvHashConfig = _missing_inv_hash_config
+    SAFE_SAFETY_VALUES = []
+    classify_safe_to_delete = None
+    iter_inventory_rows = None
+    parse_config_str = None
+    resolve_inventory_display_path = None
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +101,7 @@ def _make_tsv_rows(rows, headers=None):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestIterInventoryRows(unittest.TestCase):
     """Tests for the inventory parser."""
 
@@ -310,7 +332,7 @@ class TestIterInventoryRows(unittest.TestCase):
         self.assertEqual(results[0][0], "/photos/a.jpg")
 
     def test_uppercase_hex_hash_accepted(self):
-        """Uppercase hex hashes should be accepted."""
+        """Uppercase hex hashes should be accepted and normalized to lowercase."""
         lines = _make_tsv_rows(
             [
                 ["/a.jpg", "", "100", "1000", "", "", "", "AABBCCDD"],
@@ -318,7 +340,7 @@ class TestIterInventoryRows(unittest.TestCase):
         )
         inv = _write_tsv(self.tmp, lines)
         results = list(iter_inventory_rows(inv))
-        self.assertEqual(results[0][4], "AABBCCDD")
+        self.assertEqual(results[0][4], "aabbccdd")
 
     def test_hash_with_spaces_treated_as_empty(self):
         """Hash containing spaces (likely corrupt) should be treated as empty."""
@@ -339,6 +361,7 @@ class TestIterInventoryRows(unittest.TestCase):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestClassifySafeToDelete(unittest.TestCase):
     """Every safety value must be explicitly tested."""
 
@@ -386,6 +409,7 @@ class TestClassifySafeToDelete(unittest.TestCase):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestParseConfigStr(unittest.TestCase):
     def test_basic(self):
         self.assertEqual(
@@ -405,6 +429,7 @@ class TestParseConfigStr(unittest.TestCase):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestResolveInventoryDisplayPath(unittest.TestCase):
     def test_absolute_path_unchanged(self):
         result = resolve_inventory_display_path("/mnt/drive/photo.jpg", None)
@@ -424,8 +449,37 @@ class TestResolveInventoryDisplayPath(unittest.TestCase):
 
 
 # ===========================================================================
-# add_hashes_to_inventory header validation
+# Path style formatting (--linux / --windows)
 # ===========================================================================
+
+
+class TestFormatPathStyle(unittest.TestCase):
+    def test_linux_to_windows(self):
+        from findphotodates import format_path_style
+
+        path = "/mnt/l/photos/image.jpg"
+        self.assertEqual(format_path_style(path, "windows"), "L:\\photos\\image.jpg")
+
+    def test_windows_to_linux(self):
+        from findphotodates import format_path_style
+
+        path = "L:\\photos\\image.jpg"
+        self.assertEqual(format_path_style(path, "linux"), "/mnt/l/photos/image.jpg")
+
+    def test_non_mount_linux_stays_linux(self):
+        from findphotodates import format_path_style
+
+        path = "/home/user/image.jpg"
+        # remains forward slash, no drive mapping
+        self.assertEqual(format_path_style(path, "linux"), "/home/user/image.jpg")
+        # converts to backslash for windows style
+        self.assertEqual(format_path_style(path, "windows"), "\\home\\user\\image.jpg")
+
+    def test_already_correct_style(self):
+        from findphotodates import format_path_style
+
+        self.assertEqual(format_path_style("/mnt/c/test", "linux"), "/mnt/c/test")
+        self.assertEqual(format_path_style("C:\\test", "windows"), "C:\\test")
 
 
 class TestAddHashesHeaderValidation(unittest.TestCase):
@@ -485,6 +539,7 @@ class TestAddHashesHeaderValidation(unittest.TestCase):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestSafeToDeleteIntegration(unittest.TestCase):
     """Verify that the matching logic produces correct safety values.
 
@@ -726,6 +781,7 @@ class TestSafeToDeleteIntegration(unittest.TestCase):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestEndToEndInventoryMatching(unittest.TestCase):
     """Build real inventory TSVs on disk and run the production loading +
     matching flow to verify same-config verification end-to-end."""
@@ -952,6 +1008,7 @@ class TestEndToEndInventoryMatching(unittest.TestCase):
 # ===========================================================================
 
 
+@unittest.skipUnless(HAS_CHECK_PHOTO, "check_photo_backups unavailable (sqlite3)")
 class TestCLIEndToEnd(unittest.TestCase):
     """Run the production main() flow end-to-end.
 
@@ -1438,6 +1495,66 @@ class TestCLIEndToEnd(unittest.TestCase):
         ds_text = Path(delete_script).read_text(encoding="utf-8")
         self.assertIn("#!/bin/bash", ds_text)
         self.assertNotIn("orphan.jpg", ds_text)
+
+
+# ===========================================================================
+# findphotodates.py cache round-trip
+# ===========================================================================
+
+
+class TestFindPhotoDatesCacheRoundTrip(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_embedded_quote_roundtrips_correctly(self):
+        from findphotodates import (
+            write_dates_to_file_atomic,
+            load_cache,
+            parse_hash_args,
+        )
+
+        raw_filepath = 'my "padget" photo.jpg'
+        photo_data = [
+            (
+                raw_filepath,
+                "2023:01:01 12:00:00",
+                1024,
+                1700000000000000000,
+                "37.7",
+                "-122.4",
+                "Location",
+                "aabbccdd",
+            )
+        ]
+        hash_opts = parse_hash_args(hash_mode="sample")
+        output_tsv = os.path.join(self.tmp, "inv.tsv")
+
+        write_dates_to_file_atomic(
+            output_file=output_tsv,
+            photo_data=photo_data,
+            inventory_root=None,
+            hash_options=hash_opts,
+            old_format=False,
+        )
+
+        with open(output_tsv, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        data_line = lines[-1].strip()
+        self.assertTrue(data_line.startswith('"my ""padget"" photo.jpg"'))
+
+        cache = load_cache(output_file=output_tsv)
+        self.assertIn(raw_filepath, cache)
+
+    def test_normalize_cache_key_embedded_quote(self):
+        from findphotodates import _normalize_cache_key
+
+        fs_path = '/mnt/l/music/Ilucion w" Eric Padget.mp3'
+        normalized = _normalize_cache_key(fs_path)
+        self.assertEqual(fs_path, normalized)
+        self.assertEqual(normalized, _normalize_cache_key(normalized))
 
 
 if __name__ == "__main__":

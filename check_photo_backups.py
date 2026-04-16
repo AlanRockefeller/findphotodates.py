@@ -30,7 +30,7 @@ import csv
 import hashlib
 import os
 import re
-import sqlite3
+
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -305,18 +305,23 @@ def compute_fullhash(path: Path, algo: str = "sha256") -> str:
 class FingerprintCache:
     def __init__(self, cache_path: Path):
         self.cache_path = cache_path
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn = None
         self._pending_inserts = 0
         if not self.cache_path.parent.exists():
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _get_conn(self) -> sqlite3.Connection:
+    def _get_conn(self):
         if self._conn is None:
+            try:
+                import sqlite3
+            except ImportError as exc:
+                raise RuntimeError(
+                    "sqlite3 is not available; use --no-fingerprint-cache"
+                ) from exc
             self._conn = sqlite3.connect(str(self.cache_path))
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
-            self._conn.execute(
-                """
+            self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS fingerprints (
                     path TEXT,
                     size INTEGER,
@@ -328,8 +333,7 @@ class FingerprintCache:
                     hash TEXT,
                     PRIMARY KEY (path, size, mtime_ns, mode, chunks, chunk_bytes, algo)
                 )
-                """
-            )
+                """)
         return self._conn
 
     def get(
@@ -397,7 +401,10 @@ def get_jpeg_date_taken(path: Path) -> str:
 
 
 def is_photo_like(path: Path, exts: Set[str]) -> bool:
-    return path.is_file() and path.suffix.lower().lstrip(".") in exts
+    try:
+        return path.is_file() and path.suffix.lower().lstrip(".") in exts
+    except (PermissionError, OSError):
+        return False
 
 
 def human_readable_size(size_bytes: int) -> str:
@@ -763,7 +770,7 @@ def main() -> int:
             continue
         try:
             st = p.stat()
-        except FileNotFoundError:
+        except OSError:
             continue
         base, date_taken = p.name.lower(), ""
         if p.suffix.lower() in (".jpg", ".jpeg"):

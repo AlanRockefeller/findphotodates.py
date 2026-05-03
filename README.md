@@ -1,6 +1,6 @@
 # findphotodates.py
 
-**Version 1.5.1 (2026-04-09)** — Alan Rockefeller
+**Version 1.5.1 (2026-05-03)** — Alan Rockefeller
 
 A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
@@ -156,30 +156,30 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
                         [--old-format] [--linux] [--windows] [--save] [--scan]
 ```
 
-| Option                    | Description                                                   |
-| ------------------------- | ------------------------------------------------------------- |
-| `--directory`             | Directory to search (default: current directory)              |
-| `-o`, `--output`, `--out` | Output file path (default: photo.dates.tsv or .txt)           |
-| `-q`, `--quiet`           | Run quietly without printing progress                         |
-| `--debug`                 | Run in debug mode with verbose output                         |
-| `--only-media`            | Index only media files (photos + videos) instead of all files |
-| `--video`                 | Index only video files                                        |
-| `--only-photos`           | Index only photo files                                        |
-| `--extension`             | Index only files with a specific extension (e.g., "pdf")      |
-| `--locate`                | Try to extract location data (if available)                   |
-| `--hash`                  | Hashing mode: `off` (default), `sample`, or `full`            |
-| `--add-hashes`            | Fill in missing hashes for an existing inventory TSV          |
-| `--sample-chunks`         | Number of chunks for sample hash (default: 3)                 |
-| `--sample-chunk-mib`      | Size of each chunk in MiB (default: 0.0625 = 64 KiB)          |
-| `--hash-algo`             | Override hash algorithm (`blake3`, `blake2b`, or `sha256`)    |
-| `--hash-cache`            | Path to SQLite hash cache                                     |
-| `--no-hash-cache`         | Disable hash cache                                            |
-| `--hash-exts`             | Comma-separated extensions to hash (default: hash all)        |
-| `--old-format`            | Write legacy output (`./path: YYYY:MM:DD`) without hashes     |
+| Option                    | Description                                                           |
+| ------------------------- | --------------------------------------------------------------------- |
+| `--directory`             | Directory to search (default: current directory)                      |
+| `-o`, `--output`, `--out` | Output file path (default: photo.dates.tsv or .txt)                   |
+| `-q`, `--quiet`           | Run quietly without printing progress                                 |
+| `--debug`                 | Run in debug mode with verbose output                                 |
+| `--only-media`            | Index only media files (photos + videos) instead of all files         |
+| `--video`                 | Index only video files                                                |
+| `--only-photos`           | Index only photo files                                                |
+| `--extension`             | Index only files with a specific extension (e.g., "pdf")              |
+| `--locate`                | Try to extract location data (if available)                           |
+| `--hash`                  | Hashing mode: `off` (default), `sample`, or `full`                    |
+| `--add-hashes`            | Fill in missing hashes for an existing inventory TSV                  |
+| `--sample-chunks`         | Number of chunks for sample hash (default: 3)                         |
+| `--sample-chunk-mib`      | Size of each chunk in MiB (default: 0.0625 = 64 KiB)                  |
+| `--hash-algo`             | Override hash algorithm (`blake3`, `blake2b`, or `sha256`)            |
+| `--hash-cache`            | Path to SQLite hash cache                                             |
+| `--no-hash-cache`         | Disable hash cache                                                    |
+| `--hash-exts`             | Comma-separated extensions to hash (default: hash all)                |
+| `--old-format`            | Write legacy output (`./path: YYYY:MM:DD`) without hashes             |
 | `--linux`                 | Force Linux-style paths (/mnt/c/...) in output (default: auto-detect) |
-| `--windows`               | Force Windows-style paths (C:\...) in output (default: auto-detect) |
-| `--save`                  | Save current scan configuration for later use with --scan     |
-| `--scan`                  | Run all saved scan configurations                             |
+| `--windows`               | Force Windows-style paths (C:\...) in output (default: auto-detect)   |
+| `--save`                  | Save current scan configuration for later use with --scan             |
+| `--scan`                  | Run all saved scan configurations                                     |
 
 ## Backup Checking (check_photo_backups.py)
 

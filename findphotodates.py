@@ -120,6 +120,8 @@ HASH_CACHE_BATCH_COMMIT_EVERY = 1000
 # Non-drive paths (Linux home dirs, UNC paths, etc.) pass through unchanged
 # after backslash → forward-slash conversion.
 
+_IS_TTY = sys.stdout.isatty()
+
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 _WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
 
@@ -1909,7 +1911,7 @@ def run_scan(
                                 f"Discovering... {discovery.discovered:,} found | "
                                 f"Processed {total_seen:,} ({cached_count:,} cached) — "
                                 f"{rate_str} [{_format_duration(elapsed)}]",
-                                end="\r",
+                                end="\r" if _IS_TTY else "\n",
                             )
                             last_progress_time = current_time
                     if discovery.done.is_set() and file_queue.empty():
@@ -1939,7 +1941,10 @@ def run_scan(
                     total_files = discovery.total
                     if not quiet:
                         # Clear \r progress line, then print clean discovery summary
-                        print("\r\033[2K", end="")
+                        if _IS_TTY:
+                            print("\r\033[2K", end="")
+                        else:
+                            print()
                         print(f"Discovery complete: {total_files:,} files found.")
 
                 try:
@@ -2089,7 +2094,10 @@ def run_scan(
                     _t_checkpoint_total += time.time() - _tc0
                     last_save_time = current_time
                     if not quiet:
-                        print("\r\033[2K", end="")
+                        if _IS_TTY:
+                            print("\r\033[2K", end="")
+                        else:
+                            print()
                         print(f"[Checkpoint: {len(photo_data):,} files saved]")
 
                 # Progress line every 2 seconds
@@ -2106,7 +2114,7 @@ def run_scan(
                         print(
                             f"Processed {total_seen:,} / {total_files:,} ({pct:.1f}%) — "
                             f"{rate_str}{eta_part} [{_format_duration(elapsed)}]",
-                            end="\r",
+                            end="\r" if _IS_TTY else "\n",
                         )
                     else:
                         # Phase 1: discovery still running
@@ -2114,7 +2122,7 @@ def run_scan(
                             f"Discovering... {discovery.discovered:,} found | "
                             f"Processed {total_seen:,} ({cached_count:,} cached) — "
                             f"{rate_str} [{_format_duration(elapsed)}]",
-                            end="\r",
+                            end="\r" if _IS_TTY else "\n",
                         )
                     last_progress_time = current_time
 
@@ -2159,7 +2167,10 @@ def run_scan(
     if not quiet:
         elapsed = time.time() - start_time
         # Clear \r progress line, then print clean completion summary
-        print("\r\033[2K", end="")
+        if _IS_TTY:
+            print("\r\033[2K", end="")
+        else:
+            print()
         print(
             f"Processing complete: {total_seen:,} files in {_format_duration(elapsed)}."
         )
@@ -2403,7 +2414,7 @@ def add_hashes_to_inventory(
                     elapsed = current_time - start_time
                     print(
                         f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]",
-                        end="\r",
+                        end="\r" if _IS_TTY else "\n",
                     )
                     last_progress_time = current_time
 

@@ -1,6 +1,6 @@
 # findphotodates.py
 
-**Version 1.5.1 (2026-05-03)** — Alan Rockefeller
+**Version 1.5.2 (2026-05-03)** — Alan Rockefeller
 
 A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 

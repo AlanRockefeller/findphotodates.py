@@ -7,6 +7,7 @@
 from pathlib import Path
 import hashlib
 import os
+import stat
 import sys
 import subprocess
 import argparse
@@ -626,7 +627,29 @@ def is_supported_file(filename, extensions):
     return any(filename.lower().endswith(f".{ext}") for ext in extensions)
 
 
-def find_files(directory, extensions):
+def _is_windows_reparse_point_dir(entry):
+    """Return True if this DirEntry is a Windows directory reparse point
+    (junction, directory symlink, or other directory-like reparse target).
+
+    Callers should already have confirmed the entry is a directory
+    (entry.is_dir(follow_symlinks=False) == True) before invoking this — we
+    only need to decide whether that directory is a reparse point we must
+    refuse to recurse into.
+
+    Always False on non-Windows platforms, where st_file_attributes is absent.
+    """
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except (PermissionError, OSError):
+        return False
+    attrs = getattr(st, "st_file_attributes", None)
+    if attrs is None:
+        return False
+    reparse_bit = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attrs & reparse_bit)
+
+
+def find_files(directory, extensions, debug=False):
     """Recursively find all files with the specified extensions using os.scandir().
 
     Yields (filepath, is_symlink, size_bytes, mtime_ns) tuples.
@@ -646,9 +669,24 @@ def find_files(directory, extensions):
         for entry in scan_it:
             try:
                 is_link = entry.is_symlink()
-                if entry.is_dir(follow_symlinks=False):
+                is_dir_no_follow = entry.is_dir(follow_symlinks=False)
+                if is_dir_no_follow:
+                    # Alan 5/3/26 - Skip Windows reparse-point *directories*
+                    # (NTFS junctions and directory symlinks) to avoid
+                    # traversal loops such as
+                    # C:\ProgramData\Application Data -> C:\ProgramData.
+                    # Only checked for directories so ordinary reparse-point
+                    # files (e.g. OneDrive cloud placeholders, file symlinks)
+                    # are still indexed normally.
+                    if _is_windows_reparse_point_dir(entry):
+                        if debug:
+                            print(
+                                f"Debug: Skipping reparse-point directory: {entry.path}",
+                                file=sys.stderr,
+                            )
+                        continue
                     # Real directory — recurse
-                    yield from find_files(entry.path, extensions)
+                    yield from find_files(entry.path, extensions, debug=debug)
                 elif is_link and entry.is_dir(follow_symlinks=True):
                     # Symlinked directory — skip recursion to avoid
                     # duplicate traversal and symlink loops
@@ -1595,7 +1633,7 @@ class _DiscoveryState:
         self.t_queue_wait = 0.0  # time spent blocked on queue.put()
 
 
-def _discovery_producer(file_queue, directory, extensions, state):
+def _discovery_producer(file_queue, directory, extensions, state, debug=False):
     """Producer thread: walk directory, enqueue file tuples, signal done.
 
     Each queued item is (filepath, is_symlink, size_bytes, mtime_ns).
@@ -1611,7 +1649,7 @@ def _discovery_producer(file_queue, directory, extensions, state):
         count = 0
         t_walk = 0.0
         t_queue = 0.0
-        it = iter(find_files(directory, extensions))
+        it = iter(find_files(directory, extensions, debug=debug))
         while True:
             tw0 = time.monotonic()
             try:
@@ -1815,7 +1853,7 @@ def run_scan(
     discovery = _DiscoveryState()
     producer = threading.Thread(
         target=_discovery_producer,
-        args=(file_queue, directory, extensions, discovery),
+        args=(file_queue, directory, extensions, discovery, debug),
         daemon=True,
     )
     producer.start()

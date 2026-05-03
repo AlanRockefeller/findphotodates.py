@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.5.2 (2026-05-03)
+
+- Fix a bug where Windows junctions can cause an infinite loop
+- Fix a minor display bug so ANSI color codes are only sent if the output is a terminal
+
 ## v1.5.1 (2026-04-15)
 
 - Made sure it works well in both Windows and Linux. On my WSL system, it works a whole lot faster when running in Windows vs. a drive mounted via WSL.

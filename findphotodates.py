@@ -126,6 +126,8 @@ DEFAULT_LOCATION_CACHE_PATH = DEFAULT_CACHE_DIR / "location_cache.sqlite"
 HASH_CACHE_BATCH_COMMIT_EVERY = 1000
 LOCATION_CACHE_BATCH_COMMIT_EVERY = 1000
 LOCATION_CACHE_PRECISION = 2
+WORKER_SHUTDOWN_TIMEOUT_SECONDS = 60
+_sqlite_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Cross-platform cache-key normalization (WSL ↔ Windows)
@@ -556,7 +558,7 @@ def open_sqlite_cache(cache_path, debug=False):
         return None
     try:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(cache_path)
+        conn = sqlite3.connect(cache_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("""
@@ -587,12 +589,13 @@ def get_cached_hash(
     if conn is None:
         return None
     try:
-        row = conn.execute(
-            """SELECT digest FROM hash_cache
-               WHERE path = ? AND size_bytes = ? AND mtime_ns = ?
-                 AND hash_mode = ? AND chunk_bytes = ? AND chunks = ? AND algo = ?""",
-            (path, size_bytes, mtime_ns, hash_mode, chunk_bytes, chunks, algo),
-        ).fetchone()
+        with _sqlite_lock:
+            row = conn.execute(
+                """SELECT digest FROM hash_cache
+                   WHERE path = ? AND size_bytes = ? AND mtime_ns = ?
+                     AND hash_mode = ? AND chunk_bytes = ? AND chunks = ? AND algo = ?""",
+                (path, size_bytes, mtime_ns, hash_mode, chunk_bytes, chunks, algo),
+            ).fetchone()
         return row[0] if row else None
     except Exception:
         return None
@@ -614,19 +617,29 @@ def put_cached_hash(
     if conn is None:
         return
     try:
-        conn.execute(
-            """INSERT OR REPLACE INTO hash_cache
-               (path, size_bytes, mtime_ns, hash_mode, chunk_bytes, chunks, algo, digest)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (path, size_bytes, mtime_ns, hash_mode, chunk_bytes, chunks, algo, digest),
-        )
-        if pending_counter is not None:
-            pending_counter[0] += 1
-            if pending_counter[0] >= HASH_CACHE_BATCH_COMMIT_EVERY:
+        with _sqlite_lock:
+            conn.execute(
+                """INSERT OR REPLACE INTO hash_cache
+                   (path, size_bytes, mtime_ns, hash_mode, chunk_bytes, chunks, algo, digest)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    path,
+                    size_bytes,
+                    mtime_ns,
+                    hash_mode,
+                    chunk_bytes,
+                    chunks,
+                    algo,
+                    digest,
+                ),
+            )
+            if pending_counter is not None:
+                pending_counter[0] += 1
+                if pending_counter[0] >= HASH_CACHE_BATCH_COMMIT_EVERY:
+                    conn.commit()
+                    pending_counter[0] = 0
+            else:
                 conn.commit()
-                pending_counter[0] = 0
-        else:
-            conn.commit()
     except Exception:
         pass
 
@@ -641,7 +654,7 @@ def open_location_cache(cache_path, debug=False):
         return None
     try:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(cache_path)
+        conn = sqlite3.connect(cache_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("""
@@ -667,11 +680,12 @@ def get_cached_location(conn, lat_rounded, lon_rounded, precision):
     if conn is None:
         return None
     try:
-        row = conn.execute(
-            """SELECT location FROM location_cache
-               WHERE lat_rounded = ? AND lon_rounded = ? AND precision = ?""",
-            (lat_rounded, lon_rounded, precision),
-        ).fetchone()
+        with _sqlite_lock:
+            row = conn.execute(
+                """SELECT location FROM location_cache
+                   WHERE lat_rounded = ? AND lon_rounded = ? AND precision = ?""",
+                (lat_rounded, lon_rounded, precision),
+            ).fetchone()
         return row[0] if row else None
     except Exception:
         return None
@@ -684,19 +698,20 @@ def put_cached_location(
     if conn is None or not location or is_coordinate_string(location):
         return
     try:
-        conn.execute(
-            """INSERT OR REPLACE INTO location_cache
-               (lat_rounded, lon_rounded, precision, location, fetched_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (lat_rounded, lon_rounded, precision, location, int(time.time())),
-        )
-        if pending_counter is not None:
-            pending_counter[0] += 1
-            if pending_counter[0] >= LOCATION_CACHE_BATCH_COMMIT_EVERY:
+        with _sqlite_lock:
+            conn.execute(
+                """INSERT OR REPLACE INTO location_cache
+                   (lat_rounded, lon_rounded, precision, location, fetched_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (lat_rounded, lon_rounded, precision, location, int(time.time())),
+            )
+            if pending_counter is not None:
+                pending_counter[0] += 1
+                if pending_counter[0] >= LOCATION_CACHE_BATCH_COMMIT_EVERY:
+                    conn.commit()
+                    pending_counter[0] = 0
+            else:
                 conn.commit()
-                pending_counter[0] = 0
-        else:
-            conn.commit()
     except Exception:
         pass
 
@@ -1175,6 +1190,7 @@ def get_photo_data(filepath, _exiftool=None):
 # Global variables for geolocation rate limiting and coordinate caching
 _last_geolocate_time = 0
 _coord_cache = {}  # (round(lat,2), round(lon,2)) -> location
+_geolocate_lock = threading.Lock()
 
 
 def _coord_cache_key(lat, lon, precision=LOCATION_CACHE_PRECISION):
@@ -1213,77 +1229,88 @@ def geolocate(lat, lon, location_conn=None, pending_counter=None):
         LOCATION_CACHE_PRECISION,
     )
     if cached_location:
-        _coord_cache[cache_key] = cached_location
+        with _geolocate_lock:
+            _coord_cache[cache_key] = cached_location
         return cached_location
 
-    # Rate limiting: wait at least 1 second since last request
-    current_time = time.time()
-    time_since_last = current_time - _last_geolocate_time
-    if time_since_last < 1.0:
-        time.sleep(1.0 - time_since_last)
+    with _geolocate_lock:
+        # Rate limiting: wait at least 1 second since last request
+        current_time = time.time()
+        time_since_last = current_time - _last_geolocate_time
+        if time_since_last < 1.0:
+            time.sleep(1.0 - time_since_last)
 
-    try:
-        # Build Nominatim reverse geocoding URL with addressdetails=1
-        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat_float}&lon={lon_float}&addressdetails=1"
+        try:
+            # Build Nominatim reverse geocoding URL with addressdetails=1
+            url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat_float}&lon={lon_float}&addressdetails=1"
 
-        # Create request with proper User-Agent header (required by Nominatim)
-        req = urllib.request.Request(url)
-        req.add_header(
-            "User-Agent",
-            "findphotodates.py/1.5 (https://github.com/alanrockefeller/findphotodates.py)",
-        )
-
-        # Make the request
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
-
-            # Update last request time
-            _last_geolocate_time = time.time()
-
-            # Extract location from response - prefer address components over display_name
-            location = None
-            if "address" in data:
-                addr = data["address"]
-                parts = []
-                # Build location from address components in order of specificity
-                for key in ["city", "town", "village", "county", "state", "country"]:
-                    if key in addr:
-                        parts.append(addr[key])
-                if parts:
-                    location = ", ".join(parts)
-
-            # Fallback to display_name if address components didn't work
-            if not location and "display_name" in data:
-                location = data["display_name"]
-
-            # Fallback to coordinates if no location found
-            if not location:
-                location = f"{lat_float}, {lon_float}"
-
-            # Cache the result
-            _coord_cache[cache_key] = location
-            put_cached_location(
-                location_conn,
-                lat_rounded,
-                lon_rounded,
-                LOCATION_CACHE_PRECISION,
-                location,
-                pending_counter=pending_counter,
+            # Create request with proper User-Agent header (required by Nominatim)
+            req = urllib.request.Request(url)
+            req.add_header(
+                "User-Agent",
+                "findphotodates.py/1.5 (https://github.com/alanrockefeller/findphotodates.py)",
             )
-            return location
 
-    except urllib.error.HTTPError as e:
-        # Handle 429 (rate limit) with longer backoff
-        if e.code == 429:
-            _last_geolocate_time = time.time() + 5  # Wait 5 seconds before next attempt
-        else:
+            # Make the request
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+
+                # Update last request time
+                _last_geolocate_time = time.time()
+
+                # Extract location from response - prefer address components over display_name
+                location = None
+                if "address" in data:
+                    addr = data["address"]
+                    parts = []
+                    # Build location from address components in order of specificity
+                    for key in [
+                        "city",
+                        "town",
+                        "village",
+                        "county",
+                        "state",
+                        "country",
+                    ]:
+                        if key in addr:
+                            parts.append(addr[key])
+                    if parts:
+                        location = ", ".join(parts)
+
+                # Fallback to display_name if address components didn't work
+                if not location and "display_name" in data:
+                    location = data["display_name"]
+
+                # Fallback to coordinates if no location found
+                if not location:
+                    location = f"{lat_float}, {lon_float}"
+
+        except urllib.error.HTTPError as e:
+            # Handle 429 (rate limit) with longer backoff
+            if e.code == 429:
+                _last_geolocate_time = (
+                    time.time() + 5
+                )  # Wait 5 seconds before next attempt
+            else:
+                _last_geolocate_time = time.time()
+            # Don't cache fallback coordinates - allow retry on next run
+            return f"{lat_float}, {lon_float}"
+        except Exception:
+            # Don't cache fallback coordinates - allow retry on next run
             _last_geolocate_time = time.time()
-        # Don't cache fallback coordinates - allow retry on next run
-        return f"{lat_float}, {lon_float}"
-    except Exception:
-        # Don't cache fallback coordinates - allow retry on next run
-        _last_geolocate_time = time.time()
-        return f"{lat_float}, {lon_float}"
+            return f"{lat_float}, {lon_float}"
+
+    with _geolocate_lock:
+        _coord_cache[cache_key] = location
+    put_cached_location(
+        location_conn,
+        lat_rounded,
+        lon_rounded,
+        LOCATION_CACHE_PRECISION,
+        location,
+        pending_counter=pending_counter,
+    )
+    return location
 
 
 def is_coordinate_string(location):
@@ -1370,7 +1397,8 @@ def load_cache(output_file, debug=False):
                         ):
                             coord_key = _coord_cache_key(gps_lat, gps_lon)
                             if coord_key is not None:
-                                _coord_cache.setdefault(coord_key, location)
+                                with _geolocate_lock:
+                                    _coord_cache.setdefault(coord_key, location)
 
                         # Treat coordinate strings as missing location (allows retry)
                         if location and is_coordinate_string(location):
@@ -2177,6 +2205,177 @@ def _format_eta(remaining_files, rate):
         return f"{int(secs)}s"
 
 
+def _clamp_worker_count(workers):
+    try:
+        return max(1, min(32, int(workers)))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _log_worker_error(error_log, error_log_lock, message):
+    with error_log_lock:
+        error_log.write(message + "\n")
+        error_log.flush()
+
+
+def _build_exiftool_rows(
+    batch,
+    batch_results,
+    locate,
+    location_conn,
+    location_cache_pending,
+    hash_options,
+    hash_conn,
+    hash_cache_pending,
+):
+    results = []
+    file_counts = Counter()
+    stats = {"t_hashing": 0.0, "t_geolocate": 0.0}
+    for out_path, os_path, key_path, size_bytes, mtime_ns, ext in batch:
+        date_taken, gps_lat, gps_lon = batch_results.get(os_path, (None, None, None))
+        location = None
+        if locate and gps_lat and gps_lon:
+            _tg0 = time.time()
+            location = geolocate(
+                gps_lat,
+                gps_lon,
+                location_conn=location_conn,
+                pending_counter=location_cache_pending,
+            )
+            stats["t_geolocate"] += time.time() - _tg0
+            if location and is_coordinate_string(location):
+                location = None
+        _th0 = time.time()
+        content_hash = get_content_hash(
+            key_path,
+            size_bytes,
+            mtime_ns,
+            hash_options,
+            hash_conn,
+            hash_cache_pending,
+            os_path=os_path,
+        )
+        stats["t_hashing"] += time.time() - _th0
+        results.append(
+            (
+                out_path,
+                date_taken or "",
+                size_bytes,
+                mtime_ns,
+                gps_lat or "",
+                gps_lon or "",
+                location or "",
+                content_hash,
+            )
+        )
+        file_counts[ext] += 1
+    return results, file_counts, stats
+
+
+def _exiftool_worker(
+    worker_id,
+    work_queue,
+    results_queue,
+    stop_event,
+    locate,
+    hash_options,
+    hash_conn,
+    hash_cache_pending,
+    location_conn,
+    location_cache_pending,
+    error_log,
+    error_log_lock,
+):
+    exiftool = None
+    worker_started = time.time()
+    worker_stats = {
+        "worker_id": worker_id,
+        "wall": 0.0,
+        "t_active": 0.0,
+        "t_exiftool": 0.0,
+        "t_hashing": 0.0,
+        "t_geolocate": 0.0,
+        "t_queue_push": 0.0,
+        "batches": 0,
+        "files": 0,
+        "errors": 0,
+    }
+    try:
+        while not stop_event.is_set():
+            try:
+                batch = work_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if batch is None:
+                break
+
+            _t_active_start = time.time()
+            batch_results = None
+            t_exiftool = 0.0
+            try:
+                if exiftool is None:
+                    exiftool = ExifToolPersistent()
+                    exiftool.start()
+                os_paths = [item[1] for item in batch]
+                _te0 = time.time()
+                batch_results = exiftool.batch_query(os_paths)
+                t_exiftool = time.time() - _te0
+                worker_stats["t_exiftool"] += t_exiftool
+                if batch_results is None:
+                    batch_results = {item[1]: (None, None, None) for item in batch}
+            except Exception as e:
+                worker_stats["errors"] += 1
+                _log_worker_error(
+                    error_log,
+                    error_log_lock,
+                    f"Warning: ExifTool worker {worker_id} failed; recording {len(batch)} file(s) with blank EXIF: {e!r}",
+                )
+                batch_results = {item[1]: (None, None, None) for item in batch}
+
+            results, file_counts, stats = _build_exiftool_rows(
+                batch,
+                batch_results,
+                locate,
+                location_conn,
+                location_cache_pending,
+                hash_options,
+                hash_conn,
+                hash_cache_pending,
+            )
+            worker_stats["t_hashing"] += stats["t_hashing"]
+            worker_stats["t_geolocate"] += stats["t_geolocate"]
+            worker_stats["batches"] += 1
+            worker_stats["files"] += len(results)
+
+            packet = {
+                "type": "results",
+                "results": results,
+                "file_counts": file_counts,
+                "t_exiftool": t_exiftool,
+                "t_hashing": stats["t_hashing"],
+                "t_geolocate": stats["t_geolocate"],
+            }
+            _tq0 = time.time()
+            results_queue.put(packet)
+            worker_stats["t_queue_push"] += time.time() - _tq0
+            worker_stats["t_active"] += time.time() - _t_active_start
+    except Exception as e:
+        worker_stats["errors"] += 1
+        _log_worker_error(
+            error_log,
+            error_log_lock,
+            f"Warning: ExifTool worker {worker_id} stopped unexpectedly: {e!r}",
+        )
+    finally:
+        if exiftool is not None:
+            try:
+                exiftool.stop()
+            except Exception:
+                pass
+        worker_stats["wall"] = time.time() - worker_started
+        results_queue.put({"type": "worker_done", "stats": worker_stats})
+
+
 # ---------------------------------------------------------------------------
 # Main scan loop
 # ---------------------------------------------------------------------------
@@ -2195,12 +2394,14 @@ def run_scan(
     perf_stats=None,
     path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
     raw_output=None,  # Alan 5/3/26 - original CLI --output arg, used only for friendly Windows path hints
+    workers=4,
 ):
     """Run a scan on the specified directory.
 
     If perf_stats is a dict, it will be populated with detailed timing breakdowns.
     """
     _t0 = time.time()
+    worker_count = _clamp_worker_count(workers)
 
     # Resolve "auto" path style once, before any writes.
     if path_style == "auto":
@@ -2289,28 +2490,33 @@ def run_scan(
     _t_cache_lookup_total = 0.0
     _t_exiftool_total = 0.0
     _t_hashing_total = 0.0
+    _t_geolocate_total = 0.0
     _t_checkpoint_total = 0.0
+    _t_dispatch_wait = 0.0
+    _t_results_wait = 0.0
+    _t_worker_total = 0.0
+    _worker_details = []
 
     def cleanup_all():
         if hash_conn is not None:
             try:
-                if hash_cache_pending is not None and hash_cache_pending[0] > 0:
-                    hash_conn.commit()
+                with _sqlite_lock:
+                    if hash_cache_pending is not None and hash_cache_pending[0] > 0:
+                        hash_conn.commit()
                 hash_conn.close()
             except Exception:
                 pass
         if location_conn is not None:
             try:
-                if (
-                    location_cache_pending is not None
-                    and location_cache_pending[0] > 0
-                ):
-                    location_conn.commit()
+                with _sqlite_lock:
+                    if (
+                        location_cache_pending is not None
+                        and location_cache_pending[0] > 0
+                    ):
+                        location_conn.commit()
                 location_conn.close()
             except Exception:
                 pass
-
-    exiftool = ExifToolPersistent()
 
     # --- Start background file discovery ---
     file_queue = queue.Queue(maxsize=_DISCOVERY_QUEUE_SIZE)
@@ -2326,13 +2532,6 @@ def run_scan(
     interrupted = False
 
     with open(error_log_path, "w", encoding="utf-8") as error_log:
-        try:
-            exiftool.start()
-        except FileNotFoundError:
-            print("Error: ExifTool is required but was not found.")
-            discovery.done.wait(timeout=2)
-            return False
-
         start_time = time.time()
         last_save_time = start_time
         last_progress_time = start_time
@@ -2342,87 +2541,221 @@ def run_scan(
         )
         total_files = 0  # set once discovery finishes
 
+        work_queue = queue.Queue(maxsize=max(1, worker_count * 4))
+        results_queue = queue.Queue()
+        stop_event = threading.Event()
+        error_log_lock = threading.Lock()
+        worker_threads = []
+        worker_done_count = 0
+
+        for worker_id in range(1, worker_count + 1):
+            t = threading.Thread(
+                target=_exiftool_worker,
+                args=(
+                    worker_id,
+                    work_queue,
+                    results_queue,
+                    stop_event,
+                    locate,
+                    hash_options,
+                    hash_conn,
+                    hash_cache_pending,
+                    location_conn,
+                    location_cache_pending,
+                    error_log,
+                    error_log_lock,
+                ),
+                daemon=True,
+            )
+            t.start()
+            worker_threads.append(t)
+
         # Batch buffer for files that need exiftool queries
-        # Each entry: (out_path, os_path, key_path, size_bytes, mtime_ns)
+        # Each entry: (out_path, os_path, key_path, size_bytes, mtime_ns, ext)
         #   out_path  — abspath written to TSV (human-visible)
         #   os_path   — actual filesystem path for exiftool / hashing I/O
         #   key_path  — normalized cache key for TSV cache and hash cache lookups
         exiftool_batch = []
 
-        def _flush_exiftool_batch():
-            """Send accumulated files to exiftool as one batch and process results."""
+        def _drain_results():
             nonlocal processed_count, _t_exiftool_total, _t_hashing_total
-            if not exiftool_batch:
-                return
-            os_paths = [item[1] for item in exiftool_batch]
-            _te0 = time.time()
-            batch_results = exiftool.batch_query(os_paths)
-            _t_exiftool_total += time.time() - _te0
+            nonlocal _t_geolocate_total, _t_results_wait, _t_worker_total
+            nonlocal worker_done_count
+            _trq0 = time.time()
+            while True:
+                try:
+                    packet = results_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if packet.get("type") == "results":
+                    rows = packet.get("results", [])
+                    photo_data.extend(rows)
+                    file_counts.update(packet.get("file_counts", Counter()))
+                    processed_count += len(rows)
+                    _t_exiftool_total += packet.get("t_exiftool", 0.0)
+                    _t_hashing_total += packet.get("t_hashing", 0.0)
+                    _t_geolocate_total += packet.get("t_geolocate", 0.0)
+                elif packet.get("type") == "worker_done":
+                    stats = packet.get("stats", {})
+                    _worker_details.append(stats)
+                    _t_worker_total += stats.get("wall", 0.0)
+                    worker_done_count += 1
+            _t_results_wait += time.time() - _trq0
 
-            for out_path, os_path, key_path, size_bytes, mtime_ns in exiftool_batch:
-                date_taken, gps_lat, gps_lon = batch_results.get(
-                    os_path, (None, None, None)
-                )
-                location = None
-                if locate and gps_lat and gps_lon:
-                    location = geolocate(
-                        gps_lat,
-                        gps_lon,
-                        location_conn=location_conn,
-                        pending_counter=location_cache_pending,
-                    )
-                    if location and is_coordinate_string(location):
-                        location = None
-                _th0 = time.time()
-                content_hash = get_content_hash(
-                    key_path,
-                    size_bytes,
-                    mtime_ns,
+        def _update_progress_and_checkpoint():
+            nonlocal last_progress_time, last_save_time, _t_checkpoint_total
+            total_seen = cached_count + processed_count
+            current_time = time.time()
+            rate_tracker.record(current_time, total_seen)
+
+            if total_seen > 0 and (current_time - last_save_time) > 900:
+                _tc0 = time.time()
+                data_snapshot = list(photo_data)
+                _ckpt_ok = _safe_write_inventory(
+                    output,
+                    data_snapshot,
+                    inventory_root,
                     hash_options,
-                    hash_conn,
-                    hash_cache_pending,
-                    os_path=os_path,
+                    old_format,
+                    path_style,
+                    debug=debug,
+                    context="checkpoint",
                 )
-                _t_hashing_total += time.time() - _th0
-                photo_data.append(
-                    (
-                        out_path,
-                        date_taken or "",
-                        size_bytes,
-                        mtime_ns,
-                        gps_lat or "",
-                        gps_lon or "",
-                        location or "",
-                        content_hash,
+                _t_checkpoint_total += time.time() - _tc0
+                last_save_time = current_time
+                if not quiet:
+                    _clear_progress_line()
+                    if _ckpt_ok:
+                        print(f"[Checkpoint: {len(data_snapshot):,} files saved]")
+                if not _ckpt_ok:
+                    print(
+                        "Error: Checkpoint failed; stopping scan so you can "
+                        "fix the output path/disk/permissions and rerun."
                     )
-                )
-                processed_count += 1
+                    stop_event.set()
+                    return False
+
+            if not quiet and (current_time - last_progress_time) >= 2.0:
+                elapsed = current_time - start_time
+                rate = rate_tracker.rate()
+                rate_str = f"{rate:.0f} files/sec" if rate else "..."
+
+                if discovery_complete and total_files > 0:
+                    pct = total_seen / total_files * 100
+                    eta_str = _format_eta(total_files - total_seen, rate)
+                    eta_part = f" — ETA: {eta_str}" if eta_str else ""
+                    print(
+                        f"Processed {total_seen:,} / {total_files:,} ({pct:.1f}%) — "
+                        f"{rate_str}{eta_part} [{_format_duration(elapsed)}]",
+                        end="\r" if _IS_TTY else "\n",
+                    )
+                else:
+                    print(
+                        f"Discovering... {discovery.discovered:,} found | "
+                        f"Processed {total_seen:,} ({cached_count:,} cached) — "
+                        f"{rate_str} [{_format_duration(elapsed)}]",
+                        end="\r" if _IS_TTY else "\n",
+                    )
+                last_progress_time = current_time
+            return True
+
+        def _maybe_print_discovery_complete():
+            nonlocal discovery_complete, total_files
+            if not discovery_complete and discovery.done.is_set():
+                discovery_complete = True
+                total_files = discovery.total
+                if not quiet:
+                    _clear_progress_line()
+                    print(f"Discovery complete: {total_files:,} files found.")
+
+        def _record_blank_exif_batch(batch):
+            nonlocal processed_count, _t_hashing_total
+            blank_results = {item[1]: (None, None, None) for item in batch}
+            rows, counts, stats = _build_exiftool_rows(
+                batch,
+                blank_results,
+                locate,
+                location_conn,
+                location_cache_pending,
+                hash_options,
+                hash_conn,
+                hash_cache_pending,
+            )
+            photo_data.extend(rows)
+            file_counts.update(counts)
+            processed_count += len(rows)
+            _t_hashing_total += stats["t_hashing"]
+
+        def _enqueue_exiftool_batch():
+            if not exiftool_batch:
+                return True
+            batch = list(exiftool_batch)
             exiftool_batch.clear()
+            while True:
+                try:
+                    work_queue.put(batch, timeout=0.5)
+                    return True
+                except queue.Full:
+                    _drain_results()
+                    _maybe_print_discovery_complete()
+                    if not _update_progress_and_checkpoint():
+                        return False
+                    if not any(t.is_alive() for t in worker_threads):
+                        _log_worker_error(
+                            error_log,
+                            error_log_lock,
+                            f"Warning: all ExifTool workers stopped; recording {len(batch)} file(s) with blank EXIF.",
+                        )
+                        _record_blank_exif_batch(batch)
+                        return True
+
+        def _stop_workers(interrupt=False):
+            if interrupt:
+                stop_event.set()
+                for _ in worker_threads:
+                    try:
+                        work_queue.put_nowait(None)
+                    except queue.Full:
+                        pass
+            else:
+                for _ in worker_threads:
+                    work_queue.put(None)
+            timeout_seconds = 5 if interrupt else WORKER_SHUTDOWN_TIMEOUT_SECONDS
+            deadline = time.time() + timeout_seconds
+            while any(t.is_alive() for t in worker_threads):
+                for t in worker_threads:
+                    remaining = max(0.0, deadline - time.time())
+                    if remaining <= 0:
+                        alive = sum(1 for thread in worker_threads if thread.is_alive())
+                        if alive:
+                            print(
+                                f"Warning: {alive} ExifTool worker(s) did not exit within {timeout_seconds} seconds; abandoning.",
+                                file=sys.stderr,
+                            )
+                        return False
+                    t.join(timeout=min(0.2, remaining))
+                _drain_results()
+                if not interrupt:
+                    _update_progress_and_checkpoint()
+            _drain_results()
+            return True
 
         try:
             while True:
-                # --- Get next file from queue ---
+                _drain_results()
+                _maybe_print_discovery_complete()
+                if not _update_progress_and_checkpoint():
+                    _stop_workers(interrupt=True)
+                    cleanup_all()
+                    return False
+
                 try:
-                    item = file_queue.get(timeout=1.0)
+                    _td0 = time.time()
+                    item = file_queue.get(timeout=0.5)
+                    _t_dispatch_wait += time.time() - _td0
                 except queue.Empty:
-                    # No file ready — flush any pending exiftool batch
-                    _flush_exiftool_batch()
-                    if not quiet:
-                        current_time = time.time()
-                        if current_time - last_progress_time >= 2.0:
-                            elapsed = current_time - start_time
-                            total_seen = cached_count + processed_count
-                            rate = rate_tracker.rate()
-                            rate_str = f"{rate:.0f} files/sec" if rate else "..."
-                            print(
-                                f"Discovering... {discovery.discovered:,} found | "
-                                f"Processed {total_seen:,} ({cached_count:,} cached) — "
-                                f"{rate_str} [{_format_duration(elapsed)}]",
-                                end="\r" if _IS_TTY else "\n",
-                            )
-                            last_progress_time = current_time
+                    _t_dispatch_wait += time.time() - _td0
                     if discovery.done.is_set() and file_queue.empty():
-                        # Producer finished and queue is drained
                         if discovery.error is not None:
                             print(f"\nError during file discovery: {discovery.error}")
                             raise discovery.error from None
@@ -2430,8 +2763,6 @@ def run_scan(
                     continue
 
                 if item is None:
-                    # Sentinel: discovery finished — flush remaining batch
-                    _flush_exiftool_batch()
                     if discovery.error is not None:
                         if not quiet:
                             print(f"\nError during file discovery: {discovery.error}")
@@ -2441,15 +2772,6 @@ def run_scan(
                 file, is_symlink, prod_size, prod_mtime = item
                 basename = os.path.basename(file)
                 ext = os.path.splitext(basename)[1].lstrip(".").lower()
-
-                # Check if discovery just completed (for progress phase transition)
-                if not discovery_complete and discovery.done.is_set():
-                    discovery_complete = True
-                    total_files = discovery.total
-                    if not quiet:
-                        # Clear \r progress line, then print clean discovery summary
-                        _clear_progress_line()
-                        print(f"Discovery complete: {total_files:,} files found.")
 
                 try:
                     out_path = os.path.abspath(file)
@@ -2495,12 +2817,14 @@ def run_scan(
 
                         if locate and gps_lat and gps_lon:
                             if not location or is_coordinate_string(location):
+                                _tg0 = time.time()
                                 location = geolocate(
                                     gps_lat,
                                     gps_lon,
                                     location_conn=location_conn,
                                     pending_counter=location_cache_pending,
                                 )
+                                _t_geolocate_total += time.time() - _tg0
                                 cached_entry["location"] = location
 
                         _th0 = time.time()
@@ -2533,10 +2857,20 @@ def run_scan(
                         # Not cached — check if exiftool-eligible
                         if ext in EXIFTOOL_EXTENSIONS:
                             exiftool_batch.append(
-                                (out_path, fs_path, key_path, size_bytes, mtime_ns)
+                                (
+                                    out_path,
+                                    fs_path,
+                                    key_path,
+                                    size_bytes,
+                                    mtime_ns,
+                                    ext,
+                                )
                             )
                             if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
-                                _flush_exiftool_batch()
+                                if not _enqueue_exiftool_batch():
+                                    _stop_workers(interrupt=True)
+                                    cleanup_all()
+                                    return False
                         else:
                             # Non-media file: index with filesystem metadata only
                             _th0 = time.time()
@@ -2563,100 +2897,67 @@ def run_scan(
                                 )
                             )
                             processed_count += 1
-
-                    file_counts[ext] += 1
+                            file_counts[ext] += 1
+                    if (
+                        cached_entry
+                        and cached_entry["size_bytes"] == size_bytes
+                        and cached_entry["mtime_ns"] == mtime_ns
+                    ):
+                        file_counts[ext] += 1
 
                 except OSError as e:
                     error_log.write(f"Warning: Could not access '{file}': {str(e)}\n")
-                    if _check_drive_disconnect(
-                        e,
-                        output,
-                        photo_data,
-                        inventory_root,
-                        hash_options,
-                        old_format,
-                        cleanup_all,
-                        path_style=path_style,
+                    if any(
+                        err in str(e).lower()
+                        for err in [
+                            "no such file",
+                            "input/output error",
+                            "stale file handle",
+                        ]
                     ):
-                        exiftool.stop()
-                        return False
+                        _stop_workers(interrupt=True)
+                        _drain_results()
+                        if _check_drive_disconnect(
+                            e,
+                            output,
+                            photo_data,
+                            inventory_root,
+                            hash_options,
+                            old_format,
+                            cleanup_all,
+                            path_style=path_style,
+                        ):
+                            return False
                     continue
 
-                # --- Progress and checkpointing ---
-                total_seen = cached_count + processed_count
-                current_time = time.time()
-
-                # Record rate sample
-                rate_tracker.record(current_time, total_seen)
-
-                # Checkpoint every 15 minutes
-                if total_seen > 0 and (current_time - last_save_time) > 900:
-                    _tc0 = time.time()
-                    # Alan 5/3/26 - Use _safe_write_inventory so a transient
-                    # write failure (drive removed, dir vanished, disk full,
-                    # ACL change mid-scan) prints a friendly message instead
-                    # of a Python traceback.
-                    _ckpt_ok = _safe_write_inventory(
-                        output,
-                        photo_data,
-                        inventory_root,
-                        hash_options,
-                        old_format,
-                        path_style,
-                        debug=debug,
-                        context="checkpoint",
-                    )
-                    _t_checkpoint_total += time.time() - _tc0
-                    last_save_time = current_time
-                    if not quiet:
-                        _clear_progress_line()
-                        if _ckpt_ok:
-                            print(f"[Checkpoint: {len(photo_data):,} files saved]")
-                    # Alan 5/4/26 - If the checkpoint failed, stop the scan
-                    # rather than continuing with unsaved data for hours.
-                    # The final write would just hit the same error, and
-                    # the user needs to fix the underlying issue (bad path,
-                    # full disk, revoked permissions) before any rerun.
-                    if not _ckpt_ok:
+            if not _enqueue_exiftool_batch():
+                _stop_workers(interrupt=True)
+                cleanup_all()
+                return False
+            workers_finished = _stop_workers(interrupt=False)
+            if workers_finished:
+                done_deadline = time.time() + 10
+                while worker_done_count < worker_count:
+                    _drain_results()
+                    if worker_done_count >= worker_count:
+                        break
+                    if time.time() >= done_deadline:
+                        missing = worker_count - worker_done_count
                         print(
-                            "Error: Checkpoint failed; stopping scan so you can "
-                            "fix the output path/disk/permissions and rerun."
+                            f"Warning: missing {missing} ExifTool worker completion packet(s); continuing.",
+                            file=sys.stderr,
                         )
-                        try:
-                            exiftool.stop()
-                        except Exception:
-                            pass
-                        cleanup_all()
-                        return False
+                        break
+                    time.sleep(0.05)
 
-                # Progress line every 2 seconds
-                if not quiet and (current_time - last_progress_time) >= 2.0:
-                    elapsed = current_time - start_time
-                    rate = rate_tracker.rate()
-                    rate_str = f"{rate:.0f} files/sec" if rate else "..."
-
-                    if discovery_complete and total_files > 0:
-                        # Phase 2: show percent and ETA
-                        pct = total_seen / total_files * 100
-                        eta_str = _format_eta(total_files - total_seen, rate)
-                        eta_part = f" — ETA: {eta_str}" if eta_str else ""
-                        print(
-                            f"Processed {total_seen:,} / {total_files:,} ({pct:.1f}%) — "
-                            f"{rate_str}{eta_part} [{_format_duration(elapsed)}]",
-                            end="\r" if _IS_TTY else "\n",
-                        )
-                    else:
-                        # Phase 1: discovery still running
-                        print(
-                            f"Discovering... {discovery.discovered:,} found | "
-                            f"Processed {total_seen:,} ({cached_count:,} cached) — "
-                            f"{rate_str} [{_format_duration(elapsed)}]",
-                            end="\r" if _IS_TTY else "\n",
-                        )
-                    last_progress_time = current_time
-
+        except Exception:
+            _stop_workers(interrupt=True)
+            _drain_results()
+            raise
         except KeyboardInterrupt:
             interrupted = True
+            _stop_workers(interrupt=True)
+            _drain_results()
             print(
                 f"\n\nInterrupted! Saving progress ({len(photo_data):,} files processed so far)..."
             )
@@ -2666,7 +2967,7 @@ def run_scan(
             try:
                 if _safe_write_inventory(
                     output,
-                    photo_data,
+                    list(photo_data),
                     inventory_root,
                     hash_options,
                     old_format,
@@ -2683,8 +2984,6 @@ def run_scan(
                 "The scan will pick up where it left off using the saved inventory as cache."
             )
 
-        exiftool.stop()
-
     # Wait for producer thread to finish (should already be done)
     producer.join(timeout=5)
 
@@ -2696,6 +2995,7 @@ def run_scan(
     if total_seen == 0:
         if not quiet:
             print("No files found.")
+        cleanup_all()
         return True
 
     if not quiet:
@@ -2752,7 +3052,15 @@ def run_scan(
         perf_stats["t_cache_lookup"] = _t_cache_lookup_total
         perf_stats["t_exiftool"] = _t_exiftool_total
         perf_stats["t_hashing"] = _t_hashing_total
+        perf_stats["t_geolocate"] = _t_geolocate_total
         perf_stats["t_checkpoints"] = _t_checkpoint_total
+        perf_stats["t_dispatch_wait"] = _t_dispatch_wait
+        perf_stats["t_results_wait"] = _t_results_wait
+        perf_stats["t_worker_total"] = _t_worker_total
+        perf_stats["worker_details"] = sorted(
+            _worker_details, key=lambda item: item.get("worker_id", 0)
+        )
+        perf_stats["worker_count"] = worker_count
         perf_stats["t_write"] = _t_write
         perf_stats["files_total"] = total_seen
         perf_stats["files_cached"] = cached_count
@@ -2766,24 +3074,56 @@ def _print_perf_summary(label, stats):
     wall = stats.get("wall_total", 0)
     if wall <= 0:
         return
+    worker_count = stats.get("worker_count", 1)
     print(f"\n--- Timing breakdown (overlapping; not additive): {label} ---")
     items = [
-        ("Inventory cache load", stats.get("t_cache_load", 0)),
-        ("Discovery (wall)", stats.get("t_discovery_wall", 0)),
-        ("  scandir walk", stats.get("t_discovery_walk", 0)),
-        ("  queue put-wait", stats.get("t_discovery_queue_wait", 0)),
-        ("realpath() calls", stats.get("t_realpath", 0)),
-        ("stat() calls", stats.get("t_stat", 0)),
-        ("TSV cache lookups", stats.get("t_cache_lookup", 0)),
-        ("ExifTool batches", stats.get("t_exiftool", 0)),
-        ("Content hashing", stats.get("t_hashing", 0)),
-        ("Checkpoints", stats.get("t_checkpoints", 0)),
-        ("Final write", stats.get("t_write", 0)),
+        ("Inventory cache load", stats.get("t_cache_load", 0), True),
+        ("Discovery (wall)", stats.get("t_discovery_wall", 0), True),
+        ("  scandir walk", stats.get("t_discovery_walk", 0), True),
+        ("  queue put-wait", stats.get("t_discovery_queue_wait", 0), True),
+        ("realpath() calls", stats.get("t_realpath", 0), True),
+        ("stat() calls", stats.get("t_stat", 0), True),
+        ("TSV cache lookups", stats.get("t_cache_lookup", 0), True),
+        ("Dispatch wait", stats.get("t_dispatch_wait", 0), True),
+        ("Results drain", stats.get("t_results_wait", 0), True),
+        (f"ExifTool ({worker_count}w sum)", stats.get("t_exiftool", 0), False),
+        (
+            f"Content hashing ({worker_count}w sum)",
+            stats.get("t_hashing", 0),
+            False,
+        ),
+        (f"Geolocation ({worker_count}w sum)", stats.get("t_geolocate", 0), False),
+        ("Checkpoints", stats.get("t_checkpoints", 0), True),
+        ("Final write", stats.get("t_write", 0), True),
     ]
-    for name, secs in items:
-        pct = secs / wall * 100 if wall else 0
-        print(f"  {name:<22s} {secs:7.2f}s  ({pct:5.1f}% of wall)")
-    print(f"  {'Wall total':<22s} {wall:7.2f}s")
+    for name, secs, show_pct in items:
+        if show_pct:
+            pct = secs / wall * 100 if wall else 0
+            print(f"  {name:<26s} {secs:7.2f}s  ({pct:5.1f}% of wall)")
+        else:
+            print(f"  {name:<26s} {secs:7.2f}s  (sum across workers)")
+    print(f"  {'Wall total':<26s} {wall:7.2f}s")
+    worker_details = stats.get("worker_details") or []
+    worker_active_total = sum(item.get("t_active", 0) for item in worker_details)
+    if worker_active_total:
+        print(
+            f"  {'Worker active total':<26s} {worker_active_total:7.2f}s  (parallel; sum exceeds wall by design)"
+        )
+    if worker_details:
+        print("  Per-worker:")
+        for item in worker_details:
+            print(
+                "    "
+                f"#{item.get('worker_id', 0):<2d} "
+                f"wall={item.get('wall', 0):.2f}s "
+                f"active={item.get('t_active', 0):.2f}s "
+                f"exif={item.get('t_exiftool', 0):.2f}s "
+                f"hash={item.get('t_hashing', 0):.2f}s "
+                f"geo={item.get('t_geolocate', 0):.2f}s "
+                f"push={item.get('t_queue_push', 0):.2f}s "
+                f"files={item.get('files', 0):,} "
+                f"errors={item.get('errors', 0)}"
+            )
     total = stats.get("files_total", 0)
     cached = stats.get("files_cached", 0)
     processed = stats.get("files_processed", 0)
@@ -3142,6 +3482,7 @@ Options:
   --hash {sample,full,off}  Hashing mode (default: off). Use --hash sample to enable.
   --hash-cache PATH        Path to SQLite hash cache.
   --no-hash-cache          Disable hash cache.
+  --workers N       Number of parallel ExifTool workers (default: 4).
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
   --save             Save the current scan configuration for later use.
@@ -3264,6 +3605,13 @@ For more details on a specific option, you can also use:
         help="Print a performance timing summary after each scan.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Number of parallel ExifTool worker processes (default: 4).",
+    )
+    parser.add_argument(
         "--linux",
         action="store_const",
         dest="path_style",
@@ -3363,6 +3711,7 @@ For more details on a specific option, you can also use:
             "hash_exts": args.hash_exts,
             "old_format": args.old_format,
             "path_style": args.path_style,
+            "workers": _clamp_worker_count(args.workers),
         }
 
         config = load_config()
@@ -3429,6 +3778,7 @@ For more details on a specific option, you can also use:
                 perf_stats=scan_perf,
                 path_style=args.path_style,
                 raw_output=output,
+                workers=args.workers,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
@@ -3490,6 +3840,7 @@ For more details on a specific option, you can also use:
                     old_format=flags.get("old_format", False),
                     perf_stats=scan_perf,
                     path_style=flags.get("path_style", "auto"),
+                    workers=flags.get("workers", 4),
                 )
                 if ok is False:
                     any_scan_failed = True
@@ -3537,6 +3888,7 @@ For more details on a specific option, you can also use:
         perf_stats=scan_perf,
         path_style=args.path_style,
         raw_output=output,
+        workers=args.workers,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)

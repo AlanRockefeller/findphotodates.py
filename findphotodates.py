@@ -101,10 +101,31 @@ TSV_COLUMNS = [
     "content_hash",
 ]
 
-# Default hash cache path
-DEFAULT_HASH_CACHE_DIR = Path.home() / ".cache" / "findphotodates"
-DEFAULT_HASH_CACHE_PATH = DEFAULT_HASH_CACHE_DIR / "hash_cache.sqlite"
+# Default cache paths
+def _default_cache_dir():
+    """Return the per-user cache directory for findphotodates.
+
+    Linux/macOS/WSL: $XDG_CACHE_HOME/findphotodates if set, else ~/.cache/findphotodates
+    Windows: %LOCALAPPDATA%\\findphotodates\\Cache
+    """
+    if platform.system() == "Windows":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "findphotodates" / "Cache"
+        return Path.home() / "AppData" / "Local" / "findphotodates" / "Cache"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg) / "findphotodates"
+    return Path.home() / ".cache" / "findphotodates"
+
+
+DEFAULT_CACHE_DIR = _default_cache_dir()
+DEFAULT_HASH_CACHE_DIR = DEFAULT_CACHE_DIR  # backward-compat alias
+DEFAULT_HASH_CACHE_PATH = DEFAULT_CACHE_DIR / "hash_cache.sqlite"
+DEFAULT_LOCATION_CACHE_PATH = DEFAULT_CACHE_DIR / "location_cache.sqlite"
 HASH_CACHE_BATCH_COMMIT_EVERY = 1000
+LOCATION_CACHE_BATCH_COMMIT_EVERY = 1000
+LOCATION_CACHE_PRECISION = 2
 
 # ---------------------------------------------------------------------------
 # Cross-platform cache-key normalization (WSL ↔ Windows)
@@ -122,6 +143,44 @@ HASH_CACHE_BATCH_COMMIT_EVERY = 1000
 # after backslash → forward-slash conversion.
 
 _IS_TTY = sys.stdout.isatty()
+
+
+# Alan 5/4/26 - Cosmetic: detect whether the current terminal can render ANSI
+# escape sequences. POSIX TTYs always can; Windows is conservative — older
+# PowerShell 5 / cmd.exe will print raw "ESC[2K" garbage if we send it
+# unconditionally, so we only enable ANSI when the host advertises it
+# (Windows Terminal, ConEmu, ANSICON, or a real TERM).
+def _detect_ansi_support():
+    if not _IS_TTY:
+        return False
+    if os.name != "nt":
+        return True
+    if os.environ.get("WT_SESSION"):
+        return True  # Windows Terminal
+    if os.environ.get("ConEmuANSI", "").upper() == "ON":
+        return True
+    if "ANSICON" in os.environ:
+        return True
+    term = os.environ.get("TERM", "")
+    if term and term.lower() != "dumb":
+        return True
+    return False
+
+
+_ANSI_OK = _detect_ansi_support()
+
+
+def _clear_progress_line():
+    """Clear the carriage-return progress line before printing a summary.
+
+    On ANSI-capable terminals: emit "\\r\\x1b[2K" to wipe the line in place.
+    Otherwise: emit a newline so the next print starts cleanly without
+    leaking raw escape codes onto the screen.
+    """
+    if _ANSI_OK:
+        print("\r\033[2K", end="")
+    else:
+        print()
 
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 _WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
@@ -219,6 +278,31 @@ def _resolve_local_inventory_path(path):
     if not path:
         return path
     return os.path.abspath(format_path_style(path, _host_path_style()))
+
+
+def migrate_default_hash_cache(quiet=False, debug=False):
+    """Move the old Windows default hash cache into the native cache directory."""
+    if platform.system() != "Windows":
+        return False
+    old_path = Path.home() / ".cache" / "findphotodates" / "hash_cache.sqlite"
+    new_path = DEFAULT_HASH_CACHE_PATH
+    if old_path == new_path or not old_path.exists() or new_path.exists():
+        return False
+    try:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(old_path, new_path)
+        for suffix in ("-wal", "-shm"):
+            old_sidecar = Path(str(old_path) + suffix)
+            new_sidecar = Path(str(new_path) + suffix)
+            if old_sidecar.exists() and not new_sidecar.exists():
+                os.replace(old_sidecar, new_sidecar)
+        if not quiet:
+            print(f"Moved existing hash cache to {new_path}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"Debug: Failed to migrate hash cache from {old_path}: {e}")
+        return False
 
 
 def detect_inventory_path_style(tsv_path):
@@ -361,6 +445,19 @@ def parse_hash_args(
         hash_exts=hash_exts,
         sample_algo=sample_algo,
         full_algo=full_algo,
+    )
+
+
+def parse_location_args(location_cache_path=None, no_location_cache=False):
+    """Parse and normalize reverse-geocoding cache options."""
+    use_cache = not no_location_cache
+    path = location_cache_path
+    if use_cache and path is None:
+        path = str(DEFAULT_LOCATION_CACHE_PATH)
+    return types.SimpleNamespace(
+        use_location_cache=use_cache,
+        location_cache_path=path,
+        precision=LOCATION_CACHE_PRECISION,
     )
 
 
@@ -526,6 +623,76 @@ def put_cached_hash(
         if pending_counter is not None:
             pending_counter[0] += 1
             if pending_counter[0] >= HASH_CACHE_BATCH_COMMIT_EVERY:
+                conn.commit()
+                pending_counter[0] = 0
+        else:
+            conn.commit()
+    except Exception:
+        pass
+
+
+def open_location_cache(cache_path, debug=False):
+    """Open SQLite location cache and ensure the expected table exists."""
+    try:
+        import sqlite3
+    except ImportError:
+        if debug:
+            print("Debug: sqlite3 module not found.")
+        return None
+    try:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(cache_path)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS location_cache (
+                lat_rounded REAL NOT NULL,
+                lon_rounded REAL NOT NULL,
+                precision INTEGER NOT NULL,
+                location TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (lat_rounded, lon_rounded, precision)
+            )
+        """)
+        conn.commit()
+        return conn
+    except Exception as e:
+        if debug:
+            print(f"Debug: Failed to open location cache at {cache_path}: {e}")
+        return None
+
+
+def get_cached_location(conn, lat_rounded, lon_rounded, precision):
+    """Return cached location string if present, else None."""
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            """SELECT location FROM location_cache
+               WHERE lat_rounded = ? AND lon_rounded = ? AND precision = ?""",
+            (lat_rounded, lon_rounded, precision),
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def put_cached_location(
+    conn, lat_rounded, lon_rounded, precision, location, pending_counter=None
+):
+    """Store a resolved location in the SQLite cache."""
+    if conn is None or not location or is_coordinate_string(location):
+        return
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO location_cache
+               (lat_rounded, lon_rounded, precision, location, fetched_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (lat_rounded, lon_rounded, precision, location, int(time.time())),
+        )
+        if pending_counter is not None:
+            pending_counter[0] += 1
+            if pending_counter[0] >= LOCATION_CACHE_BATCH_COMMIT_EVERY:
                 conn.commit()
                 pending_counter[0] = 0
         else:
@@ -731,12 +898,29 @@ class ExifToolPersistent:
         if self._proc is not None:
             return
         try:
+            # Alan 5/3/26 - Force UTF-8 on the pipes to ExifTool.  Without
+            # explicit encoding, Python uses the locale codec for text=True
+            # pipes, which on Windows is typically cp1252 and crashes with
+            # UnicodeEncodeError on filenames containing characters like
+            # U+202F (narrow no-break space).  "-charset filename=UTF8" tells
+            # ExifTool that filenames arriving on the -@ argfile pipe are
+            # UTF-8 rather than the active Windows code page.
             self._proc = subprocess.Popen(
-                ["exiftool", "-stay_open", "True", "-@", "-"],
+                [
+                    "exiftool",
+                    "-charset",
+                    "filename=UTF8",
+                    "-stay_open",
+                    "True",
+                    "-@",
+                    "-",
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
             )
         except FileNotFoundError as e:
             raise FileNotFoundError(
@@ -760,21 +944,56 @@ class ExifToolPersistent:
     def _send_and_read(self, args):
         """Send args to the persistent process and read lines until sentinel.
 
-        Returns list of stripped lines, or None on process death.
-        Retries once if the process dies mid-write.
+        Returns list of stripped lines, or None on process death or on a
+        UnicodeEncodeError that survived even after restarting the process
+        with UTF-8 pipes.  Retries once if the process dies mid-write.
         """
         if self._proc is None:
             self.start()
         proc = self._proc
+        payload = "\n".join(args) + "\n-execute\n"
         try:
-            proc.stdin.write("\n".join(args) + "\n-execute\n")
+            proc.stdin.write(payload)
             proc.stdin.flush()
         except (BrokenPipeError, OSError):
             self._proc = None
             self.start()
             proc = self._proc
-            proc.stdin.write("\n".join(args) + "\n-execute\n")
-            proc.stdin.flush()
+            # Alan 5/4/26 - Catch BrokenPipeError/OSError on the retry too:
+            # if the freshly-restarted ExifTool also dies during write/flush,
+            # we previously tracebacked. Treat this like the encode failure:
+            # warn, drop the process, return None so batch_query falls back
+            # and the file is recorded with blank EXIF.
+            try:
+                proc.stdin.write(payload)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, UnicodeEncodeError) as e:
+                print(
+                    f"Warning: ExifTool retry write failed: {e!r}; args={args!r}",
+                    file=sys.stderr,
+                )
+                try:
+                    if self._proc is not None:
+                        self._proc.kill()
+                except Exception:
+                    pass
+                self._proc = None
+                return None
+        except UnicodeEncodeError as e:
+            # Should not happen with utf-8 pipes, but stay defensive: a single
+            # bad path must not abort the whole scan.  Restart the process
+            # (its stdin buffer state is now unknown) and let the caller fall
+            # back to per-file querying.
+            print(
+                f"Warning: ExifTool stdin encode failed: {e!r}; args={args!r}",
+                file=sys.stderr,
+            )
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+            return None
 
         lines = []
         while True:
@@ -955,10 +1174,17 @@ def get_photo_data(filepath, _exiftool=None):
 
 # Global variables for geolocation rate limiting and coordinate caching
 _last_geolocate_time = 0
-_coord_cache = {}  # (round(lat,5), round(lon,5)) -> location
+_coord_cache = {}  # (round(lat,2), round(lon,2)) -> location
 
 
-def geolocate(lat, lon):
+def _coord_cache_key(lat, lon, precision=LOCATION_CACHE_PRECISION):
+    try:
+        return (round(float(lat), precision), round(float(lon), precision))
+    except (ValueError, TypeError):
+        return None
+
+
+def geolocate(lat, lon, location_conn=None, pending_counter=None):
     """Convert GPS coordinates to a human-readable location using Nominatim API."""
     global _last_geolocate_time
 
@@ -972,10 +1198,23 @@ def geolocate(lat, lon):
     except (ValueError, TypeError):
         return f"{lat}, {lon}"
 
-    # Check coordinate cache (round to 5 decimal places ~1.1m precision)
-    cache_key = (round(lat_float, 5), round(lon_float, 5))
+    # Check coordinate cache (round to 2 decimal places ~1 km precision)
+    cache_key = _coord_cache_key(lat_float, lon_float)
+    if cache_key is None:
+        return f"{lat}, {lon}"
     if cache_key in _coord_cache:
         return _coord_cache[cache_key]
+
+    lat_rounded, lon_rounded = cache_key
+    cached_location = get_cached_location(
+        location_conn,
+        lat_rounded,
+        lon_rounded,
+        LOCATION_CACHE_PRECISION,
+    )
+    if cached_location:
+        _coord_cache[cache_key] = cached_location
+        return cached_location
 
     # Rate limiting: wait at least 1 second since last request
     current_time = time.time()
@@ -1023,6 +1262,14 @@ def geolocate(lat, lon):
 
             # Cache the result
             _coord_cache[cache_key] = location
+            put_cached_location(
+                location_conn,
+                lat_rounded,
+                lon_rounded,
+                LOCATION_CACHE_PRECISION,
+                location,
+                pending_counter=pending_counter,
+            )
             return location
 
     except urllib.error.HTTPError as e:
@@ -1114,6 +1361,16 @@ def load_cache(output_file, debug=False):
                         gps_lat = row.get("gps_lat", "") or None
                         gps_lon = row.get("gps_lon", "") or None
                         location = row.get("location", "") or None
+
+                        if (
+                            gps_lat
+                            and gps_lon
+                            and location
+                            and not is_coordinate_string(location)
+                        ):
+                            coord_key = _coord_cache_key(gps_lat, gps_lon)
+                            if coord_key is not None:
+                                _coord_cache.setdefault(coord_key, location)
 
                         # Treat coordinate strings as missing location (allows retry)
                         if location and is_coordinate_string(location):
@@ -1336,6 +1593,189 @@ def summarize_results(photo_data, file_counts, quiet, debug=False):
 def _expand_path(p: str) -> str:
     """Expand user home directory and convert to absolute path."""
     return os.path.abspath(os.path.expanduser(p))
+
+
+# Alan 5/3/26 - Preflight helpers: catch predictable setup mistakes (bad
+# --output dir, unwritable parent, --output is a directory, missing input)
+# BEFORE a multi-minute scan starts, instead of crashing at first checkpoint
+# with a Python traceback.
+def _print_user_error(lines):
+    """Print a user-facing error block without a traceback.
+
+    Accepts either a single string or a list of strings (one per line).
+    """
+    if isinstance(lines, str):
+        lines = [lines]
+    for line in lines:
+        print(line)
+
+
+def _preflight_input_directory(directory):
+    """Validate the scan's input directory before discovery starts.
+
+    Returns True if usable. Returns False after printing a friendly,
+    traceback-free message if the directory is missing, is not a directory,
+    or cannot be opened.
+    """
+    if not os.path.exists(directory):
+        _print_user_error([
+            "Error: Input directory does not exist:",
+            f"  {directory}",
+            "The scan was not started.",
+            "Check the --directory argument for typos.",
+        ])
+        return False
+    if not os.path.isdir(directory):
+        _print_user_error([
+            "Error: --directory must be a directory, but this is a file:",
+            f"  {directory}",
+            "The scan was not started.",
+        ])
+        return False
+    try:
+        # Touch the directory listing to surface permission errors up front.
+        with os.scandir(directory) as it:
+            for _ in it:
+                break
+    except PermissionError as e:
+        _print_user_error([
+            "Error: Permission denied opening input directory:",
+            f"  {directory}",
+            f"  ({e})",
+            "The scan was not started.",
+        ])
+        return False
+    except OSError as e:
+        _print_user_error([
+            "Error: Cannot open input directory:",
+            f"  {directory}",
+            f"  ({e})",
+            "The scan was not started.",
+        ])
+        return False
+    return True
+
+
+def _preflight_output_path(output, raw_output=None):
+    """Validate that the output file path is usable before scanning starts.
+
+    Catches the common cases that would otherwise crash mid-scan:
+      - --output points at an existing directory
+      - parent directory does not exist (esp. Windows drive-root-relative typos)
+      - parent directory exists but is not writable
+
+    Returns True if usable. Returns False after printing a helpful message.
+    """
+    output_abs = os.path.abspath(output)
+
+    if os.path.isdir(output_abs):
+        _print_user_error([
+            "Error: --output must be a file path, but this is a directory:",
+            f"  {output_abs}",
+            "Choose a file path inside the directory instead.",
+            "The scan was not started.",
+        ])
+        return False
+
+    output_dir = os.path.dirname(output_abs) or "."
+
+    if not os.path.isdir(output_dir):
+        msg = [
+            "Error: Output directory does not exist:",
+            f"  {output_dir}",
+            "The scan was not started.",
+            "Create the directory or choose a valid --output path.",
+        ]
+        # Windows: a path beginning with a single backslash (but not "\\")
+        # is drive-root-relative — a frequent source of typos when the user
+        # meant their profile directory.
+        if platform.system() == "Windows" and raw_output:
+            if raw_output.startswith("\\") and not raw_output.startswith("\\\\"):
+                msg.append(
+                    f"On Windows, a path like {raw_output} is drive-root-relative"
+                )
+                msg.append(f"  and resolves to: {output_abs}")
+            user_profile = os.environ.get("USERPROFILE")
+            if user_profile:
+                msg.append("Your current profile directory is:")
+                msg.append(f"  {user_profile}")
+        _print_user_error(msg)
+        return False
+
+    # Try writing a small temp file to confirm the directory is writable.
+    # Doing this here means we fail fast instead of after a long scan when
+    # the first checkpoint tries (and fails) to mkstemp().
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".findphotodates_preflight_", dir=output_dir
+        )
+        os.close(fd)
+        os.unlink(tmp_path)
+    except (PermissionError, OSError) as e:
+        _print_user_error([
+            "Error: Cannot write to output directory:",
+            f"  {output_dir}",
+            f"  ({e.__class__.__name__}: {e})",
+            "Choose a writable --output path or fix the directory permissions.",
+            "The scan was not started.",
+        ])
+        return False
+
+    return True
+
+
+def validate_scan_paths(directory, output, raw_output=None):
+    """Run all preflight checks for a scan. Returns True if both input and
+    output paths look usable, False otherwise. Friendly messages already
+    printed on failure.
+    """
+    if not _preflight_input_directory(directory):
+        return False
+    if not _preflight_output_path(output, raw_output=raw_output):
+        return False
+    return True
+
+
+def _safe_write_inventory(
+    output,
+    photo_data,
+    inventory_root,
+    hash_options,
+    old_format,
+    path_style,
+    debug=False,
+    context="write",
+):
+    """Wrap write_dates_to_file_atomic() with friendly error handling.
+
+    Returns True on success, False on a predictable filesystem error
+    (FileNotFoundError, PermissionError, OSError — disk full, access denied,
+    parent dir vanished, etc.). Re-raises only when --debug is set so the
+    full traceback is still available for unusual failures.
+    """
+    try:
+        write_dates_to_file_atomic(
+            output,
+            photo_data,
+            inventory_root=inventory_root,
+            hash_options=hash_options,
+            old_format=old_format,
+            path_style=path_style,
+        )
+        return True
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        output_abs = os.path.abspath(output)
+        output_dir = os.path.dirname(output_abs) or "."
+        _print_user_error([
+            f"Error: Could not write inventory ({context}):",
+            f"  file:  {output_abs}",
+            f"  dir:   {output_dir}",
+            f"  cause: {e.__class__.__name__}: {e}",
+            "Progress could not be saved.",
+        ])
+        if debug:
+            raise
+        return False
 
 
 def _resolve_extensions(args):
@@ -1750,9 +2190,11 @@ def run_scan(
     quiet=False,
     debug=False,
     hash_options=None,
+    location_options=None,
     old_format=False,
     perf_stats=None,
     path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
+    raw_output=None,  # Alan 5/3/26 - original CLI --output arg, used only for friendly Windows path hints
 ):
     """Run a scan on the specified directory.
 
@@ -1764,8 +2206,18 @@ def run_scan(
     if path_style == "auto":
         path_style = resolve_output_path_style("auto", output, directory)
 
+    # Alan 5/3/26 - Validate input + output paths up front. This previously
+    # only checked that the input directory existed, and the output path was
+    # not validated at all — a bad --output dir would survive a multi-minute
+    # scan and then crash at the first checkpoint when tempfile.mkstemp()
+    # tried to create the temp file in a non-existent parent directory.
+    if not validate_scan_paths(directory, output, raw_output=raw_output):
+        return False
+
     if hash_options is None:
         hash_options = parse_hash_args(quiet=quiet)
+    if location_options is None:
+        location_options = parse_location_args()
 
     if old_format:
         # Force hashing off for old format
@@ -1777,6 +2229,12 @@ def run_scan(
         else None
     )
     hash_cache_pending = [0] if hash_conn else None
+    location_conn = (
+        open_location_cache(location_options.location_cache_path, debug=debug)
+        if (locate and location_options.use_location_cache)
+        else None
+    )
+    location_cache_pending = [0] if location_conn else None
 
     if not quiet and hash_options.hash_mode != "off":
         msg = f"Hashing enabled ({hash_options.hash_mode})"
@@ -1788,11 +2246,7 @@ def run_scan(
         print(msg)
 
     inventory_root = os.path.abspath(directory)
-    # Ensure the directory exists
-    if not os.path.exists(directory):
-        if not quiet:
-            print(f"Error: Directory '{directory}' does not exist.")
-        return False
+    # Alan 5/3/26 - Existing path check moved into validate_scan_paths() above.
 
     if not quiet:
         if extensions is None:
@@ -1843,6 +2297,16 @@ def run_scan(
                 if hash_cache_pending is not None and hash_cache_pending[0] > 0:
                     hash_conn.commit()
                 hash_conn.close()
+            except Exception:
+                pass
+        if location_conn is not None:
+            try:
+                if (
+                    location_cache_pending is not None
+                    and location_cache_pending[0] > 0
+                ):
+                    location_conn.commit()
+                location_conn.close()
             except Exception:
                 pass
 
@@ -1901,7 +2365,12 @@ def run_scan(
                 )
                 location = None
                 if locate and gps_lat and gps_lon:
-                    location = geolocate(gps_lat, gps_lon)
+                    location = geolocate(
+                        gps_lat,
+                        gps_lon,
+                        location_conn=location_conn,
+                        pending_counter=location_cache_pending,
+                    )
                     if location and is_coordinate_string(location):
                         location = None
                 _th0 = time.time()
@@ -1979,10 +2448,7 @@ def run_scan(
                     total_files = discovery.total
                     if not quiet:
                         # Clear \r progress line, then print clean discovery summary
-                        if _IS_TTY:
-                            print("\r\033[2K", end="")
-                        else:
-                            print()
+                        _clear_progress_line()
                         print(f"Discovery complete: {total_files:,} files found.")
 
                 try:
@@ -2029,7 +2495,12 @@ def run_scan(
 
                         if locate and gps_lat and gps_lon:
                             if not location or is_coordinate_string(location):
-                                location = geolocate(gps_lat, gps_lon)
+                                location = geolocate(
+                                    gps_lat,
+                                    gps_lon,
+                                    location_conn=location_conn,
+                                    pending_counter=location_cache_pending,
+                                )
                                 cached_entry["location"] = location
 
                         _th0 = time.time()
@@ -2121,22 +2592,42 @@ def run_scan(
                 # Checkpoint every 15 minutes
                 if total_seen > 0 and (current_time - last_save_time) > 900:
                     _tc0 = time.time()
-                    write_dates_to_file_atomic(
+                    # Alan 5/3/26 - Use _safe_write_inventory so a transient
+                    # write failure (drive removed, dir vanished, disk full,
+                    # ACL change mid-scan) prints a friendly message instead
+                    # of a Python traceback.
+                    _ckpt_ok = _safe_write_inventory(
                         output,
                         photo_data,
-                        inventory_root=inventory_root,
-                        hash_options=hash_options,
-                        old_format=old_format,
-                        path_style=path_style,
+                        inventory_root,
+                        hash_options,
+                        old_format,
+                        path_style,
+                        debug=debug,
+                        context="checkpoint",
                     )
                     _t_checkpoint_total += time.time() - _tc0
                     last_save_time = current_time
                     if not quiet:
-                        if _IS_TTY:
-                            print("\r\033[2K", end="")
-                        else:
-                            print()
-                        print(f"[Checkpoint: {len(photo_data):,} files saved]")
+                        _clear_progress_line()
+                        if _ckpt_ok:
+                            print(f"[Checkpoint: {len(photo_data):,} files saved]")
+                    # Alan 5/4/26 - If the checkpoint failed, stop the scan
+                    # rather than continuing with unsaved data for hours.
+                    # The final write would just hit the same error, and
+                    # the user needs to fix the underlying issue (bad path,
+                    # full disk, revoked permissions) before any rerun.
+                    if not _ckpt_ok:
+                        print(
+                            "Error: Checkpoint failed; stopping scan so you can "
+                            "fix the output path/disk/permissions and rerun."
+                        )
+                        try:
+                            exiftool.stop()
+                        except Exception:
+                            pass
+                        cleanup_all()
+                        return False
 
                 # Progress line every 2 seconds
                 if not quiet and (current_time - last_progress_time) >= 2.0:
@@ -2169,16 +2660,21 @@ def run_scan(
             print(
                 f"\n\nInterrupted! Saving progress ({len(photo_data):,} files processed so far)..."
             )
+            # Alan 5/3/26 - _safe_write_inventory already prints a friendly
+            # error block on predictable failures; only show a generic
+            # warning for unexpected exceptions.
             try:
-                write_dates_to_file_atomic(
+                if _safe_write_inventory(
                     output,
                     photo_data,
-                    inventory_root=inventory_root,
-                    hash_options=hash_options,
-                    old_format=old_format,
-                    path_style=path_style,
-                )
-                print(f"Progress saved to '{output}'.")
+                    inventory_root,
+                    hash_options,
+                    old_format,
+                    path_style,
+                    debug=debug,
+                    context="interrupted save",
+                ):
+                    print(f"Progress saved to '{output}'.")
             except Exception as save_err:
                 print(f"WARNING: Could not save progress: {save_err}")
             print("\nTo resume, run the same command again:")
@@ -2205,24 +2701,30 @@ def run_scan(
     if not quiet:
         elapsed = time.time() - start_time
         # Clear \r progress line, then print clean completion summary
-        if _IS_TTY:
-            print("\r\033[2K", end="")
-        else:
-            print()
+        _clear_progress_line()
         print(
             f"Processing complete: {total_seen:,} files in {_format_duration(elapsed)}."
         )
 
     _tw0 = time.time()
-    write_dates_to_file_atomic(
+    # Alan 5/3/26 - Wrap final write in _safe_write_inventory so the user
+    # gets a friendly error (not a Python traceback) if the output dir
+    # disappeared, filled up, or revoked write access during the scan.
+    _final_ok = _safe_write_inventory(
         output,
         photo_data,
-        inventory_root=inventory_root,
-        hash_options=hash_options,
-        old_format=old_format,
-        path_style=path_style,
+        inventory_root,
+        hash_options,
+        old_format,
+        path_style,
+        debug=debug,
+        context="final write",
     )
     _t_write = time.time() - _tw0
+
+    if not _final_ok:
+        cleanup_all()
+        return False
 
     if not quiet:
         print(f"Dates written to '{output}' ({len(photo_data):,} files listed).")
@@ -2613,7 +3115,7 @@ Key Features:
   - Extracts 'Date Taken' and GPS from media files via ExifTool.
   - Caches results in a TSV file to speed up subsequent runs.
   - Optional content hashing (--hash sample) for backup/deduplication safety.
-  - Can reverse geolocate files using GPS coordinates (--locate).
+  - Can reverse geolocate files using GPS coordinates (--locate), with persistent caching.
   - Can save and manage multiple scan configurations (--save, --scan).
 
 Usage: findphotodates.py [options]
@@ -2635,7 +3137,11 @@ Options:
   --video            Index only video files (MP4, MOV, AVI, etc.).
   --extension EXT    Index only a specific file extension (e.g., --extension pdf).
   --locate           Attempt to reverse geolocate files using GPS coordinates.
+  --location-cache PATH  Path to SQLite reverse-geocoding cache.
+  --no-location-cache    Disable persistent reverse-geocoding cache.
   --hash {sample,full,off}  Hashing mode (default: off). Use --hash sample to enable.
+  --hash-cache PATH        Path to SQLite hash cache.
+  --no-hash-cache          Disable hash cache.
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
   --save             Save the current scan configuration for later use.
@@ -2687,7 +3193,7 @@ For more details on a specific option, you can also use:
     parser.add_argument(
         "--locate",
         action="store_true",
-        help="Attempt to locate files using GPS coordinates.",
+        help="Attempt to locate files using GPS coordinates. Uses a persistent SQLite cache by default.",
     )
     parser.add_argument(
         "--test", action="store_true", help="Run date parsing tests and exit."
@@ -2726,6 +3232,17 @@ For more details on a specific option, you can also use:
     )
     parser.add_argument(
         "--no-hash-cache", action="store_true", help="Disable hash cache."
+    )
+    parser.add_argument(
+        "--location-cache",
+        metavar="PATH",
+        default=None,
+        help="Path to SQLite reverse-geocoding cache.",
+    )
+    parser.add_argument(
+        "--no-location-cache",
+        action="store_true",
+        help="Disable persistent reverse-geocoding cache.",
     )
     parser.add_argument(
         "--hash-exts",
@@ -2782,10 +3299,16 @@ For more details on a specific option, you can also use:
         hash_exts_str=args.hash_exts,
         quiet=args.quiet,
     )
+    location_options = parse_location_args(
+        location_cache_path=args.location_cache,
+        no_location_cache=args.no_location_cache,
+    )
 
     if args.test:
         test_date_parsing()
         return
+
+    migrate_default_hash_cache(quiet=args.quiet, debug=args.debug)
 
     if args.add_hashes:
         output_abs = _expand_path(output)
@@ -2802,9 +3325,10 @@ For more details on a specific option, you can also use:
     if args.save:
         directory_abs = _expand_path(args.directory)
         output_abs = _expand_path(output)
-        if not os.path.exists(directory_abs):
-            print(f"Error: Directory '{directory_abs}' does not exist.")
-            return
+        # Alan 5/3/26 - Use the shared input-directory preflight so --save
+        # gives the same friendly error as a regular scan and exits nonzero.
+        if not _preflight_input_directory(directory_abs):
+            sys.exit(1)
 
         drive_root, path_relative = detect_drive_root(directory_abs)
         drive_hint_value = get_drive_hint(drive_root)
@@ -2834,6 +3358,8 @@ For more details on a specific option, you can also use:
             "hash_algo": args.hash_algo,
             "hash_cache": args.hash_cache,
             "no_hash_cache": args.no_hash_cache,
+            "location_cache": args.location_cache,
+            "no_location_cache": args.no_location_cache,
             "hash_exts": args.hash_exts,
             "old_format": args.old_format,
             "path_style": args.path_style,
@@ -2887,7 +3413,10 @@ For more details on a specific option, you can also use:
         else:
             extensions = _resolve_extensions(args)
             scan_perf = {}
-            run_scan(
+            # Alan 5/3/26 - Pass raw --output through so preflight can give
+            # Windows-specific hints (e.g. "\Users\..." is drive-root-relative)
+            # and propagate run_scan's False return as a nonzero process exit.
+            ok = run_scan(
                 directory_abs,
                 output_abs,
                 extensions,
@@ -2895,15 +3424,19 @@ For more details on a specific option, you can also use:
                 args.quiet,
                 args.debug,
                 hash_options=hash_options,
+                location_options=location_options,
                 old_format=args.old_format,
                 perf_stats=scan_perf,
                 path_style=args.path_style,
+                raw_output=output,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
                 args.debugperformance or scan_perf.get("wall_total", 0) >= 1000
             ):
                 _print_perf_summary(directory_abs, scan_perf)
+            if ok is False:
+                sys.exit(1)
             return
 
     if args.scan:
@@ -2913,6 +3446,7 @@ For more details on a specific option, you can also use:
             return
 
         all_perf = []
+        any_scan_failed = False
         print(f"Running {len(config['saved_scans'])} saved scan(s)...")
         for idx, entry in enumerate(config["saved_scans"], 1):
             resolved_dir = resolve_saved_directory(entry)
@@ -2934,11 +3468,17 @@ For more details on a specific option, you can also use:
                 hash_exts_str=flags.get("hash_exts"),
                 quiet=args.quiet,
             )
+            scan_location_options = parse_location_args(
+                location_cache_path=flags.get("location_cache"),
+                no_location_cache=flags.get("no_location_cache", False),
+            )
             saved_exts = flags.get("extensions")
             extensions = set(saved_exts) if saved_exts is not None else None
             scan_perf = {}
+            # Alan 5/3/26 - Track per-saved-scan failures so we can exit
+            # nonzero at the end if any saved scan failed preflight or write.
             try:
-                run_scan(
+                ok = run_scan(
                     resolved_dir,
                     entry.get("output_abs", "photo.dates.tsv"),
                     extensions,
@@ -2946,12 +3486,16 @@ For more details on a specific option, you can also use:
                     flags.get("quiet", False),
                     flags.get("debug", False),
                     hash_options=scan_hash_options,
+                    location_options=scan_location_options,
                     old_format=flags.get("old_format", False),
                     perf_stats=scan_perf,
                     path_style=flags.get("path_style", "auto"),
                 )
+                if ok is False:
+                    any_scan_failed = True
             except Exception as e:
                 print(f"  Error: {e}")
+                any_scan_failed = True
             # Add summary if the --debugperformance option is used, or if the run takes more than 1000 seconds
             if scan_perf:
                 if args.debugperformance or scan_perf.get("wall_total", 0) >= 1000:
@@ -2968,13 +3512,19 @@ For more details on a specific option, you can also use:
                 files = stats.get("files_total", 0)
                 print(f"  {name:<30s} {wall:7.1f}s  {files:>8,} files")
             print(f"  {'TOTAL':<30s} {total_wall:7.1f}s  {total_files:>8,} files")
+        # Alan 5/3/26 - Surface saved-scan failures via process exit code so
+        # automation/scripting can notice when a saved scan failed preflight.
+        if any_scan_failed:
+            sys.exit(1)
         return
 
     directory_abs = _expand_path(args.directory)
     output_abs = _expand_path(output)
     extensions = _resolve_extensions(args)
     scan_perf = {}
-    run_scan(
+    # Alan 5/3/26 - Pass raw --output through (used only for friendly Windows
+    # path hints in preflight) and translate False return into nonzero exit.
+    ok = run_scan(
         directory_abs,
         output_abs,
         extensions,
@@ -2982,12 +3532,16 @@ For more details on a specific option, you can also use:
         args.quiet,
         args.debug,
         hash_options=hash_options,
+        location_options=location_options,
         old_format=args.old_format,
         perf_stats=scan_perf,
         path_style=args.path_style,
+        raw_output=output,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)
+    if ok is False:
+        sys.exit(1)
 
 
 def test_date_parsing():

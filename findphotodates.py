@@ -85,6 +85,12 @@ EXIFTOOL_EXTENSIONS = (
 # that could carry EXIF dates or GPS).  Matches EXIFTOOL_EXTENSIONS.
 MEDIA_EXTENSIONS = EXIFTOOL_EXTENSIONS
 
+# Images smaller than this threshold are unlikely to carry meaningful EXIF
+# (DateTimeOriginal etc.) and are typically icons, thumbnails, or UI assets.
+# They get indexed with filesystem metadata only, skipping ExifTool entirely.
+MIN_EXIFTOOL_IMAGE_BYTES = 100_000  # 100 KB
+SIZE_FILTERED_IMAGE_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "webp"})
+
 # Backward-compatible alias used by saved scan configs from v1.4
 DEFAULT_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 
@@ -885,7 +891,7 @@ def find_files(directory, extensions, debug=False):
 
 
 EXIFTOOL_BATCH_SIZE = (
-    50  # files per exiftool -json batch; tune up for NAS, down for slow disks
+    250  # files per exiftool -json batch; tune up for NAS, down for slow disks
 )
 
 
@@ -1029,8 +1035,12 @@ class ExifToolPersistent:
             return None, None, None
         return self._parse_lines(lines)
 
-    def batch_query(self, filepaths):
+    def batch_query(self, filepaths, fast2=False):
         """Query multiple files at once using -json output.
+
+        If fast2 is True, passes -fast2 to ExifTool, which skips MakerNotes
+        and trailing metadata. Safe for JPEG/PNG/WebP. UNSAFE for RAW formats
+        that store DateTimeOriginal in MakerNotes (e.g. older Nikon bodies).
 
         Returns dict mapping filepath -> (date, gps_lat, gps_lon).
         Files that fail to parse get (None, None, None).
@@ -1043,7 +1053,11 @@ class ExifToolPersistent:
         if not filepaths:
             return {}
 
-        args = ["-json", "-n", "-f", *self._TAGS, *filepaths]
+        args = ["-json", "-n", "-f"]
+        if fast2:
+            args.append("-fast2")
+        args.extend(self._TAGS)
+        args.extend(filepaths)
         lines = self._send_and_read(args)
 
         retries = 3
@@ -1054,7 +1068,8 @@ class ExifToolPersistent:
 
         results = {fp: (None, None, None) for fp in filepaths}
         if lines is None:
-            # Fallback: query one at a time
+            # Fallback: query one at a time. query() intentionally full-parses;
+            # this rare path prefers correctness over preserving fast2.
             for fp in filepaths:
                 results[fp] = self.query(fp)
             return results
@@ -1064,7 +1079,8 @@ class ExifToolPersistent:
         try:
             records = json.loads(json_text)
         except (json.JSONDecodeError, ValueError):
-            # Fallback: query one at a time
+            # Fallback: query one at a time. query() intentionally full-parses;
+            # this rare path prefers correctness over preserving fast2.
             for fp in filepaths:
                 results[fp] = self.query(fp)
             return results
@@ -2212,6 +2228,13 @@ def _clamp_worker_count(workers):
         return 4
 
 
+def _clamp_min_image_size(min_image_size):
+    try:
+        return max(0, int(min_image_size))
+    except (TypeError, ValueError):
+        return MIN_EXIFTOOL_IMAGE_BYTES
+
+
 def _log_worker_error(error_log, error_log_lock, message):
     with error_log_lock:
         error_log.write(message + "\n")
@@ -2316,9 +2339,22 @@ def _exiftool_worker(
                 if exiftool is None:
                     exiftool = ExifToolPersistent()
                     exiftool.start()
-                os_paths = [item[1] for item in batch]
+                fast2_batch = [
+                    item for item in batch if item[5] in SIZE_FILTERED_IMAGE_EXTENSIONS
+                ]
+                full_batch = [
+                    item
+                    for item in batch
+                    if item[5] not in SIZE_FILTERED_IMAGE_EXTENSIONS
+                ]
                 _te0 = time.time()
-                batch_results = exiftool.batch_query(os_paths)
+                batch_results = {}
+                if fast2_batch:
+                    fast2_paths = [item[1] for item in fast2_batch]
+                    batch_results.update(exiftool.batch_query(fast2_paths, fast2=True))
+                if full_batch:
+                    full_paths = [item[1] for item in full_batch]
+                    batch_results.update(exiftool.batch_query(full_paths, fast2=False))
                 t_exiftool = time.time() - _te0
                 worker_stats["t_exiftool"] += t_exiftool
                 if batch_results is None:
@@ -2395,6 +2431,7 @@ def run_scan(
     path_style="linux",  # safe internal default; CLI default is "auto" (resolved before calling)
     raw_output=None,  # Alan 5/3/26 - original CLI --output arg, used only for friendly Windows path hints
     workers=4,
+    min_image_size=MIN_EXIFTOOL_IMAGE_BYTES,
 ):
     """Run a scan on the specified directory.
 
@@ -2402,6 +2439,7 @@ def run_scan(
     """
     _t0 = time.time()
     worker_count = _clamp_worker_count(workers)
+    min_image_size = _clamp_min_image_size(min_image_size)
 
     # Resolve "auto" path style once, before any writes.
     if path_style == "auto":
@@ -2686,6 +2724,34 @@ def run_scan(
             processed_count += len(rows)
             _t_hashing_total += stats["t_hashing"]
 
+        def _index_as_non_media(out_path, fs_path, key_path, size_bytes, mtime_ns, ext):
+            nonlocal processed_count, _t_hashing_total
+            _th0 = time.time()
+            content_hash = get_content_hash(
+                key_path,
+                size_bytes,
+                mtime_ns,
+                hash_options,
+                hash_conn,
+                hash_cache_pending,
+                os_path=fs_path,
+            )
+            _t_hashing_total += time.time() - _th0
+            photo_data.append(
+                (
+                    out_path,
+                    "",
+                    size_bytes,
+                    mtime_ns,
+                    "",
+                    "",
+                    "",
+                    content_hash,
+                )
+            )
+            processed_count += 1
+            file_counts[ext] += 1
+
         def _enqueue_exiftool_batch():
             if not exiftool_batch:
                 return True
@@ -2856,8 +2922,15 @@ def run_scan(
                     else:
                         # Not cached — check if exiftool-eligible
                         if ext in EXIFTOOL_EXTENSIONS:
-                            exiftool_batch.append(
-                                (
+                            # Tiny images (icons, thumbnails) almost never have EXIF.
+                            # RAW/video/other EXIFTOOL_EXTENSIONS are not filtered.
+                            skip_for_size = (
+                                min_image_size > 0
+                                and ext in SIZE_FILTERED_IMAGE_EXTENSIONS
+                                and size_bytes < min_image_size
+                            )
+                            if skip_for_size:
+                                _index_as_non_media(
                                     out_path,
                                     fs_path,
                                     key_path,
@@ -2865,39 +2938,32 @@ def run_scan(
                                     mtime_ns,
                                     ext,
                                 )
-                            )
-                            if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
-                                if not _enqueue_exiftool_batch():
-                                    _stop_workers(interrupt=True)
-                                    cleanup_all()
-                                    return False
+                            else:
+                                exiftool_batch.append(
+                                    (
+                                        out_path,
+                                        fs_path,
+                                        key_path,
+                                        size_bytes,
+                                        mtime_ns,
+                                        ext,
+                                    )
+                                )
+                                if len(exiftool_batch) >= EXIFTOOL_BATCH_SIZE:
+                                    if not _enqueue_exiftool_batch():
+                                        _stop_workers(interrupt=True)
+                                        cleanup_all()
+                                        return False
                         else:
                             # Non-media file: index with filesystem metadata only
-                            _th0 = time.time()
-                            content_hash = get_content_hash(
+                            _index_as_non_media(
+                                out_path,
+                                fs_path,
                                 key_path,
                                 size_bytes,
                                 mtime_ns,
-                                hash_options,
-                                hash_conn,
-                                hash_cache_pending,
-                                os_path=fs_path,
+                                ext,
                             )
-                            _t_hashing_total += time.time() - _th0
-                            photo_data.append(
-                                (
-                                    out_path,
-                                    "",
-                                    size_bytes,
-                                    mtime_ns,
-                                    "",
-                                    "",
-                                    "",
-                                    content_hash,
-                                )
-                            )
-                            processed_count += 1
-                            file_counts[ext] += 1
                     if (
                         cached_entry
                         and cached_entry["size_bytes"] == size_bytes
@@ -3483,6 +3549,7 @@ Options:
   --hash-cache PATH        Path to SQLite hash cache.
   --no-hash-cache          Disable hash cache.
   --workers N       Number of parallel ExifTool workers (default: 4).
+  --min-image-size BYTES  Skip ExifTool for tiny JPG/JPEG/PNG/WebP images (default: 100,000; 0 disables).
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
   --save             Save the current scan configuration for later use.
@@ -3612,6 +3679,18 @@ For more details on a specific option, you can also use:
         help="Number of parallel ExifTool worker processes (default: 4).",
     )
     parser.add_argument(
+        "--min-image-size",
+        type=int,
+        default=MIN_EXIFTOOL_IMAGE_BYTES,
+        metavar="BYTES",
+        help=(
+            f"Skip ExifTool for {'/'.join(sorted(SIZE_FILTERED_IMAGE_EXTENSIONS))} "
+            f"images smaller than this size in bytes (default: {MIN_EXIFTOOL_IMAGE_BYTES:,}). "
+            "Such files are still indexed with filesystem metadata. "
+            "Set to 0 to disable the filter."
+        ),
+    )
+    parser.add_argument(
         "--linux",
         action="store_const",
         dest="path_style",
@@ -3712,6 +3791,7 @@ For more details on a specific option, you can also use:
             "old_format": args.old_format,
             "path_style": args.path_style,
             "workers": _clamp_worker_count(args.workers),
+            "min_image_size": _clamp_min_image_size(args.min_image_size),
         }
 
         config = load_config()
@@ -3779,6 +3859,7 @@ For more details on a specific option, you can also use:
                 path_style=args.path_style,
                 raw_output=output,
                 workers=args.workers,
+                min_image_size=args.min_image_size,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
@@ -3841,6 +3922,9 @@ For more details on a specific option, you can also use:
                     perf_stats=scan_perf,
                     path_style=flags.get("path_style", "auto"),
                     workers=flags.get("workers", 4),
+                    min_image_size=flags.get(
+                        "min_image_size", MIN_EXIFTOOL_IMAGE_BYTES
+                    ),
                 )
                 if ok is False:
                     any_scan_failed = True
@@ -3889,6 +3973,7 @@ For more details on a specific option, you can also use:
         path_style=args.path_style,
         raw_output=output,
         workers=args.workers,
+        min_image_size=args.min_image_size,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)

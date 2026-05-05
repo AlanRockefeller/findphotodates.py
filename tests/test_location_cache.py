@@ -61,7 +61,7 @@ def _patch_exiftool(monkeypatch, responses_by_name):
         def stop(self):
             pass
 
-        def batch_query(self, filepaths):
+        def batch_query(self, filepaths, fast2=False):
             return {
                 fp: responses_by_name.get(Path(fp).name, (None, None, None))
                 for fp in filepaths
@@ -127,6 +127,7 @@ def test_run_scan_reuses_sqlite_location_cache_across_tsvs(tmp_path, monkeypatch
         quiet=True,
         hash_options=hash_options,
         location_options=location_options,
+        min_image_size=0,
     )
     assert calls["count"] == 1
 
@@ -140,6 +141,7 @@ def test_run_scan_reuses_sqlite_location_cache_across_tsvs(tmp_path, monkeypatch
         quiet=True,
         hash_options=hash_options,
         location_options=location_options,
+        min_image_size=0,
     )
     assert calls["count"] == 1
 
@@ -184,6 +186,7 @@ def test_run_scan_uses_tsv_prime_when_location_cache_disabled(
         quiet=True,
         hash_options=fpd.parse_hash_args(hash_mode="off"),
         location_options=fpd.parse_location_args(no_location_cache=True),
+        min_image_size=0,
     )
 
     assert calls["count"] == 0

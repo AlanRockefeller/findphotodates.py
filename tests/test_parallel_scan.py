@@ -71,7 +71,7 @@ def _patch_fixture_exiftool(monkeypatch, responses):
         def stop(self):
             pass
 
-        def batch_query(self, filepaths):
+        def batch_query(self, filepaths, fast2=False):
             return {fp: responses.get(fp, (None, None, None)) for fp in filepaths}
 
     monkeypatch.setattr(fpd, "ExifToolPersistent", FixtureExifTool)
@@ -127,6 +127,7 @@ def test_single_worker_matches_expected_serial_inventory(tmp_path, monkeypatch):
         quiet=True,
         hash_options=hash_options,
         workers=1,
+        min_image_size=0,
     )
 
     assert output.read_bytes() == _expected_inventory_bytes(root, hash_options)
@@ -148,6 +149,7 @@ def test_multi_worker_matches_single_worker_inventory(tmp_path, monkeypatch):
         quiet=True,
         hash_options=hash_options,
         workers=1,
+        min_image_size=0,
     )
     assert fpd.run_scan(
         str(root),
@@ -156,9 +158,207 @@ def test_multi_worker_matches_single_worker_inventory(tmp_path, monkeypatch):
         quiet=True,
         hash_options=hash_options,
         workers=4,
+        min_image_size=0,
     )
 
     assert multi.read_bytes() == single.read_bytes()
+
+
+def _write_sized_file(root, name, size):
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pattern = name.encode("ascii") or b"x"
+    path.write_bytes((pattern * ((size // len(pattern)) + 1))[:size])
+    return path
+
+
+def _read_data_rows(path):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return [
+            row
+            for row in csv.DictReader(
+                (line for line in f if not line.startswith("#")),
+                delimiter="\t",
+            )
+        ]
+
+
+def _patch_recording_exiftool(monkeypatch, calls):
+    class RecordingExifTool:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def batch_query(self, filepaths, fast2=False):
+            calls.append((fast2, tuple(sorted(Path(fp).name for fp in filepaths))))
+            return {
+                fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
+                for fp in filepaths
+            }
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", RecordingExifTool)
+
+
+def test_min_image_size_filter_routes_tiny_images_only(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    _write_sized_file(root, "tiny.jpg", 1_000)
+    _write_sized_file(root, "normal.jpg", 200_000)
+    _write_sized_file(root, "tiny.png", 5_000)
+    _write_sized_file(root, "tiny.nef", 1_000)
+    _write_sized_file(root, "tiny.mp4", 1_000)
+    calls = []
+    _patch_recording_exiftool(monkeypatch, calls)
+    output = tmp_path / "out.tsv"
+
+    assert fpd.run_scan(
+        str(root),
+        str(output),
+        None,
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=100_000,
+    )
+
+    sent = {name for _fast2, names in calls for name in names}
+    assert "tiny.jpg" not in sent
+    assert "tiny.png" not in sent
+    assert {"normal.jpg", "tiny.nef", "tiny.mp4"} <= sent
+
+    rows = {Path(row["filepath"]).name: row for row in _read_data_rows(output)}
+    assert set(rows) == {"tiny.jpg", "normal.jpg", "tiny.png", "tiny.nef", "tiny.mp4"}
+    assert rows["tiny.jpg"]["size_bytes"] == "1000"
+    assert rows["tiny.png"]["size_bytes"] == "5000"
+    assert rows["tiny.jpg"]["date_taken"] == ""
+    assert rows["tiny.png"]["date_taken"] == ""
+    assert rows["normal.jpg"]["date_taken"] == "2024:01:01 10:00:00"
+    assert rows["tiny.nef"]["date_taken"] == "2024:01:01 10:00:00"
+    assert rows["tiny.mp4"]["date_taken"] == "2024:01:01 10:00:00"
+
+
+def test_min_image_size_zero_disables_filter(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    for name, size in [
+        ("tiny.jpg", 1_000),
+        ("normal.jpg", 200_000),
+        ("tiny.png", 5_000),
+        ("tiny.nef", 1_000),
+        ("tiny.mp4", 1_000),
+    ]:
+        _write_sized_file(root, name, size)
+    calls = []
+    _patch_recording_exiftool(monkeypatch, calls)
+
+    assert fpd.run_scan(
+        str(root),
+        str(tmp_path / "out.tsv"),
+        None,
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=0,
+    )
+
+    sent = {name for _fast2, names in calls for name in names}
+    assert sent == {"tiny.jpg", "normal.jpg", "tiny.png", "tiny.nef", "tiny.mp4"}
+
+
+def test_fast2_applies_only_to_safe_image_extensions(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    for name in ["a.jpg", "b.png", "c.nef", "d.mp4"]:
+        _write_sized_file(root, name, 1_000)
+    calls = []
+    _patch_recording_exiftool(monkeypatch, calls)
+
+    assert fpd.run_scan(
+        str(root),
+        str(tmp_path / "out.tsv"),
+        None,
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=0,
+    )
+
+    assert len(calls) == 2
+    assert (True, ("a.jpg", "b.png")) in calls
+    assert (False, ("c.nef", "d.mp4")) in calls
+
+
+def test_all_jpeg_batch_runs_only_fast2_query(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    for name in ["a.jpg", "b.jpeg", "c.jpg"]:
+        _write_sized_file(root, name, 1_000)
+    calls = []
+    _patch_recording_exiftool(monkeypatch, calls)
+
+    assert fpd.run_scan(
+        str(root),
+        str(tmp_path / "out.tsv"),
+        None,
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=0,
+    )
+
+    assert calls == [(True, ("a.jpg", "b.jpeg", "c.jpg"))]
+
+
+def test_all_raw_batch_runs_only_full_parse_query(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    for name in ["a.nef", "b.nef", "c.nef"]:
+        _write_sized_file(root, name, 1_000)
+    calls = []
+    _patch_recording_exiftool(monkeypatch, calls)
+
+    assert fpd.run_scan(
+        str(root),
+        str(tmp_path / "out.tsv"),
+        None,
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=0,
+    )
+
+    assert calls == [(False, ("a.nef", "b.nef", "c.nef"))]
+
+
+def test_file_counts_include_size_filtered_and_worker_paths(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "scan"
+    _write_sized_file(root, "tiny-a.jpg", 1_000)
+    _write_sized_file(root, "tiny-b.jpg", 1_000)
+    _write_sized_file(root, "normal.jpg", 200_000)
+    _write_sized_file(root, "a.txt", 100)
+    _write_sized_file(root, "b.txt", 100)
+    calls = []
+    captured_counts = {}
+    _patch_recording_exiftool(monkeypatch, calls)
+
+    def capture_summary(photo_data, file_counts, quiet, debug=False):
+        captured_counts.update(file_counts)
+
+    monkeypatch.setattr(fpd, "summarize_results", capture_summary)
+
+    assert fpd.run_scan(
+        str(root),
+        str(tmp_path / "out.tsv"),
+        None,
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=100_000,
+    )
+
+    assert captured_counts["jpg"] == 3
+    assert captured_counts["txt"] == 2
+    sent = {name for _fast2, names in calls for name in names}
+    assert sent == {"normal.jpg"}
 
 
 def test_geolocate_lock_serializes_nominatim_requests(monkeypatch):
@@ -241,7 +441,7 @@ def test_keyboard_interrupt_during_dispatch_writes_clean_partial_tsv(
         def stop(self):
             pass
 
-        def batch_query(self, filepaths):
+        def batch_query(self, filepaths, fast2=False):
             time.sleep(0.1)
             return {
                 fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
@@ -260,6 +460,7 @@ def test_keyboard_interrupt_during_dispatch_writes_clean_partial_tsv(
             quiet=True,
             hash_options=fpd.parse_hash_args(hash_mode="off"),
             workers=2,
+            min_image_size=0,
         )
     finally:
         timer.cancel()
@@ -289,7 +490,7 @@ def test_crashing_worker_records_failed_batch_with_blank_exif(
         def stop(self):
             pass
 
-        def batch_query(self, filepaths):
+        def batch_query(self, filepaths, fast2=False):
             with self.lock:
                 type(self).calls += 1
                 call = type(self).calls
@@ -310,6 +511,7 @@ def test_crashing_worker_records_failed_batch_with_blank_exif(
         quiet=True,
         hash_options=fpd.parse_hash_args(hash_mode="off"),
         workers=1,
+        min_image_size=0,
     )
 
     with open(output, "r", encoding="utf-8", newline="") as f:
@@ -342,7 +544,7 @@ def test_normal_shutdown_timeout_warns_and_returns_quickly(
         def stop(self):
             time.sleep(2)
 
-        def batch_query(self, filepaths):
+        def batch_query(self, filepaths, fast2=False):
             return {
                 fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
                 for fp in filepaths
@@ -359,6 +561,7 @@ def test_normal_shutdown_timeout_warns_and_returns_quickly(
         quiet=True,
         hash_options=fpd.parse_hash_args(hash_mode="off"),
         workers=1,
+        min_image_size=0,
     )
     elapsed = time.monotonic() - started
 

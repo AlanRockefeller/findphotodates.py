@@ -1,6 +1,6 @@
 # findphotodates.py
 
-**Version 1.5.2 (2026-05-03)** — Alan Rockefeller
+**Version 1.5.2 (2026-05-04)** — Alan Rockefeller
 
 A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
@@ -38,13 +38,17 @@ A filesystem inventory tool that indexes all files and extracts EXIF dates and G
 - **Cross-platform cache reuse** - Inventories created under WSL get cache hits when re-read from native Windows and vice versa, including transparent normalization for "funny characters" (like quotes) that are represented differently.
 - Saves progress every 15 minutes and handles errors from disconnecting drives gracefully. Picks up where it left off.
 - **Batched ExifTool** - Queries multiple files per ExifTool round-trip for faster metadata extraction on large scans
+- **Parallel ExifTool workers** - Runs batched metadata extraction across configurable worker threads (`--workers`, default 4)
+- **Fast ExifTool path for small safe images** - Uses `-fast2` for JPEG/PNG/WebP batches and skips tiny JPEG/PNG/WebP files below `--min-image-size` unless disabled
 - **Fast directory walking** - Uses `os.scandir()` instead of `os.walk()` for faster file discovery
+- **Persistent location cache** - Reverse-geocoded GPS coordinates are cached in SQLite and shared across inventories
 - **Detailed timing breakdown** - Shows where time is actually spent (discovery, exiftool, stat, hashing, etc.)
 
 ## Requirements
 
 - Python 3.x
 - **ExifTool** must be installed and available on your system PATH. Run `exiftool -ver` to verify. This applies on Linux, macOS, WSL, **and** native Windows.
+- Scans that need ExifTool fail fast if the `exiftool` command cannot be started, rather than writing blank EXIF/date fields for every media file.
 - (Optional) `blake3` library for significantly faster hashing (`pip install blake3`)
 - (Optional) `exifread` library for `check_photo_backups.py` JPEG date reading (`pip install exifread`)
 
@@ -153,7 +157,10 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
                         [--sample-chunks INT] [--sample-chunk-mib FLOAT]
                         [--hash-algo {blake3,blake2b,sha256}]
                         [--hash-cache PATH] [--no-hash-cache] [--hash-exts LIST]
-                        [--old-format] [--linux] [--windows] [--save] [--scan]
+                        [--location-cache PATH] [--no-location-cache]
+                        [--old-format] [--debugperformance] [--workers N]
+                        [--min-image-size BYTES] [--linux] [--windows]
+                        [--save] [--scan]
 ```
 
 | Option                    | Description                                                           |
@@ -175,7 +182,12 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
 | `--hash-cache`            | Path to SQLite hash cache                                             |
 | `--no-hash-cache`         | Disable hash cache                                                    |
 | `--hash-exts`             | Comma-separated extensions to hash (default: hash all)                |
+| `--location-cache`        | Path to SQLite reverse-geocoding cache                                |
+| `--no-location-cache`     | Disable persistent reverse-geocoding cache                            |
 | `--old-format`            | Write legacy output (`./path: YYYY:MM:DD`) without hashes             |
+| `--debugperformance`      | Print detailed timing statistics after each scan                      |
+| `--workers`               | Number of parallel ExifTool worker threads (default: 4)               |
+| `--min-image-size`        | Skip ExifTool for tiny JPG/JPEG/PNG/WebP files (default: 100,000)     |
 | `--linux`                 | Force Linux-style paths (/mnt/c/...) in output (default: auto-detect) |
 | `--windows`               | Force Windows-style paths (C:\...) in output (default: auto-detect)   |
 | `--save`                  | Save current scan configuration for later use with --scan             |

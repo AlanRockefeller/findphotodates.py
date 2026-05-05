@@ -364,14 +364,26 @@ def test_file_counts_include_size_filtered_and_worker_paths(
 def test_geolocate_lock_serializes_nominatim_requests(monkeypatch):
     timestamps = []
     timestamps_lock = threading.Lock()
+    fake_time_lock = threading.Lock()
+    fake_now = {"value": 1_000.0}
     start_event = threading.Event()
     errors = []
 
+    def fake_time():
+        with fake_time_lock:
+            return fake_now["value"]
+
+    def fake_sleep(seconds):
+        with fake_time_lock:
+            fake_now["value"] += seconds
+
     def fake_urlopen(req, timeout):
         with timestamps_lock:
-            timestamps.append(time.monotonic())
+            timestamps.append(fpd.time.time())
         return FakeResponse({"display_name": "Serialized Place"})
 
+    monkeypatch.setattr(fpd.time, "time", fake_time)
+    monkeypatch.setattr(fpd.time, "sleep", fake_sleep)
     monkeypatch.setattr(fpd.urllib.request, "urlopen", fake_urlopen)
 
     def call_geolocate(i):
@@ -528,7 +540,39 @@ def test_crashing_worker_records_failed_batch_with_blank_exif(
     assert any(row["date_taken"] for row in rows)
 
 
-def test_normal_shutdown_timeout_warns_and_returns_quickly(
+def test_missing_exiftool_startup_failure_fails_scan(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "scan"
+    path = root / "a.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"jpg")
+
+    class MissingExifTool:
+        def start(self):
+            raise FileNotFoundError("exiftool")
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", MissingExifTool)
+    output = tmp_path / "out.tsv"
+
+    assert (
+        fpd.run_scan(
+            str(root),
+            str(output),
+            {"jpg"},
+            quiet=True,
+            hash_options=fpd.parse_hash_args(hash_mode="off"),
+            workers=1,
+            min_image_size=0,
+        )
+        is False
+    )
+    assert "failed to start" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_normal_shutdown_timeout_fails_and_returns_quickly(
     tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setattr(fpd, "WORKER_SHUTDOWN_TIMEOUT_SECONDS", 0.2)
@@ -542,7 +586,7 @@ def test_normal_shutdown_timeout_warns_and_returns_quickly(
             pass
 
         def stop(self):
-            time.sleep(2)
+            time.sleep(0.6)
 
         def batch_query(self, filepaths, fast2=False):
             return {
@@ -554,14 +598,17 @@ def test_normal_shutdown_timeout_warns_and_returns_quickly(
     output = tmp_path / "out.tsv"
 
     started = time.monotonic()
-    assert fpd.run_scan(
-        str(root),
-        str(output),
-        {"jpg"},
-        quiet=True,
-        hash_options=fpd.parse_hash_args(hash_mode="off"),
-        workers=1,
-        min_image_size=0,
+    assert (
+        fpd.run_scan(
+            str(root),
+            str(output),
+            {"jpg"},
+            quiet=True,
+            hash_options=fpd.parse_hash_args(hash_mode="off"),
+            workers=1,
+            min_image_size=0,
+        )
+        is False
     )
     elapsed = time.monotonic() - started
 

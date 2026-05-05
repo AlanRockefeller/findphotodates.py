@@ -1250,6 +1250,20 @@ def geolocate(lat, lon, location_conn=None, pending_counter=None):
         return cached_location
 
     with _geolocate_lock:
+        cached_location = _coord_cache.get(cache_key)
+        if cached_location:
+            return cached_location
+
+        cached_location = get_cached_location(
+            location_conn,
+            lat_rounded,
+            lon_rounded,
+            LOCATION_CACHE_PRECISION,
+        )
+        if cached_location:
+            _coord_cache[cache_key] = cached_location
+            return cached_location
+
         # Rate limiting: wait at least 1 second since last request
         current_time = time.time()
         time_since_last = current_time - _last_geolocate_time
@@ -1316,16 +1330,15 @@ def geolocate(lat, lon, location_conn=None, pending_counter=None):
             _last_geolocate_time = time.time()
             return f"{lat_float}, {lon_float}"
 
-    with _geolocate_lock:
         _coord_cache[cache_key] = location
-    put_cached_location(
-        location_conn,
-        lat_rounded,
-        lon_rounded,
-        LOCATION_CACHE_PRECISION,
-        location,
-        pending_counter=pending_counter,
-    )
+        put_cached_location(
+            location_conn,
+            lat_rounded,
+            lon_rounded,
+            LOCATION_CACHE_PRECISION,
+            location,
+            pending_counter=pending_counter,
+        )
     return location
 
 
@@ -2338,7 +2351,20 @@ def _exiftool_worker(
             try:
                 if exiftool is None:
                     exiftool = ExifToolPersistent()
-                    exiftool.start()
+                    try:
+                        exiftool.start()
+                    except Exception as e:
+                        worker_stats["errors"] += 1
+                        results_queue.put(
+                            {
+                                "type": "fatal_error",
+                                "message": (
+                                    f"Error: ExifTool worker {worker_id} failed to start: {e}"
+                                ),
+                            }
+                        )
+                        stop_event.set()
+                        return
                 fast2_batch = [
                     item for item in batch if item[5] in SIZE_FILTERED_IMAGE_EXTENSIONS
                 ]
@@ -2585,6 +2611,7 @@ def run_scan(
         error_log_lock = threading.Lock()
         worker_threads = []
         worker_done_count = 0
+        fatal_worker_error = None
 
         for worker_id in range(1, worker_count + 1):
             t = threading.Thread(
@@ -2618,7 +2645,7 @@ def run_scan(
         def _drain_results():
             nonlocal processed_count, _t_exiftool_total, _t_hashing_total
             nonlocal _t_geolocate_total, _t_results_wait, _t_worker_total
-            nonlocal worker_done_count
+            nonlocal worker_done_count, fatal_worker_error
             _trq0 = time.time()
             while True:
                 try:
@@ -2638,7 +2665,14 @@ def run_scan(
                     _worker_details.append(stats)
                     _t_worker_total += stats.get("wall", 0.0)
                     worker_done_count += 1
+                elif packet.get("type") == "fatal_error":
+                    if fatal_worker_error is None:
+                        fatal_worker_error = packet.get(
+                            "message", "Error: ExifTool worker failed."
+                        )
+                        print(fatal_worker_error, file=sys.stderr)
             _t_results_wait += time.time() - _trq0
+            return fatal_worker_error is None
 
         def _update_progress_and_checkpoint():
             nonlocal last_progress_time, last_save_time, _t_checkpoint_total
@@ -2762,7 +2796,8 @@ def run_scan(
                     work_queue.put(batch, timeout=0.5)
                     return True
                 except queue.Full:
-                    _drain_results()
+                    if not _drain_results():
+                        return False
                     _maybe_print_discovery_complete()
                     if not _update_progress_and_checkpoint():
                         return False
@@ -2808,7 +2843,10 @@ def run_scan(
 
         try:
             while True:
-                _drain_results()
+                if not _drain_results():
+                    _stop_workers(interrupt=True)
+                    cleanup_all()
+                    return False
                 _maybe_print_discovery_complete()
                 if not _update_progress_and_checkpoint():
                     _stop_workers(interrupt=True)
@@ -3001,20 +3039,35 @@ def run_scan(
                 cleanup_all()
                 return False
             workers_finished = _stop_workers(interrupt=False)
-            if workers_finished:
-                done_deadline = time.time() + 10
-                while worker_done_count < worker_count:
+            if fatal_worker_error is not None:
+                _stop_workers(interrupt=True)
+                _drain_results()
+                cleanup_all()
+                return False
+            if not workers_finished:
+                _stop_workers(interrupt=True)
+                _drain_results()
+                cleanup_all()
+                return False
+            done_deadline = time.time() + 10
+            while worker_done_count < worker_count:
+                if not _drain_results():
+                    _stop_workers(interrupt=True)
+                    cleanup_all()
+                    return False
+                if worker_done_count >= worker_count:
+                    break
+                if time.time() >= done_deadline:
+                    missing = worker_count - worker_done_count
+                    print(
+                        f"Warning: missing {missing} ExifTool worker completion packet(s); failing scan.",
+                        file=sys.stderr,
+                    )
+                    _stop_workers(interrupt=True)
                     _drain_results()
-                    if worker_done_count >= worker_count:
-                        break
-                    if time.time() >= done_deadline:
-                        missing = worker_count - worker_done_count
-                        print(
-                            f"Warning: missing {missing} ExifTool worker completion packet(s); continuing.",
-                            file=sys.stderr,
-                        )
-                        break
-                    time.sleep(0.05)
+                    cleanup_all()
+                    return False
+                time.sleep(0.05)
 
         except Exception:
             _stop_workers(interrupt=True)
@@ -3548,7 +3601,7 @@ Options:
   --hash {sample,full,off}  Hashing mode (default: off). Use --hash sample to enable.
   --hash-cache PATH        Path to SQLite hash cache.
   --no-hash-cache          Disable hash cache.
-  --workers N       Number of parallel ExifTool workers (default: 4).
+  --workers N       Number of parallel ExifTool worker threads (default: 4).
   --min-image-size BYTES  Skip ExifTool for tiny JPG/JPEG/PNG/WebP images (default: 100,000; 0 disables).
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
@@ -3676,7 +3729,7 @@ For more details on a specific option, you can also use:
         type=int,
         default=4,
         metavar="N",
-        help="Number of parallel ExifTool worker processes (default: 4).",
+        help="Number of parallel ExifTool worker threads (default: 4).",
     )
     parser.add_argument(
         "--min-image-size",

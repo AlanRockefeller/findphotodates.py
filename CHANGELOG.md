@@ -4,6 +4,11 @@
 
 - Fix a bug where Windows junctions can cause an infinite loop
 - Fix a minor display bug so ANSI color codes are only sent if the output is a terminal
+- Add a persistent SQLite reverse-geocoding cache so `--locate` can reuse resolved GPS coordinates across inventories and avoid repeated Nominatim requests
+- Run ExifTool batches through configurable parallel worker threads with `--workers` (default: 4)
+- Speed up safe image metadata extraction by using ExifTool `-fast2` for JPEG/PNG/WebP batches
+- Add `--min-image-size` to skip ExifTool for tiny JPG/JPEG/PNG/WebP files that rarely contain useful EXIF, while still indexing them with filesystem metadata
+- Fail scans when ExifTool worker startup or shutdown fails instead of silently treating unavailable or stuck workers as successful blank metadata extraction
 
 ## v1.5.1 (2026-04-15)
 

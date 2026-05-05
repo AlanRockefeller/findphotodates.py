@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -274,6 +275,44 @@ def test_no_location_cache_still_uses_in_memory_cache(monkeypatch):
 
     assert fpd.geolocate("37.801", "-122.271").startswith("Oakland")
     assert fpd.geolocate("37.802", "-122.272").startswith("Oakland")
+    assert calls["count"] == 1
+
+
+def test_concurrent_geolocate_rechecks_cache_inside_lock(monkeypatch):
+    calls = {"count": 0}
+    urlopen_entered = threading.Event()
+    release_urlopen = threading.Event()
+    errors = []
+    results = []
+
+    def fake_urlopen(req, timeout):
+        calls["count"] += 1
+        urlopen_entered.set()
+        release_urlopen.wait(timeout=2)
+        return FakeResponse({"display_name": "Cached Place"})
+
+    monkeypatch.setattr(fpd.urllib.request, "urlopen", fake_urlopen)
+
+    def call_geolocate(lat, lon):
+        try:
+            results.append(fpd.geolocate(lat, lon))
+        except Exception as e:
+            errors.append(e)
+
+    first = threading.Thread(target=call_geolocate, args=("37.801", "-122.271"))
+    second = threading.Thread(target=call_geolocate, args=("37.802", "-122.272"))
+
+    first.start()
+    assert urlopen_entered.wait(timeout=2)
+    second.start()
+    release_urlopen.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert sorted(results) == ["Cached Place", "Cached Place"]
     assert calls["count"] == 1
 
 

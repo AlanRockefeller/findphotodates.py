@@ -190,6 +190,164 @@ def _clear_progress_line():
     else:
         print()
 
+
+def _temporarily_ignore_sigint():
+    """Ignore repeated Ctrl-C while an interrupt cleanup block is running."""
+    try:
+        previous_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        return previous_handler
+    except Exception:
+        return None
+
+
+def _restore_sigint(previous_handler):
+    if previous_handler is None:
+        return
+    try:
+        signal.signal(signal.SIGINT, previous_handler)
+    except Exception:
+        pass
+
+
+class _StatusOutputPauseController:
+    """Suppress transient status lines for a short period after space is pressed."""
+
+    def __init__(
+        self,
+        enabled=True,
+        pause_seconds=60.0,
+        clock=time.time,
+        input_stream=None,
+    ):
+        self._enabled = enabled
+        self._pause_seconds = pause_seconds
+        self._clock = clock
+        self._input_stream = input_stream or sys.stdin
+        self._paused_until = 0.0
+        self._pause_notice_pending = False
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._restore_posix_terminal = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+        return False
+
+    def pause_now(self):
+        with self._lock:
+            self._paused_until = max(
+                self._paused_until, self._clock() + self._pause_seconds
+            )
+            self._pause_notice_pending = True
+
+    def is_paused(self, now=None):
+        if now is None:
+            now = self._clock()
+        with self._lock:
+            return now < self._paused_until
+
+    def consume_pause_notice(self):
+        with self._lock:
+            if not self._pause_notice_pending:
+                return False
+            self._pause_notice_pending = False
+            return True
+
+    def start(self):
+        if not self._enabled:
+            return
+        try:
+            if not self._input_stream.isatty():
+                return
+        except Exception:
+            return
+        if os.name == "nt":
+            target = self._run_windows
+        else:
+            target = self._prepare_posix()
+        if target is None:
+            return
+        self._thread = threading.Thread(target=target, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=1.0)
+            except KeyboardInterrupt:
+                pass
+        if self._restore_posix_terminal is not None:
+            try:
+                self._restore_posix_terminal()
+            except Exception:
+                pass
+            self._restore_posix_terminal = None
+
+    def _prepare_posix(self):
+        try:
+            import select
+            import termios
+            import tty
+
+            fd = self._input_stream.fileno()
+            old_attrs = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+
+            def restore():
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+            self._restore_posix_terminal = restore
+        except Exception:
+            return None
+
+        def run():
+            while not self._stop.is_set():
+                try:
+                    readable, _, _ = select.select([self._input_stream], [], [], 0.2)
+                    if readable and os.read(fd, 1) == b" ":
+                        self.pause_now()
+                except Exception:
+                    break
+
+        return run
+
+    def _run_windows(self):
+        try:
+            user32 = __import__("ctypes").windll.user32
+            vk_space = 0x20
+            was_down = False
+            while not self._stop.is_set():
+                is_down = bool(user32.GetAsyncKeyState(vk_space) & 0x8000)
+                if is_down and not was_down:
+                    self.pause_now()
+                was_down = is_down
+                time.sleep(0.05)
+            return
+        except Exception:
+            pass
+
+        try:
+            import msvcrt
+        except ImportError:
+            return
+        while not self._stop.is_set():
+            try:
+                if msvcrt.kbhit():
+                    if msvcrt.getwch() == " ":
+                        self.pause_now()
+                else:
+                    time.sleep(0.2)
+            except Exception:
+                break
+
+
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 _WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
 
@@ -2595,7 +2753,10 @@ def run_scan(
 
     interrupted = False
 
-    with open(error_log_path, "w", encoding="utf-8") as error_log:
+    with (
+        _StatusOutputPauseController(enabled=(not quiet and _IS_TTY)) as status_pause,
+        open(error_log_path, "w", encoding="utf-8") as error_log,
+    ):
         start_time = time.time()
         last_save_time = start_time
         last_progress_time = start_time
@@ -2680,6 +2841,10 @@ def run_scan(
             current_time = time.time()
             rate_tracker.record(current_time, total_seen)
 
+            if not quiet and status_pause.consume_pause_notice():
+                _clear_progress_line()
+                print("Status output paused for 60 seconds; scan continues.")
+
             if total_seen > 0 and (current_time - last_save_time) > 900:
                 _tc0 = time.time()
                 data_snapshot = list(photo_data)
@@ -2707,7 +2872,11 @@ def run_scan(
                     stop_event.set()
                     return False
 
-            if not quiet and (current_time - last_progress_time) >= 2.0:
+            if (
+                not quiet
+                and not status_pause.is_paused(current_time)
+                and (current_time - last_progress_time) >= 2.0
+            ):
                 elapsed = current_time - start_time
                 rate = rate_tracker.rate()
                 rate_str = f"{rate:.0f} files/sec" if rate else "..."
@@ -3075,39 +3244,70 @@ def run_scan(
             raise
         except KeyboardInterrupt:
             interrupted = True
-            _stop_workers(interrupt=True)
-            _drain_results()
-            print(
-                f"\n\nInterrupted! Saving progress ({len(photo_data):,} files processed so far)..."
-            )
-            # Alan 5/3/26 - _safe_write_inventory already prints a friendly
-            # error block on predictable failures; only show a generic
-            # warning for unexpected exceptions.
+            previous_sigint = _temporarily_ignore_sigint()
             try:
-                if _safe_write_inventory(
-                    output,
-                    list(photo_data),
-                    inventory_root,
-                    hash_options,
-                    old_format,
-                    path_style,
-                    debug=debug,
-                    context="interrupted save",
-                ):
-                    print(f"Progress saved to '{output}'.")
-            except Exception as save_err:
-                print(f"WARNING: Could not save progress: {save_err}")
-            print("\nTo resume, run the same command again:")
-            print(f'  findphotodates.py --directory "{directory}" -o "{output}"')
-            print(
-                "The scan will pick up where it left off using the saved inventory as cache."
-            )
+                status_pause.stop()
+                _clear_progress_line()
+                print(
+                    f"\nInterrupted by Ctrl-C after collecting {len(photo_data):,} file rows."
+                )
+                print("Stopping workers and saving a resumable partial inventory...")
+                try:
+                    _stop_workers(interrupt=True)
+                except KeyboardInterrupt:
+                    print(
+                        "Second Ctrl-C received while stopping workers; skipping worker wait."
+                    )
+                try:
+                    _drain_results()
+                except KeyboardInterrupt:
+                    print(
+                        "Second Ctrl-C received while collecting final worker results."
+                    )
+                # Alan 5/3/26 - _safe_write_inventory already prints a friendly
+                # error block on predictable failures; only show a generic
+                # warning for unexpected exceptions.
+                saved_progress = False
+                try:
+                    if _safe_write_inventory(
+                        output,
+                        list(photo_data),
+                        inventory_root,
+                        hash_options,
+                        old_format,
+                        path_style,
+                        debug=debug,
+                        context="interrupted save",
+                    ):
+                        saved_progress = True
+                        print(f"Saved {len(photo_data):,} rows to '{output}'.")
+                except KeyboardInterrupt:
+                    print(
+                        "Second Ctrl-C received while saving; the partial inventory may not have been written."
+                    )
+                except Exception as save_err:
+                    print(f"WARNING: Could not save progress: {save_err}")
+                if saved_progress:
+                    print("\nTo resume, run the same command again.")
+                    print(
+                        "Existing rows in the TSV will be used as cache, so the scan picks up from saved progress."
+                    )
+                else:
+                    print("\nNo resumable progress file was saved for this interrupt.")
+            finally:
+                _restore_sigint(previous_sigint)
 
     # Wait for producer thread to finish (should already be done)
-    producer.join(timeout=5)
+    try:
+        producer.join(timeout=0.2 if interrupted else 5)
+    except KeyboardInterrupt:
+        interrupted = True
 
     if interrupted:
-        cleanup_all()
+        try:
+            cleanup_all()
+        except KeyboardInterrupt:
+            pass
         return False
 
     total_seen = cached_count + processed_count
@@ -3360,62 +3560,71 @@ def add_hashes_to_inventory(
     last_progress_time = start_time
 
     try:
-        for row in rows:
-            if row.get("content_hash", "").strip():
-                continue  # already has hash
+        with _StatusOutputPauseController(
+            enabled=(not quiet and _IS_TTY)
+        ) as status_pause:
+            for row in rows:
+                if row.get("content_hash", "").strip():
+                    continue  # already has hash
 
-            filepath = row.get("filepath", "")
-            if not filepath:
-                continue
+                filepath = row.get("filepath", "")
+                if not filepath:
+                    continue
 
-            try:
-                # key_path from stored filepath (matches load_cache keying)
-                key_path = _normalize_cache_key(filepath)
-                # Resolve cross-platform display paths back to a local path
-                # before following symlinks for stat/hash I/O.
-                real_path = os.path.realpath(_resolve_local_inventory_path(filepath))
-                stat_info = os.stat(real_path)
-                size_bytes = stat_info.st_size
-                mtime_ns = stat_info.st_mtime_ns
+                try:
+                    # key_path from stored filepath (matches load_cache keying)
+                    key_path = _normalize_cache_key(filepath)
+                    # Resolve cross-platform display paths back to a local path
+                    # before following symlinks for stat/hash I/O.
+                    real_path = os.path.realpath(_resolve_local_inventory_path(filepath))
+                    stat_info = os.stat(real_path)
+                    size_bytes = stat_info.st_size
+                    mtime_ns = stat_info.st_mtime_ns
 
-                # Verify file hasn't changed since indexing
-                row_size = int(row.get("size_bytes", 0))
-                row_mtime = int(row.get("mtime_ns", 0))
-                if row_size != size_bytes or row_mtime != mtime_ns:
-                    if debug:
-                        print(f"  Skipping (changed): {filepath}")
+                    # Verify file hasn't changed since indexing
+                    row_size = int(row.get("size_bytes", 0))
+                    row_mtime = int(row.get("mtime_ns", 0))
+                    if row_size != size_bytes or row_mtime != mtime_ns:
+                        if debug:
+                            print(f"  Skipping (changed): {filepath}")
+                        skipped += 1
+                        continue
+
+                    content_hash = get_content_hash(
+                        key_path,
+                        size_bytes,
+                        mtime_ns,
+                        hash_options,
+                        hash_conn,
+                        hash_cache_pending,
+                        os_path=real_path,
+                    )
+                    if content_hash:
+                        row["content_hash"] = content_hash
+                        filled += 1
+                    else:
+                        errors += 1
+
+                except OSError:
                     skipped += 1
                     continue
 
-                content_hash = get_content_hash(
-                    key_path,
-                    size_bytes,
-                    mtime_ns,
-                    hash_options,
-                    hash_conn,
-                    hash_cache_pending,
-                    os_path=real_path,
-                )
-                if content_hash:
-                    row["content_hash"] = content_hash
-                    filled += 1
-                else:
-                    errors += 1
-
-            except OSError:
-                skipped += 1
-                continue
-
-            # Progress every 2 seconds
-            if not quiet:
-                current_time = time.time()
-                if current_time - last_progress_time >= 2.0:
-                    elapsed = current_time - start_time
-                    print(
-                        f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]",
-                        end="\r" if _IS_TTY else "\n",
-                    )
-                    last_progress_time = current_time
+                # Progress every 2 seconds
+                if not quiet:
+                    current_time = time.time()
+                    if status_pause.consume_pause_notice():
+                        _clear_progress_line()
+                        print("Status output paused for 60 seconds; hashing continues.")
+                    if (
+                        not status_pause.is_paused(current_time)
+                        and current_time - last_progress_time >= 2.0
+                    ):
+                        elapsed = current_time - start_time
+                        print(
+                            f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]",
+                            end="\r" if _IS_TTY else "\n",
+                        )
+                        last_progress_time = current_time
 
     except KeyboardInterrupt:
         interrupted = True

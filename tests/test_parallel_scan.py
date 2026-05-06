@@ -482,6 +482,56 @@ def test_keyboard_interrupt_during_dispatch_writes_clean_partial_tsv(
     assert 0 <= len(cache) < 30
 
 
+def test_repeated_keyboard_interrupt_during_cleanup_stays_friendly(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(fpd, "EXIFTOOL_BATCH_SIZE", 2)
+    root = tmp_path / "scan"
+    for i in range(30):
+        path = root / f"{i:03d}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"jpg")
+
+    class SlowExifTool:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def batch_query(self, filepaths, fast2=False):
+            time.sleep(0.5)
+            return {
+                fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
+                for fp in filepaths
+            }
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", SlowExifTool)
+    output = tmp_path / "partial.tsv"
+    first = threading.Timer(0.08, lambda: os.kill(os.getpid(), signal.SIGINT))
+    second = threading.Timer(0.10, lambda: os.kill(os.getpid(), signal.SIGINT))
+    first.start()
+    second.start()
+    try:
+        result = fpd.run_scan(
+            str(root),
+            str(output),
+            {"jpg"},
+            quiet=True,
+            hash_options=fpd.parse_hash_args(hash_mode="off"),
+            workers=1,
+            min_image_size=0,
+        )
+    finally:
+        first.cancel()
+        second.cancel()
+
+    captured = capsys.readouterr()
+    assert result is False
+    assert "Interrupted by Ctrl-C" in captured.out
+    assert "Traceback" not in captured.out
+
+
 def test_crashing_worker_records_failed_batch_with_blank_exif(
     tmp_path, monkeypatch
 ):

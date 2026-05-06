@@ -193,6 +193,8 @@ usage: findphotodates.py [-h] [--directory DIRECTORY] [-o OUTPUT] [-q] [--debug]
 | `--save`                  | Save current scan configuration for later use with --scan             |
 | `--scan`                  | Run all saved scan configurations                                     |
 
+During interactive scans, press the space bar to pause transient progress/status line updates for one minute. The scan continues running.
+
 ## Backup Checking (check_photo_backups.py)
 
 `check_photo_backups.py` computes target-side fingerprints and compares them against your backup inventories.

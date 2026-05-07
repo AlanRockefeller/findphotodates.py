@@ -646,6 +646,14 @@ def test_normal_shutdown_timeout_fails_and_returns_quickly(
 
     monkeypatch.setattr(fpd, "ExifToolPersistent", HangingStopExifTool)
     output = tmp_path / "out.tsv"
+    write_contexts = []
+    real_safe_write_inventory = fpd._safe_write_inventory
+
+    def recording_safe_write_inventory(*args, **kwargs):
+        write_contexts.append(kwargs.get("context"))
+        return real_safe_write_inventory(*args, **kwargs)
+
+    monkeypatch.setattr(fpd, "_safe_write_inventory", recording_safe_write_inventory)
 
     started = time.monotonic()
     assert (
@@ -663,7 +671,10 @@ def test_normal_shutdown_timeout_fails_and_returns_quickly(
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
-    assert "did not exit within 0.2 seconds; abandoning" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "did not exit within 0.2 seconds; abandoning; failing scan" in err
+    assert "final write" not in write_contexts
+    assert not output.exists()
 
 
 def test_perf_summary_marks_parallel_sums_and_worker_active(capsys):

@@ -2793,6 +2793,7 @@ def run_scan(
         worker_threads = []
         worker_done_count = 0
         fatal_worker_error = None
+        worker_shutdown_timed_out = False
 
         for worker_id in range(1, worker_count + 1):
             t = threading.Thread(
@@ -3000,6 +3001,7 @@ def run_scan(
                         return True
 
         def _stop_workers(interrupt=False):
+            nonlocal worker_shutdown_timed_out
             if interrupt:
                 stop_event.set()
                 for _ in worker_threads:
@@ -3018,8 +3020,9 @@ def run_scan(
                     if remaining <= 0:
                         alive = sum(1 for thread in worker_threads if thread.is_alive())
                         if alive:
+                            worker_shutdown_timed_out = True
                             print(
-                                f"Warning: {alive} ExifTool worker(s) did not exit within {timeout_seconds} seconds; abandoning.",
+                                f"Warning: {alive} ExifTool worker(s) did not exit within {timeout_seconds} seconds; abandoning; failing scan.",
                                 file=sys.stderr,
                             )
                         return False
@@ -3328,6 +3331,9 @@ def run_scan(
             cleanup_all()
         except KeyboardInterrupt:
             pass
+        return False
+    if worker_shutdown_timed_out:
+        cleanup_all()
         return False
 
     total_seen = cached_count + processed_count

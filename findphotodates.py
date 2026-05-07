@@ -191,25 +191,6 @@ def _clear_progress_line():
         print()
 
 
-def _temporarily_ignore_sigint():
-    """Ignore repeated Ctrl-C while an interrupt cleanup block is running."""
-    try:
-        previous_handler = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        return previous_handler
-    except Exception:
-        return None
-
-
-def _restore_sigint(previous_handler):
-    if previous_handler is None:
-        return
-    try:
-        signal.signal(signal.SIGINT, previous_handler)
-    except Exception:
-        pass
-
-
 class _StatusOutputPauseController:
     """Suppress transient status lines for a short period after space is pressed."""
 
@@ -3267,58 +3248,54 @@ def run_scan(
             raise
         except KeyboardInterrupt:
             interrupted = True
-            previous_sigint = _temporarily_ignore_sigint()
+            status_pause.stop()
+            _clear_progress_line()
+            print(
+                f"\nInterrupted by Ctrl-C after collecting {len(photo_data):,} file rows."
+            )
+            print("Stopping workers and saving a resumable partial inventory...")
             try:
-                status_pause.stop()
-                _clear_progress_line()
+                _stop_workers(interrupt=True)
+            except KeyboardInterrupt:
                 print(
-                    f"\nInterrupted by Ctrl-C after collecting {len(photo_data):,} file rows."
+                    "Second Ctrl-C received while stopping workers; skipping worker wait."
                 )
-                print("Stopping workers and saving a resumable partial inventory...")
-                try:
-                    _stop_workers(interrupt=True)
-                except KeyboardInterrupt:
-                    print(
-                        "Second Ctrl-C received while stopping workers; skipping worker wait."
-                    )
-                try:
-                    _drain_results()
-                except KeyboardInterrupt:
-                    print(
-                        "Second Ctrl-C received while collecting final worker results."
-                    )
-                # Alan 5/3/26 - _safe_write_inventory already prints a friendly
-                # error block on predictable failures; only show a generic
-                # warning for unexpected exceptions.
-                saved_progress = False
-                try:
-                    if _safe_write_inventory(
-                        output,
-                        list(photo_data),
-                        inventory_root,
-                        hash_options,
-                        old_format,
-                        path_style,
-                        debug=debug,
-                        context="interrupted save",
-                    ):
-                        saved_progress = True
-                        print(f"Saved {len(photo_data):,} rows to '{output}'.")
-                except KeyboardInterrupt:
-                    print(
-                        "Second Ctrl-C received while saving; the partial inventory may not have been written."
-                    )
-                except Exception as save_err:
-                    print(f"WARNING: Could not save progress: {save_err}")
-                if saved_progress:
-                    print("\nTo resume, run the same command again.")
-                    print(
-                        "Existing rows in the TSV will be used as cache, so the scan picks up from saved progress."
-                    )
-                else:
-                    print("\nNo resumable progress file was saved for this interrupt.")
-            finally:
-                _restore_sigint(previous_sigint)
+            try:
+                _drain_results()
+            except KeyboardInterrupt:
+                print(
+                    "Second Ctrl-C received while collecting final worker results."
+                )
+            # Alan 5/3/26 - _safe_write_inventory already prints a friendly
+            # error block on predictable failures; only show a generic
+            # warning for unexpected exceptions.
+            saved_progress = False
+            try:
+                if _safe_write_inventory(
+                    output,
+                    list(photo_data),
+                    inventory_root,
+                    hash_options,
+                    old_format,
+                    path_style,
+                    debug=debug,
+                    context="interrupted save",
+                ):
+                    saved_progress = True
+                    print(f"Saved {len(photo_data):,} rows to '{output}'.")
+            except KeyboardInterrupt:
+                print(
+                    "Second Ctrl-C received while saving; the partial inventory may not have been written."
+                )
+            except Exception as save_err:
+                print(f"WARNING: Could not save progress: {save_err}")
+            if saved_progress:
+                print("\nTo resume, run the same command again.")
+                print(
+                    "Existing rows in the TSV will be used as cache, so the scan picks up from saved progress."
+                )
+            else:
+                print("\nNo resumable progress file was saved for this interrupt.")
 
     # Wait for producer thread to finish (should already be done)
     try:

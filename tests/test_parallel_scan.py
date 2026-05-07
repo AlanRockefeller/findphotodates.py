@@ -532,6 +532,60 @@ def test_repeated_keyboard_interrupt_during_cleanup_stays_friendly(
     assert "Traceback" not in captured.out
 
 
+def test_second_keyboard_interrupt_can_abort_interrupted_save(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(fpd, "EXIFTOOL_BATCH_SIZE", 2)
+    root = tmp_path / "scan"
+    for i in range(20):
+        path = root / f"{i:03d}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"jpg")
+
+    class SlowExifTool:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def batch_query(self, filepaths, fast2=False):
+            time.sleep(0.1)
+            return {
+                fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
+                for fp in filepaths
+            }
+
+    def interrupting_safe_write_inventory(*args, **kwargs):
+        if kwargs.get("context") == "interrupted save":
+            raise KeyboardInterrupt
+        return True
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", SlowExifTool)
+    monkeypatch.setattr(fpd, "_safe_write_inventory", interrupting_safe_write_inventory)
+    output = tmp_path / "partial.tsv"
+    timer = threading.Timer(0.08, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer.start()
+    try:
+        result = fpd.run_scan(
+            str(root),
+            str(output),
+            {"jpg"},
+            quiet=True,
+            hash_options=fpd.parse_hash_args(hash_mode="off"),
+            workers=1,
+            min_image_size=0,
+        )
+    finally:
+        timer.cancel()
+
+    captured = capsys.readouterr()
+    assert result is False
+    assert "Second Ctrl-C received while saving" in captured.out
+    assert "No resumable progress file was saved" in captured.out
+    assert "Traceback" not in captured.out
+
+
 def test_crashing_worker_records_failed_batch_with_blank_exif(
     tmp_path, monkeypatch
 ):

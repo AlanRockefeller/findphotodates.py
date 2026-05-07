@@ -1265,11 +1265,10 @@ class ExifToolPersistent:
 
             date = None
             for key in self._DATE_KEYS:
-                val = rec.get(key)
-                if val and isinstance(val, str) and val != "-":
-                    if re.match(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", val):
-                        date = val
-                        break
+                normalized = _normalize_exif_date(rec.get(key))
+                if normalized:
+                    date = normalized
+                    break
 
             gps_lat = None
             gps_lon = None
@@ -1288,11 +1287,10 @@ class ExifToolPersistent:
         date = None
         if len(lines) >= self._DATE_TAG_COUNT:
             for i in range(self._DATE_TAG_COUNT):
-                val = lines[i].strip()
-                if val and val != "-":
-                    if re.match(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", val):
-                        date = val
-                        break
+                normalized = _normalize_exif_date(lines[i])
+                if normalized:
+                    date = normalized
+                    break
         gps_lat = None
         gps_lon = None
         if len(lines) >= self._DATE_TAG_COUNT + 2:
@@ -1338,11 +1336,10 @@ def get_photo_data(filepath, _exiftool=None):
             date = None
             if len(lines) >= len(date_tags):
                 for i in range(len(date_tags)):
-                    line = lines[i].strip()
-                    if line and line != "-":
-                        if re.match(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", line):
-                            date = line
-                            break
+                    normalized = _normalize_exif_date(lines[i])
+                    if normalized:
+                        date = normalized
+                        break
             gps_lat = None
             gps_lon = None
             if len(lines) >= len(date_tags) + 2:
@@ -1508,6 +1505,27 @@ def is_coordinate_string(location):
     return bool(re.match(r"^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$", location.strip()))
 
 
+_EXIF_DATE_RE = re.compile(
+    r"^(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})(?:([+-]\d{2}:\d{2}|Z))?$"
+)
+
+
+def _normalize_exif_date(value):
+    """Normalize an ExifTool date string to 'YYYY:MM:DD HH:MM:SS'."""
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or s == "-":
+        return None
+    match = _EXIF_DATE_RE.match(s)
+    if not match:
+        return None
+    date_part = match.group(1)
+    if date_part.startswith("0000:") or date_part[:4] < "1900":
+        return None
+    return date_part
+
+
 def load_cache(output_file, debug=False):
     """Load existing TSV cache if it exists and has the expected header.
 
@@ -1572,6 +1590,8 @@ def load_cache(output_file, debug=False):
                         size_bytes = int(row.get("size_bytes", "0"))
                         mtime_ns = int(row.get("mtime_ns", "0"))
                         date_taken = row.get("date_taken", "") or None
+                        if date_taken:
+                            date_taken = _normalize_exif_date(date_taken)
                         gps_lat = row.get("gps_lat", "") or None
                         gps_lon = row.get("gps_lon", "") or None
                         location = row.get("location", "") or None

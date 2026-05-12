@@ -4,6 +4,7 @@ import os
 import signal
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,21 @@ def _read_data_rows(path):
         ]
 
 
+def test_scan_activity_status_labels_hashing_and_location_work():
+    assert (
+        fpd._format_scan_activity(False, fpd.parse_hash_args(hash_mode="off"))
+        == "Processing metadata"
+    )
+    assert (
+        fpd._format_scan_activity(False, fpd.parse_hash_args(hash_mode="sample"))
+        == "Processing metadata and hashes"
+    )
+    assert (
+        fpd._format_scan_activity(True, fpd.parse_hash_args(hash_mode="sample"))
+        == "Processing metadata, hashes, and locations"
+    )
+
+
 def _patch_recording_exiftool(monkeypatch, calls):
     class RecordingExifTool:
         def start(self):
@@ -263,6 +279,58 @@ def test_min_image_size_zero_disables_filter(tmp_path, monkeypatch):
 
     sent = {name for _fast2, names in calls for name in names}
     assert sent == {"tiny.jpg", "normal.jpg", "tiny.png", "tiny.nef", "tiny.mp4"}
+
+
+def test_retry_blank_exif_repairs_media_cache_rows_only(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    jpg = _write_sized_file(root, "blank.jpg", 200_000)
+    txt = _write_sized_file(root, "blank.txt", 100)
+    output = tmp_path / "out.tsv"
+    hash_options = fpd.parse_hash_args(hash_mode="off")
+
+    blank_rows = []
+    for path in (jpg, txt):
+        st = path.stat()
+        blank_rows.append((str(path), "", st.st_size, st.st_mtime_ns, "", "", "", ""))
+    fpd.write_dates_to_file_atomic(str(output), blank_rows, str(root), hash_options)
+
+    calls = []
+    _patch_recording_exiftool(monkeypatch, calls)
+    assert fpd.run_scan(
+        str(root),
+        str(output),
+        None,
+        quiet=True,
+        hash_options=hash_options,
+        workers=1,
+        min_image_size=0,
+    )
+    rows = {Path(row["filepath"]).name: row for row in _read_data_rows(output)}
+    assert calls == []
+    assert rows["blank.jpg"]["date_taken"] == ""
+    assert rows["blank.txt"]["date_taken"] == ""
+
+    assert fpd.run_scan(
+        str(root),
+        str(output),
+        None,
+        quiet=True,
+        hash_options=hash_options,
+        workers=1,
+        min_image_size=0,
+        retry_blank_exif=True,
+    )
+    rows = {Path(row["filepath"]).name: row for row in _read_data_rows(output)}
+    sent = {name for _fast2, names in calls for name in names}
+    assert sent == {"blank.jpg"}
+    assert rows["blank.jpg"]["date_taken"] == "2024:01:01 10:00:00"
+    assert rows["blank.txt"]["date_taken"] == ""
+
+
+def test_retry_blank_exif_treats_whitespace_date_as_blank():
+    assert fpd._should_retry_blank_exif(
+        "/tmp/photo.jpg", {"date_taken": "   "}, True
+    )
 
 
 def test_fast2_applies_only_to_safe_image_extensions(tmp_path, monkeypatch):
@@ -728,6 +796,143 @@ def test_normal_shutdown_timeout_fails_and_returns_quickly(
     err = capsys.readouterr().err
     assert "did not exit within 0.2 seconds; abandoning; failing scan" in err
     assert "final write" not in write_contexts
+    assert not output.exists()
+
+
+def test_exiftool_backlog_drains_before_normal_shutdown(tmp_path, monkeypatch):
+    monkeypatch.setattr(fpd, "EXIFTOOL_BATCH_SIZE", 1)
+    monkeypatch.setattr(fpd, "WORKER_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    root = tmp_path / "scan"
+    for i in range(5):
+        path = root / f"{i}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"jpg")
+
+    class SlowButHealthyExifTool:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def batch_query(self, filepaths, fast2=False):
+            time.sleep(0.03)
+            return {
+                fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
+                for fp in filepaths
+            }
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", SlowButHealthyExifTool)
+    output = tmp_path / "out.tsv"
+
+    assert fpd.run_scan(
+        str(root),
+        str(output),
+        {"jpg"},
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=0,
+    )
+
+    rows = _read_data_rows(output)
+    assert len(rows) == 5
+    assert all(row["date_taken"] for row in rows)
+
+
+def test_worker_result_count_mismatch_fails_scan(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "scan"
+    path = root / "a.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"jpg")
+
+    def bad_worker(
+        worker_id,
+        work_queue,
+        results_queue,
+        stop_event,
+        locate,
+        hash_options,
+        hash_conn,
+        hash_cache_pending,
+        location_conn,
+        location_cache_pending,
+        error_log,
+        error_log_lock,
+    ):
+        batch = work_queue.get(timeout=1)
+        results_queue.put(
+            {
+                "type": "results",
+                "input_count": len(batch),
+                "results": [],
+                "file_counts": Counter(),
+            }
+        )
+        work_queue.get(timeout=1)
+        results_queue.put(
+            {
+                "type": "worker_done",
+                "stats": {"worker_id": worker_id, "wall": 0.0},
+            }
+        )
+
+    monkeypatch.setattr(fpd, "_exiftool_worker", bad_worker)
+    output = tmp_path / "out.tsv"
+
+    assert (
+        fpd.run_scan(
+            str(root),
+            str(output),
+            {"jpg"},
+            quiet=True,
+            hash_options=fpd.parse_hash_args(hash_mode="off"),
+            workers=1,
+            min_image_size=0,
+        )
+        is False
+    )
+    assert "returned 0 row(s) for 1 queued file(s)" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_exiftool_drain_no_progress_timeout_fails_scan(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(fpd, "EXIFTOOL_DRAIN_NO_PROGRESS_TIMEOUT_SECONDS", 0.05)
+    root = tmp_path / "scan"
+    path = root / "a.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"jpg")
+
+    class HangingExifTool:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def batch_query(self, filepaths, fast2=False):
+            time.sleep(1.0)
+            return {fp: ("2024:01:01 10:00:00", "", "") for fp in filepaths}
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", HangingExifTool)
+    output = tmp_path / "out.tsv"
+    started = time.monotonic()
+
+    assert (
+        fpd.run_scan(
+            str(root),
+            str(output),
+            {"jpg"},
+            quiet=True,
+            hash_options=fpd.parse_hash_args(hash_mode="off"),
+            workers=1,
+            min_image_size=0,
+        )
+        is False
+    )
+
+    assert time.monotonic() - started < 1.5
+    assert "made no progress before the drain timeout" in capsys.readouterr().err
     assert not output.exists()
 
 

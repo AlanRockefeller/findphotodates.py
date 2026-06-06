@@ -13,6 +13,7 @@ import subprocess
 import argparse
 import re
 import time
+import shutil
 from collections import Counter, defaultdict
 from datetime import datetime
 import tempfile
@@ -133,6 +134,7 @@ HASH_CACHE_BATCH_COMMIT_EVERY = 1000
 LOCATION_CACHE_BATCH_COMMIT_EVERY = 1000
 LOCATION_CACHE_PRECISION = 2
 WORKER_SHUTDOWN_TIMEOUT_SECONDS = 60
+EXIFTOOL_DRAIN_NO_PROGRESS_TIMEOUT_SECONDS = 30 * 60
 _sqlite_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -189,6 +191,149 @@ def _clear_progress_line():
         print("\r\033[2K", end="")
     else:
         print()
+
+
+class _StatusOutputPauseController:
+    """Suppress transient status lines for a short period after space is pressed."""
+
+    def __init__(
+        self,
+        enabled=True,
+        pause_seconds=60.0,
+        clock=time.time,
+        input_stream=None,
+    ):
+        self._enabled = enabled
+        self._pause_seconds = pause_seconds
+        self._clock = clock
+        self._input_stream = input_stream or sys.stdin
+        self._paused_until = 0.0
+        self._pause_notice_pending = False
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._restore_posix_terminal = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+        return False
+
+    def pause_now(self):
+        with self._lock:
+            now = self._clock()
+            was_paused = now < self._paused_until
+            self._paused_until = max(
+                self._paused_until, now + self._pause_seconds
+            )
+            if not was_paused:
+                self._pause_notice_pending = True
+
+    def is_paused(self, now=None):
+        if now is None:
+            now = self._clock()
+        with self._lock:
+            return now < self._paused_until
+
+    def consume_pause_notice(self):
+        with self._lock:
+            if not self._pause_notice_pending:
+                return False
+            self._pause_notice_pending = False
+            return True
+
+    def start(self):
+        if not self._enabled:
+            return
+        try:
+            if not self._input_stream.isatty():
+                return
+        except Exception:
+            return
+        if os.name == "nt":
+            target = self._run_windows
+        else:
+            target = self._prepare_posix()
+        if target is None:
+            return
+        self._thread = threading.Thread(target=target, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=1.0)
+            except KeyboardInterrupt:
+                pass
+        if self._restore_posix_terminal is not None:
+            try:
+                self._restore_posix_terminal()
+            except (Exception, KeyboardInterrupt):
+                pass
+            finally:
+                self._restore_posix_terminal = None
+
+    def _prepare_posix(self):
+        try:
+            import select
+            import termios
+            import tty
+
+            fd = self._input_stream.fileno()
+            old_attrs = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+
+            def restore():
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+            self._restore_posix_terminal = restore
+        except Exception:
+            return None
+
+        def run():
+            while not self._stop.is_set():
+                try:
+                    readable, _, _ = select.select([self._input_stream], [], [], 0.2)
+                    if readable and os.read(fd, 1) == b" ":
+                        self.pause_now()
+                except Exception:
+                    break
+
+        return run
+
+    def _run_windows(self):
+        try:
+            user32 = __import__("ctypes").windll.user32
+            vk_space = 0x20
+            was_down = False
+            while not self._stop.is_set():
+                is_down = bool(user32.GetAsyncKeyState(vk_space) & 0x8000)
+                if is_down and not was_down:
+                    self.pause_now()
+                was_down = is_down
+                time.sleep(0.05)
+            return
+        except Exception:
+            pass
+
+        try:
+            import msvcrt
+        except ImportError:
+            return
+        while not self._stop.is_set():
+            try:
+                if msvcrt.kbhit():
+                    if msvcrt.getwch() == " ":
+                        self.pause_now()
+                else:
+                    time.sleep(0.2)
+            except Exception:
+                break
+
 
 _WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 _WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
@@ -1107,11 +1252,10 @@ class ExifToolPersistent:
 
             date = None
             for key in self._DATE_KEYS:
-                val = rec.get(key)
-                if val and isinstance(val, str) and val != "-":
-                    if re.match(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", val):
-                        date = val
-                        break
+                normalized = _normalize_exif_date(rec.get(key))
+                if normalized:
+                    date = normalized
+                    break
 
             gps_lat = None
             gps_lon = None
@@ -1130,11 +1274,10 @@ class ExifToolPersistent:
         date = None
         if len(lines) >= self._DATE_TAG_COUNT:
             for i in range(self._DATE_TAG_COUNT):
-                val = lines[i].strip()
-                if val and val != "-":
-                    if re.match(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", val):
-                        date = val
-                        break
+                normalized = _normalize_exif_date(lines[i])
+                if normalized:
+                    date = normalized
+                    break
         gps_lat = None
         gps_lon = None
         if len(lines) >= self._DATE_TAG_COUNT + 2:
@@ -1180,11 +1323,10 @@ def get_photo_data(filepath, _exiftool=None):
             date = None
             if len(lines) >= len(date_tags):
                 for i in range(len(date_tags)):
-                    line = lines[i].strip()
-                    if line and line != "-":
-                        if re.match(r"\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}", line):
-                            date = line
-                            break
+                    normalized = _normalize_exif_date(lines[i])
+                    if normalized:
+                        date = normalized
+                        break
             gps_lat = None
             gps_lon = None
             if len(lines) >= len(date_tags) + 2:
@@ -1350,6 +1492,27 @@ def is_coordinate_string(location):
     return bool(re.match(r"^-?\d+(\.\d+)?,\s*-?\d+(\.\d+)?$", location.strip()))
 
 
+_EXIF_DATE_RE = re.compile(
+    r"^(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})(?:([+-]\d{2}:\d{2}|Z))?$"
+)
+
+
+def _normalize_exif_date(value):
+    """Normalize an ExifTool date string to 'YYYY:MM:DD HH:MM:SS'."""
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or s == "-":
+        return None
+    match = _EXIF_DATE_RE.match(s)
+    if not match:
+        return None
+    date_part = match.group(1)
+    if date_part.startswith("0000:") or date_part[:4] < "1900":
+        return None
+    return date_part
+
+
 def load_cache(output_file, debug=False):
     """Load existing TSV cache if it exists and has the expected header.
 
@@ -1414,6 +1577,8 @@ def load_cache(output_file, debug=False):
                         size_bytes = int(row.get("size_bytes", "0"))
                         mtime_ns = int(row.get("mtime_ns", "0"))
                         date_taken = row.get("date_taken", "") or None
+                        if date_taken:
+                            date_taken = _normalize_exif_date(date_taken)
                         gps_lat = row.get("gps_lat", "") or None
                         gps_lon = row.get("gps_lon", "") or None
                         location = row.get("location", "") or None
@@ -2234,6 +2399,31 @@ def _format_eta(remaining_files, rate):
         return f"{int(secs)}s"
 
 
+def _format_scan_activity(locate, hash_options):
+    """Return a concise label for the post-discovery scan work."""
+    parts = ["metadata"]
+    if getattr(hash_options, "hash_mode", "off") != "off":
+        parts.append("hashes")
+    if locate:
+        parts.append("locations")
+
+    if len(parts) == 1:
+        work = parts[0]
+    elif len(parts) == 2:
+        work = " and ".join(parts)
+    else:
+        work = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+    return f"Processing {work}"
+
+
+def _should_retry_blank_exif(filepath, cached_row, retry_blank_exif):
+    if not retry_blank_exif or not cached_row:
+        return False
+    ext = os.path.splitext(filepath)[1].lstrip(".").lower()
+    date_taken = str(cached_row.get("date_taken") or "").strip()
+    return ext in EXIFTOOL_EXTENSIONS and not date_taken
+
+
 def _clamp_worker_count(workers):
     try:
         return max(1, min(32, int(workers)))
@@ -2348,6 +2538,7 @@ def _exiftool_worker(
             _t_active_start = time.time()
             batch_results = None
             t_exiftool = 0.0
+            metadata_done_count = 0
             try:
                 if exiftool is None:
                     exiftool = ExifToolPersistent()
@@ -2373,15 +2564,27 @@ def _exiftool_worker(
                     for item in batch
                     if item[5] not in SIZE_FILTERED_IMAGE_EXTENSIONS
                 ]
-                _te0 = time.time()
                 batch_results = {}
                 if fast2_batch:
                     fast2_paths = [item[1] for item in fast2_batch]
-                    batch_results.update(exiftool.batch_query(fast2_paths, fast2=True))
+                    _te0 = time.time()
+                    fast2_results = exiftool.batch_query(fast2_paths, fast2=True)
+                    batch_results.update(fast2_results)
+                    t_exiftool += time.time() - _te0
+                    metadata_done_count += len(fast2_batch)
+                    results_queue.put(
+                        {"type": "metadata_done", "input_count": len(fast2_batch)}
+                    )
                 if full_batch:
                     full_paths = [item[1] for item in full_batch]
-                    batch_results.update(exiftool.batch_query(full_paths, fast2=False))
-                t_exiftool = time.time() - _te0
+                    _te0 = time.time()
+                    full_results = exiftool.batch_query(full_paths, fast2=False)
+                    batch_results.update(full_results)
+                    t_exiftool += time.time() - _te0
+                    metadata_done_count += len(full_batch)
+                    results_queue.put(
+                        {"type": "metadata_done", "input_count": len(full_batch)}
+                    )
                 worker_stats["t_exiftool"] += t_exiftool
                 if batch_results is None:
                     batch_results = {item[1]: (None, None, None) for item in batch}
@@ -2392,6 +2595,11 @@ def _exiftool_worker(
                     error_log_lock,
                     f"Warning: ExifTool worker {worker_id} failed; recording {len(batch)} file(s) with blank EXIF: {e!r}",
                 )
+                remaining_metadata = len(batch) - metadata_done_count
+                if remaining_metadata > 0:
+                    results_queue.put(
+                        {"type": "metadata_done", "input_count": remaining_metadata}
+                    )
                 batch_results = {item[1]: (None, None, None) for item in batch}
 
             results, file_counts, stats = _build_exiftool_rows(
@@ -2411,6 +2619,7 @@ def _exiftool_worker(
 
             packet = {
                 "type": "results",
+                "input_count": len(batch),
                 "results": results,
                 "file_counts": file_counts,
                 "t_exiftool": t_exiftool,
@@ -2458,6 +2667,7 @@ def run_scan(
     raw_output=None,  # Alan 5/3/26 - original CLI --output arg, used only for friendly Windows path hints
     workers=4,
     min_image_size=MIN_EXIFTOOL_IMAGE_BYTES,
+    retry_blank_exif=False,
 ):
     """Run a scan on the specified directory.
 
@@ -2548,6 +2758,7 @@ def run_scan(
     file_counts = Counter()
     cached_count = 0
     processed_count = 0
+    retry_blank_exif_count = 0
     # Detailed timing accumulators
     _t_realpath_total = 0.0
     _t_stat_total = 0.0
@@ -2595,7 +2806,10 @@ def run_scan(
 
     interrupted = False
 
-    with open(error_log_path, "w", encoding="utf-8") as error_log:
+    with (
+        _StatusOutputPauseController(enabled=(not quiet and _IS_TTY)) as status_pause,
+        open(error_log_path, "w", encoding="utf-8") as error_log,
+    ):
         start_time = time.time()
         last_save_time = start_time
         last_progress_time = start_time
@@ -2604,6 +2818,7 @@ def run_scan(
             False  # local flag: have we printed the discovery-done message?
         )
         total_files = 0  # set once discovery finishes
+        progress_line_len = 0
 
         work_queue = queue.Queue(maxsize=max(1, worker_count * 4))
         results_queue = queue.Queue()
@@ -2612,6 +2827,10 @@ def run_scan(
         worker_threads = []
         worker_done_count = 0
         fatal_worker_error = None
+        worker_shutdown_timed_out = False
+        exiftool_files_queued = 0
+        exiftool_metadata_done_count = 0
+        exiftool_files_completed = 0
 
         for worker_id in range(1, worker_count + 1):
             t = threading.Thread(
@@ -2642,10 +2861,57 @@ def run_scan(
         #   key_path  — normalized cache key for TSV cache and hash cache lookups
         exiftool_batch = []
 
+        def _pending_exiftool_files():
+            return max(0, exiftool_files_queued - exiftool_metadata_done_count) + len(
+                exiftool_batch
+            )
+
+        def _pending_final_result_files():
+            return max(0, exiftool_metadata_done_count - exiftool_files_completed)
+
+        def _format_exiftool_queue_diag():
+            try:
+                work_qsize = work_queue.qsize()
+            except NotImplementedError:
+                work_qsize = "unknown"
+            alive = sum(1 for thread in worker_threads if thread.is_alive())
+            return (
+                f"queued={exiftool_files_queued:,}, "
+                f"metadata_done={exiftool_metadata_done_count:,}, "
+                f"final_completed={exiftool_files_completed:,}, "
+                f"exiftool_pending={_pending_exiftool_files():,}, "
+                f"postprocess_pending={_pending_final_result_files():,}, "
+                f"work_queue={work_qsize}, alive_workers={alive}"
+            )
+
+        def _fit_progress_line(message):
+            if not _IS_TTY:
+                return message
+            width = shutil.get_terminal_size((120, 20)).columns
+            if width <= 10 or len(message) < width:
+                return message
+            return message[: max(1, width - 4)] + "..."
+
+        def _print_progress_line(message):
+            nonlocal progress_line_len
+            message = _fit_progress_line(message)
+            if not _IS_TTY:
+                print(message)
+                return
+
+            if _ANSI_OK:
+                print(f"\r\033[2K{message}", end="\r")
+            else:
+                padding = " " * max(0, progress_line_len - len(message))
+                print(f"\r{message}{padding}", end="\r")
+            progress_line_len = len(message)
+            sys.stdout.flush()
+
         def _drain_results():
             nonlocal processed_count, _t_exiftool_total, _t_hashing_total
             nonlocal _t_geolocate_total, _t_results_wait, _t_worker_total
             nonlocal worker_done_count, fatal_worker_error
+            nonlocal exiftool_metadata_done_count, exiftool_files_completed
             _trq0 = time.time()
             while True:
                 try:
@@ -2654,12 +2920,23 @@ def run_scan(
                     break
                 if packet.get("type") == "results":
                     rows = packet.get("results", [])
+                    input_count = packet.get("input_count", len(rows))
+                    if len(rows) != input_count:
+                        fatal_worker_error = (
+                            "Error: ExifTool worker returned "
+                            f"{len(rows):,} row(s) for {input_count:,} queued file(s)."
+                        )
+                        print(fatal_worker_error, file=sys.stderr)
+                        break
                     photo_data.extend(rows)
                     file_counts.update(packet.get("file_counts", Counter()))
                     processed_count += len(rows)
+                    exiftool_files_completed += input_count
                     _t_exiftool_total += packet.get("t_exiftool", 0.0)
                     _t_hashing_total += packet.get("t_hashing", 0.0)
                     _t_geolocate_total += packet.get("t_geolocate", 0.0)
+                elif packet.get("type") == "metadata_done":
+                    exiftool_metadata_done_count += packet.get("input_count", 0)
                 elif packet.get("type") == "worker_done":
                     stats = packet.get("stats", {})
                     _worker_details.append(stats)
@@ -2679,6 +2956,10 @@ def run_scan(
             total_seen = cached_count + processed_count
             current_time = time.time()
             rate_tracker.record(current_time, total_seen)
+
+            if not quiet and status_pause.consume_pause_notice():
+                _clear_progress_line()
+                print("Status output paused for 60 seconds; scan continues.")
 
             if total_seen > 0 and (current_time - last_save_time) > 900:
                 _tc0 = time.time()
@@ -2707,26 +2988,37 @@ def run_scan(
                     stop_event.set()
                     return False
 
-            if not quiet and (current_time - last_progress_time) >= 2.0:
+            if (
+                not quiet
+                and not status_pause.is_paused(current_time)
+                and (current_time - last_progress_time) >= 2.0
+            ):
                 elapsed = current_time - start_time
                 rate = rate_tracker.rate()
                 rate_str = f"{rate:.0f} files/sec" if rate else "..."
+                activity = _format_scan_activity(locate, hash_options)
+                pending_exiftool = _pending_exiftool_files()
+                exiftool_part = (
+                    f" — {pending_exiftool:,} in ExifTool queue"
+                    if pending_exiftool > 0
+                    else ""
+                )
 
                 if discovery_complete and total_files > 0:
                     pct = total_seen / total_files * 100
                     eta_str = _format_eta(total_files - total_seen, rate)
                     eta_part = f" — ETA: {eta_str}" if eta_str else ""
-                    print(
-                        f"Processed {total_seen:,} / {total_files:,} ({pct:.1f}%) — "
-                        f"{rate_str}{eta_part} [{_format_duration(elapsed)}]",
-                        end="\r" if _IS_TTY else "\n",
+                    _print_progress_line(
+                        f"{activity}... {total_seen:,} / {total_files:,} ({pct:.1f}%) — "
+                        f"{cached_count:,} cached{exiftool_part} — "
+                        f"{rate_str}{eta_part} [{_format_duration(elapsed)}]"
                     )
                 else:
-                    print(
-                        f"Discovering... {discovery.discovered:,} found | "
+                    _print_progress_line(
+                        f"Discovering and {activity[0].lower() + activity[1:]}... "
+                        f"{discovery.discovered:,} found | "
                         f"Processed {total_seen:,} ({cached_count:,} cached) — "
-                        f"{rate_str} [{_format_duration(elapsed)}]",
-                        end="\r" if _IS_TTY else "\n",
+                        f"{rate_str}{exiftool_part} [{_format_duration(elapsed)}]"
                     )
                 last_progress_time = current_time
             return True
@@ -2787,6 +3079,7 @@ def run_scan(
             file_counts[ext] += 1
 
         def _enqueue_exiftool_batch():
+            nonlocal exiftool_files_queued
             if not exiftool_batch:
                 return True
             batch = list(exiftool_batch)
@@ -2794,6 +3087,7 @@ def run_scan(
             while True:
                 try:
                     work_queue.put(batch, timeout=0.5)
+                    exiftool_files_queued += len(batch)
                     return True
                 except queue.Full:
                     if not _drain_results():
@@ -2811,6 +3105,7 @@ def run_scan(
                         return True
 
         def _stop_workers(interrupt=False):
+            nonlocal worker_shutdown_timed_out
             if interrupt:
                 stop_event.set()
                 for _ in worker_threads:
@@ -2829,8 +3124,10 @@ def run_scan(
                     if remaining <= 0:
                         alive = sum(1 for thread in worker_threads if thread.is_alive())
                         if alive:
+                            worker_shutdown_timed_out = True
                             print(
-                                f"Warning: {alive} ExifTool worker(s) did not exit within {timeout_seconds} seconds; abandoning.",
+                                f"Warning: {alive} ExifTool worker(s) did not exit within {timeout_seconds} seconds; abandoning; failing scan. "
+                                f"ExifTool state: {_format_exiftool_queue_diag()}",
                                 file=sys.stderr,
                             )
                         return False
@@ -2840,6 +3137,56 @@ def run_scan(
                     _update_progress_and_checkpoint()
             _drain_results()
             return True
+
+        def _wait_for_exiftool_drain():
+            # Alan 5/8/26 - Drain queued metadata batches before normal shutdown;
+            # the shutdown timeout is only for worker exit, not backlog processing.
+            last_metadata_done = exiftool_metadata_done_count
+            last_progress_time_for_diag = time.time()
+            last_diag_time = last_progress_time_for_diag
+            while exiftool_metadata_done_count < exiftool_files_queued:
+                if not _drain_results():
+                    return False
+                _maybe_print_discovery_complete()
+                if not _update_progress_and_checkpoint():
+                    return False
+
+                pending = exiftool_files_queued - exiftool_metadata_done_count
+                if pending <= 0:
+                    break
+
+                if not any(t.is_alive() for t in worker_threads):
+                    print(
+                        "Error: ExifTool workers exited before all queued metadata work completed. "
+                        f"ExifTool state: {_format_exiftool_queue_diag()}",
+                        file=sys.stderr,
+                    )
+                    return False
+
+                now = time.time()
+                if exiftool_metadata_done_count != last_metadata_done:
+                    last_metadata_done = exiftool_metadata_done_count
+                    last_progress_time_for_diag = now
+                elif now - last_progress_time_for_diag >= 300 and now - last_diag_time >= 300:
+                    print(
+                        "Warning: still waiting for ExifTool metadata work to drain. "
+                        f"ExifTool state: {_format_exiftool_queue_diag()}",
+                        file=sys.stderr,
+                    )
+                    last_diag_time = now
+                if (
+                    now - last_progress_time_for_diag
+                    >= EXIFTOOL_DRAIN_NO_PROGRESS_TIMEOUT_SECONDS
+                ):
+                    print(
+                        "Error: ExifTool metadata work made no progress before the drain timeout. "
+                        f"ExifTool state: {_format_exiftool_queue_diag()}",
+                        file=sys.stderr,
+                    )
+                    return False
+                time.sleep(0.2)
+
+            return _drain_results()
 
         try:
             while True:
@@ -2909,11 +3256,25 @@ def run_scan(
                     cached_entry = cache.get(key_path)
                     _t_cache_lookup_total += time.time() - _tcl0
 
-                    if (
+                    cache_valid = (
                         cached_entry
                         and cached_entry["size_bytes"] == size_bytes
                         and cached_entry["mtime_ns"] == mtime_ns
-                    ):
+                    )
+                    retry_cached_blank_exif = False
+                    if cache_valid:
+                        # Alan 5/8/26 - Retry blank EXIF cache rows so interrupted TSV inventories can be repaired.
+                        retry_cached_blank_exif = _should_retry_blank_exif(
+                            key_path, cached_entry, retry_blank_exif
+                        )
+                        if retry_cached_blank_exif:
+                            retry_blank_exif_count += 1
+                            if debug:
+                                print(
+                                    f"Debug: Retrying blank EXIF cache row: {out_path}"
+                                )
+
+                    if cache_valid and not retry_cached_blank_exif:
                         date_taken = cached_entry["date_taken"]
                         gps_lat = cached_entry.get("gps_lat")
                         gps_lon = cached_entry.get("gps_lon")
@@ -2958,12 +3319,13 @@ def run_scan(
                         # fall through to progress/checkpoint below
 
                     else:
-                        # Not cached — check if exiftool-eligible
+                        # Not cached, stale, or forced retry — check if exiftool-eligible
                         if ext in EXIFTOOL_EXTENSIONS:
                             # Tiny images (icons, thumbnails) almost never have EXIF.
                             # RAW/video/other EXIFTOOL_EXTENSIONS are not filtered.
                             skip_for_size = (
-                                min_image_size > 0
+                                not retry_cached_blank_exif
+                                and min_image_size > 0
                                 and ext in SIZE_FILTERED_IMAGE_EXTENSIONS
                                 and size_bytes < min_image_size
                             )
@@ -3002,11 +3364,7 @@ def run_scan(
                                 mtime_ns,
                                 ext,
                             )
-                    if (
-                        cached_entry
-                        and cached_entry["size_bytes"] == size_bytes
-                        and cached_entry["mtime_ns"] == mtime_ns
-                    ):
+                    if cache_valid and not retry_cached_blank_exif:
                         file_counts[ext] += 1
 
                 except OSError as e:
@@ -3036,6 +3394,11 @@ def run_scan(
 
             if not _enqueue_exiftool_batch():
                 _stop_workers(interrupt=True)
+                cleanup_all()
+                return False
+            if not _wait_for_exiftool_drain():
+                _stop_workers(interrupt=True)
+                _drain_results()
                 cleanup_all()
                 return False
             workers_finished = _stop_workers(interrupt=False)
@@ -3075,14 +3438,28 @@ def run_scan(
             raise
         except KeyboardInterrupt:
             interrupted = True
-            _stop_workers(interrupt=True)
-            _drain_results()
+            status_pause.stop()
+            _clear_progress_line()
             print(
-                f"\n\nInterrupted! Saving progress ({len(photo_data):,} files processed so far)..."
+                f"\nInterrupted by Ctrl-C after collecting {len(photo_data):,} file rows."
             )
+            print("Stopping workers and saving a resumable partial inventory...")
+            try:
+                _stop_workers(interrupt=True)
+            except KeyboardInterrupt:
+                print(
+                    "Second Ctrl-C received while stopping workers; skipping worker wait."
+                )
+            try:
+                _drain_results()
+            except KeyboardInterrupt:
+                print(
+                    "Second Ctrl-C received while collecting final worker results."
+                )
             # Alan 5/3/26 - _safe_write_inventory already prints a friendly
             # error block on predictable failures; only show a generic
             # warning for unexpected exceptions.
+            saved_progress = False
             try:
                 if _safe_write_inventory(
                     output,
@@ -3094,19 +3471,35 @@ def run_scan(
                     debug=debug,
                     context="interrupted save",
                 ):
-                    print(f"Progress saved to '{output}'.")
+                    saved_progress = True
+                    print(f"Saved {len(photo_data):,} rows to '{output}'.")
+            except KeyboardInterrupt:
+                print(
+                    "Second Ctrl-C received while saving; the partial inventory may not have been written."
+                )
             except Exception as save_err:
                 print(f"WARNING: Could not save progress: {save_err}")
-            print("\nTo resume, run the same command again:")
-            print(f'  findphotodates.py --directory "{directory}" -o "{output}"')
-            print(
-                "The scan will pick up where it left off using the saved inventory as cache."
-            )
+            if saved_progress:
+                print("\nTo resume, run the same command again.")
+                print(
+                    "Existing rows in the TSV will be used as cache, so the scan picks up from saved progress."
+                )
+            else:
+                print("\nNo resumable progress file was saved for this interrupt.")
 
     # Wait for producer thread to finish (should already be done)
-    producer.join(timeout=5)
+    try:
+        producer.join(timeout=0.2 if interrupted else 5)
+    except KeyboardInterrupt:
+        interrupted = True
 
     if interrupted:
+        try:
+            cleanup_all()
+        except KeyboardInterrupt:
+            pass
+        return False
+    if worker_shutdown_timed_out:
         cleanup_all()
         return False
 
@@ -3151,6 +3544,8 @@ def run_scan(
             print(
                 f"  ({cached_count:,} from cache, {processed_count:,} newly processed)"
             )
+        if retry_blank_exif:
+            print(f"Blank EXIF rows retried: {retry_blank_exif_count:,}")
 
     summarize_results(photo_data, file_counts, quiet, debug)
     cleanup_all()
@@ -3184,6 +3579,7 @@ def run_scan(
         perf_stats["files_total"] = total_seen
         perf_stats["files_cached"] = cached_count
         perf_stats["files_processed"] = processed_count
+        perf_stats["retry_blank_exif_count"] = retry_blank_exif_count
 
     return True
 
@@ -3247,6 +3643,9 @@ def _print_perf_summary(label, stats):
     cached = stats.get("files_cached", 0)
     processed = stats.get("files_processed", 0)
     print(f"  Files: {total:,} total ({cached:,} cached, {processed:,} processed)")
+    retried = stats.get("retry_blank_exif_count", 0)
+    if retried:
+        print(f"  Blank EXIF rows retried: {retried:,}")
 
 
 def add_hashes_to_inventory(
@@ -3360,62 +3759,71 @@ def add_hashes_to_inventory(
     last_progress_time = start_time
 
     try:
-        for row in rows:
-            if row.get("content_hash", "").strip():
-                continue  # already has hash
+        with _StatusOutputPauseController(
+            enabled=(not quiet and _IS_TTY)
+        ) as status_pause:
+            for row in rows:
+                if row.get("content_hash", "").strip():
+                    continue  # already has hash
 
-            filepath = row.get("filepath", "")
-            if not filepath:
-                continue
+                filepath = row.get("filepath", "")
+                if not filepath:
+                    continue
 
-            try:
-                # key_path from stored filepath (matches load_cache keying)
-                key_path = _normalize_cache_key(filepath)
-                # Resolve cross-platform display paths back to a local path
-                # before following symlinks for stat/hash I/O.
-                real_path = os.path.realpath(_resolve_local_inventory_path(filepath))
-                stat_info = os.stat(real_path)
-                size_bytes = stat_info.st_size
-                mtime_ns = stat_info.st_mtime_ns
+                try:
+                    # key_path from stored filepath (matches load_cache keying)
+                    key_path = _normalize_cache_key(filepath)
+                    # Resolve cross-platform display paths back to a local path
+                    # before following symlinks for stat/hash I/O.
+                    real_path = os.path.realpath(_resolve_local_inventory_path(filepath))
+                    stat_info = os.stat(real_path)
+                    size_bytes = stat_info.st_size
+                    mtime_ns = stat_info.st_mtime_ns
 
-                # Verify file hasn't changed since indexing
-                row_size = int(row.get("size_bytes", 0))
-                row_mtime = int(row.get("mtime_ns", 0))
-                if row_size != size_bytes or row_mtime != mtime_ns:
-                    if debug:
-                        print(f"  Skipping (changed): {filepath}")
+                    # Verify file hasn't changed since indexing
+                    row_size = int(row.get("size_bytes", 0))
+                    row_mtime = int(row.get("mtime_ns", 0))
+                    if row_size != size_bytes or row_mtime != mtime_ns:
+                        if debug:
+                            print(f"  Skipping (changed): {filepath}")
+                        skipped += 1
+                        continue
+
+                    content_hash = get_content_hash(
+                        key_path,
+                        size_bytes,
+                        mtime_ns,
+                        hash_options,
+                        hash_conn,
+                        hash_cache_pending,
+                        os_path=real_path,
+                    )
+                    if content_hash:
+                        row["content_hash"] = content_hash
+                        filled += 1
+                    else:
+                        errors += 1
+
+                except OSError:
                     skipped += 1
                     continue
 
-                content_hash = get_content_hash(
-                    key_path,
-                    size_bytes,
-                    mtime_ns,
-                    hash_options,
-                    hash_conn,
-                    hash_cache_pending,
-                    os_path=real_path,
-                )
-                if content_hash:
-                    row["content_hash"] = content_hash
-                    filled += 1
-                else:
-                    errors += 1
-
-            except OSError:
-                skipped += 1
-                continue
-
-            # Progress every 2 seconds
-            if not quiet:
-                current_time = time.time()
-                if current_time - last_progress_time >= 2.0:
-                    elapsed = current_time - start_time
-                    print(
-                        f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]",
-                        end="\r" if _IS_TTY else "\n",
-                    )
-                    last_progress_time = current_time
+                # Progress every 2 seconds
+                if not quiet:
+                    current_time = time.time()
+                    if status_pause.consume_pause_notice():
+                        _clear_progress_line()
+                        print("Status output paused for 60 seconds; hashing continues.")
+                    if (
+                        not status_pause.is_paused(current_time)
+                        and current_time - last_progress_time >= 2.0
+                    ):
+                        elapsed = current_time - start_time
+                        print(
+                            f"  Hashed {filled:,} / {len(need_hash):,} — {skipped} skipped, {errors} errors [{_format_duration(elapsed)}]",
+                            end="\r" if _IS_TTY else "\n",
+                        )
+                        last_progress_time = current_time
 
     except KeyboardInterrupt:
         interrupted = True
@@ -3603,6 +4011,7 @@ Options:
   --no-hash-cache          Disable hash cache.
   --workers N       Number of parallel ExifTool worker threads (default: 4).
   --min-image-size BYTES  Skip ExifTool for tiny JPG/JPEG/PNG/WebP images (default: 100,000; 0 disables).
+  --retry-blank-exif      Re-query ExifTool-eligible cached rows with blank date_taken.
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
   --save             Save the current scan configuration for later use.
@@ -3744,6 +4153,11 @@ For more details on a specific option, you can also use:
         ),
     )
     parser.add_argument(
+        "--retry-blank-exif",
+        action="store_true",
+        help="Re-query ExifTool-eligible cached rows with blank date_taken instead of reusing them.",
+    )
+    parser.add_argument(
         "--linux",
         action="store_const",
         dest="path_style",
@@ -3845,6 +4259,7 @@ For more details on a specific option, you can also use:
             "path_style": args.path_style,
             "workers": _clamp_worker_count(args.workers),
             "min_image_size": _clamp_min_image_size(args.min_image_size),
+            "retry_blank_exif": args.retry_blank_exif,
         }
 
         config = load_config()
@@ -3913,6 +4328,7 @@ For more details on a specific option, you can also use:
                 raw_output=output,
                 workers=args.workers,
                 min_image_size=args.min_image_size,
+                retry_blank_exif=args.retry_blank_exif,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
@@ -3978,6 +4394,7 @@ For more details on a specific option, you can also use:
                     min_image_size=flags.get(
                         "min_image_size", MIN_EXIFTOOL_IMAGE_BYTES
                     ),
+                    retry_blank_exif=flags.get("retry_blank_exif", False),
                 )
                 if ok is False:
                     any_scan_failed = True
@@ -4027,6 +4444,7 @@ For more details on a specific option, you can also use:
         raw_output=output,
         workers=args.workers,
         min_image_size=args.min_image_size,
+        retry_blank_exif=args.retry_blank_exif,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)

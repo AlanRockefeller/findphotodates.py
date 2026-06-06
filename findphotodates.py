@@ -2538,6 +2538,7 @@ def _exiftool_worker(
             _t_active_start = time.time()
             batch_results = None
             t_exiftool = 0.0
+            metadata_done_count = 0
             try:
                 if exiftool is None:
                     exiftool = ExifToolPersistent()
@@ -2563,15 +2564,27 @@ def _exiftool_worker(
                     for item in batch
                     if item[5] not in SIZE_FILTERED_IMAGE_EXTENSIONS
                 ]
-                _te0 = time.time()
                 batch_results = {}
                 if fast2_batch:
                     fast2_paths = [item[1] for item in fast2_batch]
-                    batch_results.update(exiftool.batch_query(fast2_paths, fast2=True))
+                    _te0 = time.time()
+                    fast2_results = exiftool.batch_query(fast2_paths, fast2=True)
+                    batch_results.update(fast2_results)
+                    t_exiftool += time.time() - _te0
+                    metadata_done_count += len(fast2_batch)
+                    results_queue.put(
+                        {"type": "metadata_done", "input_count": len(fast2_batch)}
+                    )
                 if full_batch:
                     full_paths = [item[1] for item in full_batch]
-                    batch_results.update(exiftool.batch_query(full_paths, fast2=False))
-                t_exiftool = time.time() - _te0
+                    _te0 = time.time()
+                    full_results = exiftool.batch_query(full_paths, fast2=False)
+                    batch_results.update(full_results)
+                    t_exiftool += time.time() - _te0
+                    metadata_done_count += len(full_batch)
+                    results_queue.put(
+                        {"type": "metadata_done", "input_count": len(full_batch)}
+                    )
                 worker_stats["t_exiftool"] += t_exiftool
                 if batch_results is None:
                     batch_results = {item[1]: (None, None, None) for item in batch}
@@ -2582,6 +2595,11 @@ def _exiftool_worker(
                     error_log_lock,
                     f"Warning: ExifTool worker {worker_id} failed; recording {len(batch)} file(s) with blank EXIF: {e!r}",
                 )
+                remaining_metadata = len(batch) - metadata_done_count
+                if remaining_metadata > 0:
+                    results_queue.put(
+                        {"type": "metadata_done", "input_count": remaining_metadata}
+                    )
                 batch_results = {item[1]: (None, None, None) for item in batch}
 
             results, file_counts, stats = _build_exiftool_rows(
@@ -2811,6 +2829,7 @@ def run_scan(
         fatal_worker_error = None
         worker_shutdown_timed_out = False
         exiftool_files_queued = 0
+        exiftool_metadata_done_count = 0
         exiftool_files_completed = 0
 
         for worker_id in range(1, worker_count + 1):
@@ -2843,9 +2862,12 @@ def run_scan(
         exiftool_batch = []
 
         def _pending_exiftool_files():
-            return max(0, exiftool_files_queued - exiftool_files_completed) + len(
+            return max(0, exiftool_files_queued - exiftool_metadata_done_count) + len(
                 exiftool_batch
             )
+
+        def _pending_final_result_files():
+            return max(0, exiftool_metadata_done_count - exiftool_files_completed)
 
         def _format_exiftool_queue_diag():
             try:
@@ -2855,8 +2877,10 @@ def run_scan(
             alive = sum(1 for thread in worker_threads if thread.is_alive())
             return (
                 f"queued={exiftool_files_queued:,}, "
-                f"completed={exiftool_files_completed:,}, "
-                f"pending={_pending_exiftool_files():,}, "
+                f"metadata_done={exiftool_metadata_done_count:,}, "
+                f"final_completed={exiftool_files_completed:,}, "
+                f"exiftool_pending={_pending_exiftool_files():,}, "
+                f"postprocess_pending={_pending_final_result_files():,}, "
                 f"work_queue={work_qsize}, alive_workers={alive}"
             )
 
@@ -2887,7 +2911,7 @@ def run_scan(
             nonlocal processed_count, _t_exiftool_total, _t_hashing_total
             nonlocal _t_geolocate_total, _t_results_wait, _t_worker_total
             nonlocal worker_done_count, fatal_worker_error
-            nonlocal exiftool_files_completed
+            nonlocal exiftool_metadata_done_count, exiftool_files_completed
             _trq0 = time.time()
             while True:
                 try:
@@ -2911,6 +2935,8 @@ def run_scan(
                     _t_exiftool_total += packet.get("t_exiftool", 0.0)
                     _t_hashing_total += packet.get("t_hashing", 0.0)
                     _t_geolocate_total += packet.get("t_geolocate", 0.0)
+                elif packet.get("type") == "metadata_done":
+                    exiftool_metadata_done_count += packet.get("input_count", 0)
                 elif packet.get("type") == "worker_done":
                     stats = packet.get("stats", {})
                     _worker_details.append(stats)
@@ -3115,17 +3141,17 @@ def run_scan(
         def _wait_for_exiftool_drain():
             # Alan 5/8/26 - Drain queued metadata batches before normal shutdown;
             # the shutdown timeout is only for worker exit, not backlog processing.
-            last_completed = exiftool_files_completed
+            last_metadata_done = exiftool_metadata_done_count
             last_progress_time_for_diag = time.time()
             last_diag_time = last_progress_time_for_diag
-            while exiftool_files_completed < exiftool_files_queued:
+            while exiftool_metadata_done_count < exiftool_files_queued:
                 if not _drain_results():
                     return False
                 _maybe_print_discovery_complete()
                 if not _update_progress_and_checkpoint():
                     return False
 
-                pending = exiftool_files_queued - exiftool_files_completed
+                pending = exiftool_files_queued - exiftool_metadata_done_count
                 if pending <= 0:
                     break
 
@@ -3138,8 +3164,8 @@ def run_scan(
                     return False
 
                 now = time.time()
-                if exiftool_files_completed != last_completed:
-                    last_completed = exiftool_files_completed
+                if exiftool_metadata_done_count != last_metadata_done:
+                    last_metadata_done = exiftool_metadata_done_count
                     last_progress_time_for_diag = now
                 elif now - last_progress_time_for_diag >= 300 and now - last_diag_time >= 300:
                     print(
@@ -4233,6 +4259,7 @@ For more details on a specific option, you can also use:
             "path_style": args.path_style,
             "workers": _clamp_worker_count(args.workers),
             "min_image_size": _clamp_min_image_size(args.min_image_size),
+            "retry_blank_exif": args.retry_blank_exif,
         }
 
         config = load_config()
@@ -4367,7 +4394,7 @@ For more details on a specific option, you can also use:
                     min_image_size=flags.get(
                         "min_image_size", MIN_EXIFTOOL_IMAGE_BYTES
                     ),
-                    retry_blank_exif=args.retry_blank_exif,
+                    retry_blank_exif=flags.get("retry_blank_exif", False),
                 )
                 if ok is False:
                     any_scan_failed = True

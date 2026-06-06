@@ -840,6 +840,54 @@ def test_exiftool_backlog_drains_before_normal_shutdown(tmp_path, monkeypatch):
     assert all(row["date_taken"] for row in rows)
 
 
+def test_exiftool_drain_tracks_metadata_before_slow_postprocessing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(fpd, "EXIFTOOL_BATCH_SIZE", 1)
+    monkeypatch.setattr(fpd, "EXIFTOOL_DRAIN_NO_PROGRESS_TIMEOUT_SECONDS", 0.05)
+    root = tmp_path / "scan"
+    path = root / "a.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"jpg")
+
+    class FastExifTool:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def batch_query(self, filepaths, fast2=False):
+            return {
+                fp: ("2024:01:01 10:00:00", "37.871", "-122.273")
+                for fp in filepaths
+            }
+
+    real_build_exiftool_rows = fpd._build_exiftool_rows
+
+    def slow_build_exiftool_rows(*args, **kwargs):
+        time.sleep(0.3)
+        return real_build_exiftool_rows(*args, **kwargs)
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", FastExifTool)
+    monkeypatch.setattr(fpd, "_build_exiftool_rows", slow_build_exiftool_rows)
+    output = tmp_path / "out.tsv"
+
+    assert fpd.run_scan(
+        str(root),
+        str(output),
+        {"jpg"},
+        quiet=True,
+        hash_options=fpd.parse_hash_args(hash_mode="off"),
+        workers=1,
+        min_image_size=0,
+    )
+
+    rows = _read_data_rows(output)
+    assert len(rows) == 1
+    assert rows[0]["date_taken"] == "2024:01:01 10:00:00"
+
+
 def test_worker_result_count_mismatch_fails_scan(tmp_path, monkeypatch, capsys):
     root = tmp_path / "scan"
     path = root / "a.jpg"
@@ -934,6 +982,62 @@ def test_exiftool_drain_no_progress_timeout_fails_scan(tmp_path, monkeypatch, ca
     assert time.monotonic() - started < 1.5
     assert "made no progress before the drain timeout" in capsys.readouterr().err
     assert not output.exists()
+
+
+def test_saved_scan_persists_and_reuses_retry_blank_exif(tmp_path, monkeypatch):
+    root = tmp_path / "scan"
+    root.mkdir()
+    output = tmp_path / "out.tsv"
+    saved_config = {}
+    retry_values = []
+
+    class ExifToolVersion:
+        returncode = 0
+
+    def fake_load_config():
+        return saved_config if saved_config else {"saved_scans": []}
+
+    def fake_save_config(config):
+        saved_config.clear()
+        saved_config.update(config)
+
+    def fake_run_scan(*args, **kwargs):
+        retry_values.append(kwargs.get("retry_blank_exif"))
+        return True
+
+    monkeypatch.setattr(
+        fpd.subprocess, "run", lambda *args, **kwargs: ExifToolVersion()
+    )
+    monkeypatch.setattr(fpd, "migrate_default_hash_cache", lambda **kwargs: None)
+    monkeypatch.setattr(fpd, "load_config", fake_load_config)
+    monkeypatch.setattr(fpd, "save_config", fake_save_config)
+    monkeypatch.setattr(fpd, "run_scan", fake_run_scan)
+
+    monkeypatch.setattr(
+        fpd.sys,
+        "argv",
+        [
+            "findphotodates.py",
+            "--directory",
+            str(root),
+            "-o",
+            str(output),
+            "--save",
+            "--retry-blank-exif",
+            "--quiet",
+        ],
+    )
+    fpd.main()
+
+    flags = saved_config["saved_scans"][0]["flags"]
+    assert flags["retry_blank_exif"] is True
+    assert retry_values == [True]
+
+    retry_values.clear()
+    monkeypatch.setattr(fpd.sys, "argv", ["findphotodates.py", "--scan"])
+    fpd.main()
+
+    assert retry_values == [True]
 
 
 def test_perf_summary_marks_parallel_sums_and_worker_active(capsys):

@@ -1518,6 +1518,19 @@ def _root_cache_prefix(root):
     return _normalize_cache_key(root.rstrip("/\\") + "/")
 
 
+def _root_still_present(root):
+    """True if an inventory root still exists here and is not an empty dir.
+
+    Rebasing is only safe when the drive has actually moved; if the recorded
+    root still holds files, cached paths under it remain valid as-is.
+    """
+    try:
+        with os.scandir(root) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+
 def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
     """Load existing TSV cache if it exists and has the expected header.
 
@@ -1525,9 +1538,10 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
     Skips all leading # lines, then uses the first non-# line as the header row.
 
     If inventory_root is given and the file's ``# inventory_root=`` header
-    names a different root (e.g. the drive was scanned as /mnt/l under WSL
-    and is now mounted at /run/media/alan/Label), cached paths under the old
-    root are rebased onto the new one so unchanged files still hit the cache.
+    names a different root that no longer exists here (e.g. the drive was
+    scanned as /mnt/l under WSL and is now mounted at /run/media/alan/Label),
+    cached paths under the old root are rebased onto the new one so unchanged
+    files still hit the cache.
     """
     cache = {}
     if not os.path.exists(output_file):
@@ -1559,7 +1573,9 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                             new_prefix = _root_cache_prefix(
                                 os.path.abspath(inventory_root)
                             )
-                            if old_prefix == new_prefix:
+                            if old_prefix == new_prefix or _root_still_present(
+                                recorded_root
+                            ):
                                 old_prefix = new_prefix = None
                             elif not quiet:
                                 print(

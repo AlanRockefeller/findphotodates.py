@@ -1513,15 +1513,42 @@ def _normalize_exif_date(value):
     return date_part
 
 
-def load_cache(output_file, debug=False):
+def _root_cache_prefix(root):
+    """Normalized cache-key prefix (with trailing slash) for an inventory root."""
+    return _normalize_cache_key(root.rstrip("/\\") + "/")
+
+
+def _root_still_present(root):
+    """True if an inventory root still exists here and is not an empty dir.
+
+    Rebasing is only safe when the drive has actually moved; if the recorded
+    root still holds files, cached paths under it remain valid as-is.
+    """
+    try:
+        with os.scandir(root) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+
+def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
     """Load existing TSV cache if it exists and has the expected header.
 
     Accepts both current columns (with content_hash) and legacy 7-column TSV.
     Skips all leading # lines, then uses the first non-# line as the header row.
+
+    If inventory_root is given and the file's ``# inventory_root=`` header
+    names a different root that no longer exists here (e.g. the drive was
+    scanned as /mnt/l under WSL and is now mounted at /run/media/alan/Label),
+    cached paths under the old root are rebased onto the new one so unchanged
+    files still hit the cache.
     """
     cache = {}
     if not os.path.exists(output_file):
         return cache
+
+    old_prefix = None
+    new_prefix = None
 
     try:
         with open(output_file, "r", encoding="utf-8", newline="") as f:
@@ -1535,6 +1562,26 @@ def load_cache(output_file, debug=False):
                 if not line:
                     continue
                 if line.startswith("#"):
+                    # Alan 9/28/26 - Rebase cached paths when the drive moved
+                    # to a different mount point since the last scan.
+                    if inventory_root is not None and line.startswith(
+                        "# inventory_root="
+                    ):
+                        recorded_root = line[len("# inventory_root=") :].strip()
+                        if recorded_root:
+                            old_prefix = _root_cache_prefix(recorded_root)
+                            new_prefix = _root_cache_prefix(
+                                os.path.abspath(inventory_root)
+                            )
+                            if old_prefix == new_prefix or _root_still_present(
+                                recorded_root
+                            ):
+                                old_prefix = new_prefix = None
+                            elif not quiet:
+                                print(
+                                    f"Inventory was created at '{recorded_root}'; "
+                                    f"matching cached paths against '{inventory_root}'."
+                                )
                     continue
 
                 # First non-# line
@@ -1574,6 +1621,10 @@ def load_cache(output_file, debug=False):
                     try:
                         # Normalize for cross-platform cache hits (WSL ↔ Windows).
                         abs_filepath = _normalize_cache_key(filepath)
+                        if old_prefix and abs_filepath.startswith(old_prefix):
+                            abs_filepath = (
+                                new_prefix + abs_filepath[len(old_prefix) :]
+                            )
                         size_bytes = int(row.get("size_bytes", "0"))
                         mtime_ns = int(row.get("mtime_ns", "0"))
                         date_taken = row.get("date_taken", "") or None
@@ -2738,7 +2789,9 @@ def run_scan(
 
     # Load existing cache
     _t_cache_start = time.time()
-    cache = load_cache(output, debug=debug)
+    cache = load_cache(
+        output, debug=debug, inventory_root=inventory_root, quiet=quiet
+    )
     _t_cache_load = time.time() - _t_cache_start
     if not quiet and cache:
         print(f"Loaded {len(cache)} entries from cache.")

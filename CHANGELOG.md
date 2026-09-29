@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.6.1 (2026-09-29)
+
+- Much faster scans of backup drives. Photos and videos that were already scanned on another drive (same name, size and modification time, as copies keep) now take their date and GPS from that drive's list instead of being read again. Every list in the same folder as the one being written is used, so in the menu and GUI that's all your drive lists. A partial scan of the Erowid drive found 99% of its photos already listed for other drives. Only list entries with a date or GPS are reused; photos whose earlier scan found nothing are read again. `--no-reuse-other-lists` turns this off.
+- Hard drives are read two files at a time instead of four. With one set of heads (and, on many USB enclosures, one command at a time), more readers just make the drive seek back and forth between folders. SSDs, network shares and drives on Windows or WSL are unaffected.
+- Stopping a scan is now immediate. Before, it waited 5 seconds for each ExifTool process to finish its batch, which on a slow drive can take minutes, then warned that the workers "did not exit". Batches in progress are now dropped and read again when the scan resumes.
+
 ## v1.6.0 (2026-09-28)
 
 - Added a desktop GUI for the interactive workflow, with connected drive selection, live scan progress, resumable stop, list browsing, and drive health checks.

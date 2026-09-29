@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Check whether files under a target directory exist on other drives,
-using Alan's `findphotodates.py` inventory files: ~/*:photo.taken.dates.txt
+using Alan's `findphotodates.py` inventory files (by default every .tsv in
+findphotodates.py's file lists folder, Documents/findphotodates unless changed,
+plus older ~/*:photo.taken.dates.txt lists)
 
 Supports BOTH inventory formats:
 
@@ -485,10 +487,26 @@ def classify_safe_to_delete(safety: str) -> bool:
     return safety in SAFE_SAFETY_VALUES
 
 
+def default_list_dir() -> Path:
+    """Folder where findphotodates.py keeps file lists (Documents/findphotodates)."""
+    try:
+        from findphotodates import default_inventory_dir
+
+        return default_inventory_dir()
+    except (Exception, SystemExit):  # missing module or unreadable config
+        return Path.home() / "Documents" / "findphotodates"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True, help="Folder to verify (staging area)")
-    ap.add_argument("--inventories", default="", help="Comma-separated inventory files")
+    ap.add_argument(
+        "--inventories",
+        default="",
+        help="Comma-separated inventory files (default: every .tsv in the file lists folder, "
+        "Documents/findphotodates unless changed, "
+        "plus older ~/*:photo.taken.dates.txt lists)",
+    )
     ap.add_argument(
         "--exclude-path-regex",
         default=r"/\$RECYCLE\.BIN/|/\.Trash/|/@eaDir/|/\.DS_Store$",
@@ -579,7 +597,8 @@ def main() -> int:
         ]
     else:
         inv_files = (
-            sorted(Path.home().glob("*:photo.taken.dates.txt"))
+            sorted(default_list_dir().glob("*.tsv"))
+            + sorted(Path.home().glob("*:photo.taken.dates.txt"))
             + sorted(Path.home().glob("*_photo.taken.dates.txt"))
             + sorted(Path.home().glob("*:photo.taken.dates.tsv"))
             + sorted(Path.home().glob("*_photo.taken.dates.tsv"))

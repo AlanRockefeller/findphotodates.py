@@ -1,0 +1,2 @@
+# Runtime dependency for findphotodates_gui.py. The CLI uses only stdlib.
+customtkinter>=5.2.2,<6

@@ -1,6 +1,6 @@
 # findphotodates.py
 
-**Version 1.5.3 (2026-09-28)**, by Alan Rockefeller
+**Version 1.6.0 (2026-09-28)**, by Alan Rockefeller
 
 A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
@@ -8,15 +8,16 @@ A filesystem inventory tool that indexes all files and extracts EXIF dates and G
 
 1. [What is this?](#what-is-this)
 2. [The Menu (easiest way to use it)](#the-menu-easiest-way-to-use-it)
-3. [Features](#features)
-4. [Requirements](#requirements)
-5. [Installation](#installation)
-6. [Content Hashing](#content-hashing)
-7. [Recommended Workflow](#recommended-workflow)
-8. [Usage (findphotodates.py)](#usage-findphotodatespy)
-9. [Backup Checking (check_photo_backups.py)](#backup-checking-check_photo_backupspy)
-10. [Troubleshooting](#troubleshooting)
-11. [License](#license)
+3. [Desktop GUI](#desktop-gui)
+4. [Features](#features)
+5. [Requirements](#requirements)
+6. [Installation](#installation)
+7. [Content Hashing](#content-hashing)
+8. [Recommended Workflow](#recommended-workflow)
+9. [Usage (findphotodates.py)](#usage-findphotodatespy)
+10. [Backup Checking (check_photo_backups.py)](#backup-checking-check_photo_backupspy)
+11. [Troubleshooting](#troubleshooting)
+12. [License](#license)
 
 ## What is this?
 
@@ -37,10 +38,17 @@ It finds your connected drives and the file list for each one, and shows a menu:
 File lists are kept in: /home/alan/Documents/findphotodates  (9 lists)
 
 Connected drives:
-  1) Sierra Club              5.0 TB  exfat    /run/media/alan/Sierra Club
-       Update its file list: Sierra Club (5F61-DDF5).tsv (last updated 2026-09-28)
-  2) OM SYSTEM                513 GB  exfat    /run/media/alan/OM SYSTEM
-       No file list yet: choose this to make one
++-----+----------------------+-----------+------------+-------------------+
+| #   | Drive                | Size      | Filesystem | Updated           |
++-----+----------------------+-----------+------------+-------------------+
+| 1   | Sierra Club          | 5.0 TB    | exfat      | Today 14:35       |
+| Location: /run/media/alan/Sierra Club                                 |
+| File list: Sierra Club (5F61-DDF5).tsv                                 |
++-----+----------------------+-----------+------------+-------------------+
+| 2   | OM SYSTEM            | 513 GB    | exfat      | Never             |
+| Location: /run/media/alan/OM SYSTEM                                   |
+| File list: New: OM SYSTEM (1234-ABCD).tsv                              |
++-----+----------------------+-----------+------------+-------------------+
 
   To do several drives in a row, type their numbers, e.g. 1 3 or 2-4
 
@@ -73,7 +81,7 @@ Drive letters and mount points change: a drive that was `L:` on Windows or `/mnt
 
 1. **The drive's serial number** (recorded in the list's header on every whole-drive scan)
 2. **The same location** as when the list was made
-3. **The contents**: it checks whether files from the list are on the drive with the same sizes. This is how lists made by older versions are recognised.
+3. **The contents**: it checks whether files from the list are on the drive with the same sizes. This is how lists made by older versions are recognised. A list that already records a different drive's serial number is never matched this way, so a drive holding copies of another drive's folders gets its own list.
 
 When a drive has moved, the old list is still used as a cache, so an update only reads new or changed files instead of starting over.
 
@@ -102,6 +110,7 @@ Every check is added to `Drive health log.tsv` in the file lists folder, so you 
 
 - After each check, the program compares it with that drive's previous entry and points out anything that got worse, for example "Unreadable sectors waiting to be replaced rose from 0 to 8".
 - Drives are tracked by serial number, so a drive keeps its history even if its name or mount point changes.
+- Before a scan, the program checks the log: if the drive's last check found bad sectors or read errors, or rated it FAILING, it warns you and suggests copying your files off first.
 - The health menu lists drives that aren't connected with their last recorded result, and `h` there shows each drive's history.
 
 On the command line, `--health` checks every drive, `--health extended` runs the extended check, and `--health history` shows the log. Add `--directory` to check only the drive holding that folder. The exit code is 1 if any drive shows warning signs, so it can be used in scripts.
@@ -124,6 +133,42 @@ The advanced menu explains each option in plain language (type `?` and a number 
 | Import file lists | Move lists from another folder or an older version into the file lists folder |
 | Where file lists are kept | Change the folder |
 | Show the equivalent command | Print the command line for the current settings, for scripts |
+
+## Desktop GUI
+
+The desktop app follows the same workflow as the menu: select one or more connected drives, then click **Make or update selected lists**. It shows each drive's existing list and last update in a compact table; lists updated today show **Today** and the time. It scans selected drives one after another, displays live progress, and lets you stop a scan while keeping its resumable progress. **Show all lists** includes unplugged drives. **Check drive health** runs a quick or extended check.
+
+**Advanced** contains all menu options: what to include, fingerprints, GPS place names, rechecking undated media, parallel readers, tiny-image threshold, path style, folder scans, backup checks, importing lists, changing the list folder, and copying the equivalent command. Hover over a setting or its `?` button for details; click `?` to keep the explanation open. Settings last until the app closes, as they do in the menu. The window starts compact and requests more height when Advanced opens. Hyprland and other tiling window managers can fill a tile regardless of the requested size; switch the window to floating to use the compact size.
+
+To run from source, first install [ExifTool](#requirements). On Linux, Tk is a system package: install it with `sudo pacman -Syu tk` on Omarchy/Arch or `sudo apt install python3-tk` on Debian/Ubuntu. A virtual environment installs the Python packages but cannot supply a missing system Tk library.
+
+On Linux, macOS, or WSL, create and activate a virtual environment, then start the GUI:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-gui.txt
+python findphotodates_gui.py
+```
+
+On Windows, use PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv\Scripts\python.exe findphotodates_gui.py
+```
+
+The command-line program still works without the GUI dependency. The GUI does not move or delete photos; the backup checker writes reports without deleting anything.
+
+Double-click builds are made separately on Linux, macOS, and Windows because PyInstaller does not cross-compile:
+
+```bash
+python -m pip install -r requirements-gui.txt -r requirements-build.txt
+pyinstaller packaging/findphotodates_gui.spec
+```
+
+The output is `dist/FindPhotoDates/` on Linux and Windows, or `dist/FindPhotoDates.app` on macOS. Keep the worker executable beside the GUI executable. ExifTool must be installed and available on `PATH` when scanning. The [build workflow](.github/workflows/build-gui.yml) attaches packaged apps to versioned releases. After updating `__version__` and `CHANGELOG.md` and committing, run `./build-release.sh` to tag and push a release.
 
 ## Features
 
@@ -388,7 +433,8 @@ Output lists are generated for different states:
 - **ExifTool missing:** Make sure `exiftool` is installed and in your PATH. Run `exiftool -ver` to check. On Windows, make sure the ExifTool directory is in your system PATH environment variable.
 - **No dates found:** Some files may lack EXIF data. The script will leave the date blank.
 - **Slow performance:** First runs compute hashes. Install the `blake3` library for best performance.
-- **Drive disconnects:** If a drive is unplugged, progress is saved. Reconnect and run again to resume.
+- **Drive disconnects:** If a drive is unplugged, progress is saved. Reconnect and run again to resume. Saved progress keeps the previous list's entries for anything the scan hadn't reached yet, so stopping partway never shrinks the list.
+- **A scan crawls or reports read errors:** The drive may be failing. The scan shows unreadable files and folders as it finds them (the first 20, with a running count on the progress line), lists them all at the end or when you press Ctrl-C (the full list is saved in a `Read errors` folder next to your file lists), keeps their entries from the previous list, and after a few errors switches to reading one file at a time and warns you. If the drive holds the only copy of anything, press Ctrl-C (progress is saved), run a health check, and copy your files off it first. The program also warns before scanning a drive whose last health check found bad sectors.
 - **Cross-platform cache misses:** Inventory cache keys normalize WSL (`/mnt/f/...`) and Windows (`F:\...`) paths to a shared form. If a drive is now mounted somewhere else (for example `/mnt/l` under WSL, then `/run/media/<you>/<Label>` on Linux), the old paths are mapped to the new location automatically, as long as the old location no longer exists and you scan the whole drive into its existing list. If you still see cache misses, make sure you're scanning the same physical drive.
 - **Slow scans under WSL:** Reading Windows drives through `/mnt/<letter>` in WSL is much slower than running natively. For drives attached to Windows, run `python findphotodates.py` from Windows instead; the lists work in both.
 

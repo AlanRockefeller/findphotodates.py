@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# findphotodates.py - Version 1.5.3 (2026-09-28) - By Alan Rockefeller
+# findphotodates.py - Version 1.6.0 (2026-09-28) - By Alan Rockefeller
 # Generates inventory TSV with filepath, date_taken, size, mtime, GPS, location, and content_hash
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
@@ -21,6 +21,8 @@ import csv
 import urllib.request
 import urllib.error
 import json
+import contextlib
+import errno
 import platform
 import posixpath
 import queue
@@ -30,7 +32,7 @@ import threading
 import types
 import unicodedata
 
-__version__ = "1.5.3"
+__version__ = "1.6.0"
 
 # Optional fast hash (prefer over stdlib when available)
 try:
@@ -977,6 +979,17 @@ def is_supported_file(filename, extensions):
     return any(filename.lower().endswith(f".{ext}") for ext in extensions)
 
 
+_IO_ERRNOS = {errno.EIO, errno.ENXIO, errno.ETIMEDOUT, errno.ENODEV}
+# Windows: CRC error, not ready, hardware error, I/O device error, device not connected.
+_IO_WINERRORS = {21, 23, 483, 1117, 1167}
+
+
+def _is_io_error(exc):
+    """True when an OSError means the drive couldn't read the data (a failing
+    or disconnected drive), as opposed to a missing file or a permission problem."""
+    return exc.errno in _IO_ERRNOS or getattr(exc, "winerror", None) in _IO_WINERRORS
+
+
 def _is_windows_reparse_point_dir(entry):
     """Return True if this DirEntry is a Windows directory reparse point
     (junction, directory symlink, or other directory-like reparse target).
@@ -999,7 +1012,7 @@ def _is_windows_reparse_point_dir(entry):
     return bool(attrs & reparse_bit)
 
 
-def find_files(directory, extensions, debug=False):
+def find_files(directory, extensions, debug=False, errors=None):
     """Recursively find all files with the specified extensions using os.scandir().
 
     Yields (filepath, is_symlink, size_bytes, mtime_ns) tuples.
@@ -1009,11 +1022,14 @@ def find_files(directory, extensions, debug=False):
 
     Symlinked directories are NOT recursed into (avoids duplicate traversal and
     infinite loops from symlink cycles).  Symlinked files are still yielded.
-    Permission errors and broken paths are silently skipped.
+    Folders and files that can't be read are skipped; if *errors* is a list,
+    (kind, path, is_io_error, message) tuples are appended to it for each one.
     """
     try:
         scan_it = os.scandir(directory)
-    except (PermissionError, OSError):
+    except (PermissionError, OSError) as e:
+        if errors is not None:
+            errors.append(("folder", directory, _is_io_error(e), e.strerror or str(e)))
         return
     with scan_it:
         for entry in scan_it:
@@ -1036,7 +1052,7 @@ def find_files(directory, extensions, debug=False):
                             )
                         continue
                     # Real directory — recurse
-                    yield from find_files(entry.path, extensions, debug=debug)
+                    yield from find_files(entry.path, extensions, debug=debug, errors=errors)
                 elif is_link and entry.is_dir(follow_symlinks=True):
                     # Symlinked directory — skip recursion to avoid
                     # duplicate traversal and symlink loops
@@ -1048,8 +1064,53 @@ def find_files(directory, extensions, debug=False):
                         else:
                             st = entry.stat(follow_symlinks=True)
                             yield entry.path, False, st.st_size, st.st_mtime_ns
-            except (PermissionError, OSError):
+            except (PermissionError, OSError) as e:
+                if errors is not None:
+                    errors.append(("file", entry.path, _is_io_error(e), e.strerror or str(e)))
                 continue
+
+
+def _is_read_error_message(message):
+    """True for ExifTool errors that mean the file itself couldn't be read
+    (as opposed to an unusual or damaged file format)."""
+    text = message.lower()
+    return any(word in text for word in ("error opening", "error reading", "i/o error",
+                                         "input/output", "file not found", "truncated"))
+
+
+class _ReadThrottle:
+    """Limits how many ExifTool workers read the drive at the same time.
+
+    Starts at the worker count; drops to 1 when the drive is struggling so a
+    failing disk isn't asked to seek to four damaged places at once.
+    """
+
+    def __init__(self, limit):
+        self._limit = max(1, limit)
+        self._active = 0
+        self._cond = threading.Condition()
+
+    @property
+    def limit(self):
+        return self._limit
+
+    def set_limit(self, limit):
+        with self._cond:
+            self._limit = max(1, limit)
+            self._cond.notify_all()
+
+    def __enter__(self):
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait(0.5)
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._active -= 1
+            self._cond.notify_all()
+        return False
 
 
 EXIFTOOL_BATCH_SIZE = (
@@ -1076,6 +1137,7 @@ class ExifToolPersistent:
 
     def __init__(self):
         self._proc = None
+        self.last_errors = {}  # filepath -> ExifTool error from the last batch_query
 
     def start(self):
         if self._proc is not None:
@@ -1215,10 +1277,12 @@ class ExifToolPersistent:
         if not filepaths:
             return {}
 
+        self.last_errors = {}
         args = ["-json", "-n", "-f"]
         if fast2:
             args.append("-fast2")
         args.extend(self._TAGS)
+        args.append("-Error")  # per-file "Error opening/reading file" etc.
         args.extend(filepaths)
         lines = self._send_and_read(args)
 
@@ -1284,6 +1348,9 @@ class ExifToolPersistent:
                 gps_lon = str(lon_val)
 
             results[matched_fp] = (date, gps_lat, gps_lon)
+            error = rec.get("Error")
+            if error and str(error) != "-" and _is_read_error_message(str(error)):
+                self.last_errors[matched_fp] = str(error)
 
         return results
 
@@ -1638,9 +1705,12 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                     try:
                         # Normalize for cross-platform cache hits (WSL ↔ Windows).
                         abs_filepath = _normalize_cache_key(filepath)
+                        display_path = filepath
                         if old_prefix and abs_filepath.startswith(old_prefix):
-                            abs_filepath = (
-                                new_prefix + abs_filepath[len(old_prefix) :]
+                            rest = abs_filepath[len(old_prefix) :]
+                            abs_filepath = new_prefix + rest
+                            display_path = os.path.join(
+                                os.path.abspath(inventory_root), *rest.split("/")
                             )
                         size_bytes = int(row.get("size_bytes", "0"))
                         mtime_ns = int(row.get("mtime_ns", "0"))
@@ -1673,6 +1743,9 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                             "gps_lat": gps_lat,
                             "gps_lon": gps_lon,
                             "location": location,
+                            # Kept so a partial save can write this row back unchanged.
+                            "filepath": display_path,
+                            "content_hash": row.get("content_hash", "") or "",
                         }
                     except (ValueError, KeyError):
                         continue
@@ -1880,6 +1953,104 @@ def summarize_results(photo_data, file_counts, quiet, debug=False):
         print(f"\n{file_type_label} Taken per Month:")
         for year_month, count in sorted(month_counter.items()):
             print(f"  {year_month}: {count}")
+
+
+def _root_gone(root):
+    """True if the scanned folder has disappeared (drive unplugged or dropped out)."""
+    try:
+        with os.scandir(root) as it:
+            return next(it, None) is None
+    except OSError:
+        return True
+
+
+def report_read_problems(problems, output, kept_rows, quiet=False):
+    """Summarise folders and files that couldn't be read, and save the full list
+    next to the file list. *problems* holds (kind, path, is_io_error, message)."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
+    out_dir = Path(output).parent / "Read errors"
+    report_path = None
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_path = _unused_path(out_dir / _safe_filename(f"{stamp} {Path(output).stem}.txt"))
+        with open(report_path, "w", encoding="utf-8") as f:
+            for kind, path, is_io, message in problems:
+                f.write(f"{kind}\t{path}\t{message}\n")
+    except OSError:
+        report_path = None
+    if quiet:
+        return report_path
+    io_problems = [p for p in problems if p[2]]
+    folders = [p for p in problems if p[0] == "folder"]
+    files = [p for p in problems if p[0] == "file"]
+    exif = [p for p in problems if p[0] == "exiftool"]
+    print("\nRead problems:")
+    if folders:
+        print(f"  {len(folders):,} folder(s) couldn't be opened"
+              f" ({Counter(p[3] for p in folders).most_common(1)[0][0]}).")
+        for kind, path, _io, message in folders[:5]:
+            print(f"    {path}")
+    if files:
+        print(f"  {len(files):,} file(s) couldn't be read ({Counter(p[3] for p in files).most_common(1)[0][0]}).")
+    if exif:
+        print(f"  {len(exif):,} photo(s)/video(s) couldn't be read to get their dates "
+              f"({Counter(p[3] for p in exif).most_common(1)[0][0]}).")
+    if kept_rows:  # None on Ctrl-C, where unreached entries are kept anyway
+        print(f"  {kept_rows:,} entries from the previous list were kept for files that couldn't be "
+              "checked, so they aren't reported as removed.")
+    if report_path:
+        print(f"  The full list is in: {report_path}")
+    if io_problems:
+        print(_wrap(
+            "Input/output errors usually mean the drive is failing. Check its health (h in "
+            "the menu, or --health) and copy anything important off it.", indent="  "))
+    return report_path
+
+
+def _troubling_health_record(directory, volume_info=None):
+    """The latest health-log entry for the drive holding *directory*, if that
+    check found signs of failure (bad sectors, read errors or FAILING)."""
+    rows = read_health_log()
+    if not rows:
+        return None
+    drive = volume_info
+    if drive is None:
+        try:
+            drive = identify_drive(_mount_root(directory))
+        except Exception:
+            drive = None
+    if drive is None:
+        return None
+    latest = None
+    for row in rows:
+        ids = [i for i in (row.get("volume_ids") or "").split(",") if i]
+        names = [n.strip() for n in (row.get("drive") or "").split(",")]
+        if (drive.volume_id and drive.volume_id in ids) or (
+            not ids and drive.label and drive.label in names
+        ):
+            latest = row
+    if latest is None:
+        return None
+    if latest.get("health") == "FAILING":
+        return latest
+    for key in ("pending_sectors", "uncorrectable_sectors", "read_errors", "ssd_media_errors"):
+        value = _as_number(latest.get(key))
+        if value:
+            return latest
+    if latest.get("check") == "file read" and latest.get("health") == "WARNING":
+        return latest
+    return None
+
+
+def _print_health_warning(row):
+    notes = row.get("notes") or ""
+    print()
+    print(_wrap(
+        f"Warning: in its last health check ({row.get('date', '')[:10]}), this drive was rated "
+        f"{row.get('health', 'WARNING')}" + (f": {notes}." if notes and notes != "No warning signs" else ".")
+        + " Reading every file on a failing drive adds wear and can be very slow. If it holds "
+        "the only copy of anything, copy your files off it first. If you scan it anyway, "
+        "files will be read one at a time to go easier on it.", indent=""))
 
 
 def _build_moved_index(cache):
@@ -2451,6 +2622,7 @@ class _DiscoveryState:
         "done",
         "done_time",
         "error",
+        "read_errors",
         "t_queue_wait",
         "t_walk",
         "total",
@@ -2463,6 +2635,7 @@ class _DiscoveryState:
         self.total = 0  # final count (valid only after done is set)
         self.done = threading.Event()
         self.error = None  # exception from producer, if any
+        self.read_errors = []  # (kind, path, is_io_error, message) for unreadable folders/files
         self.done_time = 0.0  # wall-clock time when discovery finished
         self.t_walk = 0.0  # time spent inside scandir walk (excl. queue blocking)
         self.t_queue_wait = 0.0  # time spent blocked on queue.put()
@@ -2484,7 +2657,7 @@ def _discovery_producer(file_queue, directory, extensions, state, debug=False):
         count = 0
         t_walk = 0.0
         t_queue = 0.0
-        it = iter(find_files(directory, extensions, debug=debug))
+        it = iter(find_files(directory, extensions, debug=debug, errors=state.read_errors))
         while True:
             tw0 = time.monotonic()
             try:
@@ -2684,9 +2857,11 @@ def _exiftool_worker(
     location_cache_pending,
     error_log,
     error_log_lock,
+    throttle=None,
 ):
     exiftool = None
     worker_started = time.time()
+    throttle = throttle or contextlib.nullcontext()
     worker_stats = {
         "worker_id": worker_id,
         "wall": 0.0,
@@ -2710,6 +2885,7 @@ def _exiftool_worker(
 
             _t_active_start = time.time()
             batch_results = None
+            read_errors = {}
             t_exiftool = 0.0
             metadata_done_count = 0
             try:
@@ -2738,10 +2914,13 @@ def _exiftool_worker(
                     if item[5] not in SIZE_FILTERED_IMAGE_EXTENSIONS
                 ]
                 batch_results = {}
+                read_errors = {}
                 if fast2_batch:
                     fast2_paths = [item[1] for item in fast2_batch]
                     _te0 = time.time()
-                    fast2_results = exiftool.batch_query(fast2_paths, fast2=True)
+                    with throttle:
+                        fast2_results = exiftool.batch_query(fast2_paths, fast2=True)
+                    read_errors.update(getattr(exiftool, "last_errors", {}))
                     batch_results.update(fast2_results)
                     t_exiftool += time.time() - _te0
                     metadata_done_count += len(fast2_batch)
@@ -2751,7 +2930,9 @@ def _exiftool_worker(
                 if full_batch:
                     full_paths = [item[1] for item in full_batch]
                     _te0 = time.time()
-                    full_results = exiftool.batch_query(full_paths, fast2=False)
+                    with throttle:
+                        full_results = exiftool.batch_query(full_paths, fast2=False)
+                    read_errors.update(getattr(exiftool, "last_errors", {}))
                     batch_results.update(full_results)
                     t_exiftool += time.time() - _te0
                     metadata_done_count += len(full_batch)
@@ -2798,6 +2979,10 @@ def _exiftool_worker(
                 "t_exiftool": t_exiftool,
                 "t_hashing": stats["t_hashing"],
                 "t_geolocate": stats["t_geolocate"],
+                "read_errors": [
+                    (item[0], read_errors[item[1]]) for item in batch if item[1] in read_errors
+                ],
+                "keys": [item[2] for item in batch],
             }
             _tq0 = time.time()
             results_queue.put(packet)
@@ -2866,6 +3051,17 @@ def run_scan(
     if not validate_scan_paths(directory, output, raw_output=raw_output):
         return False
     volume_headers = _volume_header_lines(output, directory, volume_info)
+
+    # Alan 9/28/26 - Warn before reading every file on a drive whose last
+    # health check found trouble, and go easy on it from the start.
+    health_row = _troubling_health_record(directory, volume_info)
+    if health_row is not None and not quiet:
+        _print_health_warning(health_row)
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            failing = health_row.get("health") == "FAILING"
+            if not _confirm("Scan it anyway?", default=not failing):
+                print("Scan cancelled.")
+                return False
 
     if hash_options is None:
         hash_options = parse_hash_args(quiet=quiet)
@@ -2946,6 +3142,65 @@ def run_scan(
     # modification time; reuse their earlier EXIF results instead of re-reading.
     moved_index = None  # (name_lower, size, mtime_ns) -> cached entry, built on first need
     moved_reused_count = 0
+    # Alan 9/28/26 - Read problems (e.g. a failing drive). Folder/file errors from
+    # the directory walk are collected in discovery.read_errors; these are the rest.
+    read_problems = []  # (kind, path, is_io_error, message)
+    unreadable_keys = set()  # cache keys of files that couldn't be read
+    slow_batches = 0
+    struggling = False
+    shown_walk_problems = 0  # how many of discovery.read_errors have been printed
+    shown_scan_problems = 0  # how many of read_problems have been printed
+    MAX_LIVE_READ_PROBLEMS = 20
+
+    def _mark_done(key):
+        """The previous list's row for *key* has been replaced by a new one."""
+        entry = cache.get(key)
+        if entry is not None:
+            entry["_seen"] = True
+
+    def _all_read_problems():
+        return list(discovery.read_errors) + read_problems
+
+    def _kept_old_rows(final):
+        """Rows from the previous list to write back.
+
+        Partial saves (checkpoint, Ctrl-C, disconnect) keep every row the scan
+        hasn't reached yet, so stopping never shrinks the list. The final save
+        keeps only rows for files in folders, or files, that couldn't be read.
+        """
+        prefixes = ()
+        if final:
+            for kind, path, _io, _msg in _all_read_problems():
+                key = _normalize_cache_key(os.path.abspath(path))
+                if kind == "folder":
+                    prefixes += (key.rstrip("/") + "/",)
+                else:
+                    unreadable_keys.add(key)
+            if not prefixes and not unreadable_keys:
+                return []
+        rows = []
+        for key, entry in cache.items():
+            if entry.get("_seen"):
+                continue
+            if final and not (key in unreadable_keys or key.startswith(prefixes)):
+                continue
+            entry["_kept"] = True
+            rows.append(
+                (
+                    entry.get("filepath") or key,
+                    entry.get("date_taken") or "",
+                    entry["size_bytes"],
+                    entry["mtime_ns"],
+                    entry.get("gps_lat") or "",
+                    entry.get("gps_lon") or "",
+                    entry.get("location") or "",
+                    entry.get("content_hash") or "",
+                )
+            )
+        return rows
+
+    def _rows_for_save(final=False):
+        return list(photo_data) + _kept_old_rows(final)
     changed_files = []  # out_path whose size or mtime differs from the previous list
     # Detailed timing accumulators
     _t_realpath_total = 0.0
@@ -3009,6 +3264,7 @@ def run_scan(
         progress_line_len = 0
 
         work_queue = queue.Queue(maxsize=max(1, worker_count * 4))
+        throttle = _ReadThrottle(1 if health_row is not None else worker_count)
         results_queue = queue.Queue()
         stop_event = threading.Event()
         error_log_lock = threading.Lock()
@@ -3037,6 +3293,7 @@ def run_scan(
                     error_log,
                     error_log_lock,
                 ),
+                kwargs={"throttle": throttle},
                 daemon=True,
             )
             t.start()
@@ -3100,6 +3357,7 @@ def run_scan(
             nonlocal _t_geolocate_total, _t_results_wait, _t_worker_total
             nonlocal worker_done_count, fatal_worker_error
             nonlocal exiftool_metadata_done_count, exiftool_files_completed
+            nonlocal slow_batches
             _trq0 = time.time()
             while True:
                 try:
@@ -3117,9 +3375,15 @@ def run_scan(
                         print(fatal_worker_error, file=sys.stderr)
                         break
                     photo_data.extend(rows)
+                    for key in packet.get("keys", ()):
+                        _mark_done(key)
                     file_counts.update(packet.get("file_counts", Counter()))
                     processed_count += len(rows)
                     exiftool_files_completed += input_count
+                    for path, message in packet.get("read_errors", ()):
+                        read_problems.append(("exiftool", path, True, message))
+                    if input_count >= 5 and packet.get("t_exiftool", 0.0) / input_count > 10:
+                        slow_batches += 1  # >10 s per file: the drive is struggling
                     _t_exiftool_total += packet.get("t_exiftool", 0.0)
                     _t_hashing_total += packet.get("t_hashing", 0.0)
                     _t_geolocate_total += packet.get("t_geolocate", 0.0)
@@ -3148,10 +3412,12 @@ def run_scan(
             if not quiet and status_pause.consume_pause_notice():
                 _clear_progress_line()
                 print("Status output paused for 60 seconds; scan continues.")
+            _show_new_read_problems()
+            _check_struggling()
 
             if total_seen > 0 and (current_time - last_save_time) > 900:
                 _tc0 = time.time()
-                data_snapshot = list(photo_data)
+                data_snapshot = _rows_for_save()
                 _ckpt_ok = _safe_write_inventory(
                     output,
                     data_snapshot,
@@ -3192,6 +3458,9 @@ def run_scan(
                     if pending_exiftool > 0
                     else ""
                 )
+                problem_count = len(discovery.read_errors) + len(read_problems)
+                if problem_count:
+                    exiftool_part += f" — {problem_count:,} unreadable"
 
                 if discovery_complete and total_files > 0:
                     pct = total_seen / total_files * 100
@@ -3211,6 +3480,46 @@ def run_scan(
                     )
                 last_progress_time = current_time
             return True
+
+        def _show_new_read_problems():
+            """Print read problems as they happen, up to MAX_LIVE_READ_PROBLEMS."""
+            nonlocal shown_walk_problems, shown_scan_problems
+            walk_new = discovery.read_errors[shown_walk_problems:]
+            scan_new = read_problems[shown_scan_problems:]
+            if not walk_new and not scan_new:
+                return
+            before = shown_walk_problems + shown_scan_problems
+            shown_walk_problems += len(walk_new)
+            shown_scan_problems += len(scan_new)
+            if quiet or before >= MAX_LIVE_READ_PROBLEMS:
+                return
+            _clear_progress_line()
+            for kind, path, _io, message in (walk_new + scan_new)[: MAX_LIVE_READ_PROBLEMS - before]:
+                label = {"folder": "Can't open folder", "file": "Can't read"}.get(kind, "Can't read")
+                print(f"{label}: {_relative_display(path, inventory_root)} ({message})")
+            if shown_walk_problems + shown_scan_problems >= MAX_LIVE_READ_PROBLEMS:
+                print(f"(More than {MAX_LIVE_READ_PROBLEMS} read problems; the rest will be "
+                      "listed at the end and saved to a file.)")
+
+        def _check_struggling():
+            nonlocal struggling
+            if struggling:
+                return
+            io_errors = sum(1 for _k, _p, is_io, _m in _all_read_problems() if is_io)
+            if io_errors < 3 and slow_batches < 2:
+                return
+            struggling = True
+            throttle.set_limit(1)
+            if not quiet:
+                _clear_progress_line()
+                what = (f"{io_errors:,} read errors so far" if io_errors >= 3
+                        else "reading has become extremely slow")
+                print(_wrap(
+                    f"Warning: this drive is having trouble reading files ({what}). It may be "
+                    "failing. The scan will now read one file at a time to go easier on it. "
+                    "If this drive holds the only copy of anything, press Ctrl-C to stop "
+                    "(progress is saved) and copy your files off it first. A health check "
+                    "(h in the menu, or --health) shows the drive's condition.", indent=""))
 
         def _maybe_print_discovery_complete():
             nonlocal discovery_complete, total_files
@@ -3235,6 +3544,8 @@ def run_scan(
                 hash_cache_pending,
             )
             photo_data.extend(rows)
+            for item in batch:
+                _mark_done(item[2])
             file_counts.update(counts)
             processed_count += len(rows)
             _t_hashing_total += stats["t_hashing"]
@@ -3264,6 +3575,7 @@ def run_scan(
                     content_hash,
                 )
             )
+            _mark_done(key_path)
             processed_count += 1
             file_counts[ext] += 1
 
@@ -3453,10 +3765,8 @@ def run_scan(
                     if cached_entry is None:
                         if had_previous_list:
                             new_files.append((out_path, size_bytes, mtime_ns))
-                    else:
-                        cached_entry["_seen"] = True
-                        if not cache_valid:
-                            changed_files.append(out_path)
+                    elif not cache_valid:
+                        changed_files.append(out_path)
                     retry_cached_blank_exif = False
                     if cache_valid:
                         # Alan 5/8/26 - Retry blank EXIF cache rows so interrupted TSV inventories can be repaired.
@@ -3533,6 +3843,7 @@ def run_scan(
                             )
                         )
                         cached_count += 1
+                        _mark_done(key_path)
                         if reused_moved:
                             moved_reused_count += 1
                         # fall through to progress/checkpoint below
@@ -3588,7 +3899,10 @@ def run_scan(
 
                 except OSError as e:
                     error_log.write(f"Warning: Could not access '{file}': {str(e)}\n")
-                    if any(
+                    read_problems.append(("file", file, _is_io_error(e), e.strerror or str(e)))
+                    # Alan 9/28/26 - One unreadable file on a failing drive is not a
+                    # disconnect; stop only if the drive itself is gone.
+                    if _root_gone(inventory_root) and any(
                         err in str(e).lower()
                         for err in [
                             "no such file",
@@ -3601,7 +3915,7 @@ def run_scan(
                         if _check_drive_disconnect(
                             e,
                             output,
-                            photo_data,
+                            _rows_for_save(),
                             inventory_root,
                             hash_options,
                             old_format,
@@ -3681,9 +3995,10 @@ def run_scan(
             # warning for unexpected exceptions.
             saved_progress = False
             try:
+                saved_rows = _rows_for_save()
                 if _safe_write_inventory(
                     output,
-                    list(photo_data),
+                    saved_rows,
                     inventory_root,
                     hash_options,
                     old_format,
@@ -3693,13 +4008,21 @@ def run_scan(
                     extra_headers=volume_headers,
                 ):
                     saved_progress = True
-                    print(f"Saved {len(photo_data):,} rows to '{output}'.")
+                    print(f"Saved {len(saved_rows):,} rows to '{output}' "
+                          f"({len(photo_data):,} from this scan, the rest from the previous list).")
             except KeyboardInterrupt:
                 print(
                     "Second Ctrl-C received while saving; the partial inventory may not have been written."
                 )
             except Exception as save_err:
                 print(f"WARNING: Could not save progress: {save_err}")
+            try:
+                _show_new_read_problems()
+                problems = _all_read_problems()
+                if problems:
+                    report_read_problems(problems, output, None, quiet=quiet)
+            except KeyboardInterrupt:
+                pass
             if saved_progress:
                 print("\nTo resume, run the same command again.")
                 print(
@@ -3743,9 +4066,10 @@ def run_scan(
     # Alan 5/3/26 - Wrap final write in _safe_write_inventory so the user
     # gets a friendly error (not a Python traceback) if the output dir
     # disappeared, filled up, or revoked write access during the scan.
+    final_rows = _rows_for_save(final=True)
     _final_ok = _safe_write_inventory(
         output,
-        photo_data,
+        final_rows,
         inventory_root,
         hash_options,
         old_format,
@@ -3761,7 +4085,7 @@ def run_scan(
         return False
 
     if not quiet:
-        print(f"Dates written to '{output}' ({len(photo_data):,} files listed).")
+        print(f"Dates written to '{output}' ({len(final_rows):,} files listed).")
         if cached_count > 0:
             print(
                 f"  ({cached_count:,} from cache, {processed_count:,} newly processed)"
@@ -3780,13 +4104,16 @@ def run_scan(
             removed = [
                 (key, entry["size_bytes"], entry["mtime_ns"])
                 for key, entry in cache.items()
-                if not entry.get("_seen")
+                if not entry.get("_seen") and not entry.get("_kept")
             ]
             print_change_report(
                 inventory_root, new_files, changed_files, removed, extensions is not None
             )
         else:
             print("\nThis is a new file list, so there is no earlier scan to compare with.")
+    problems = _all_read_problems()
+    if problems:
+        report_read_problems(problems, output, len(final_rows) - len(photo_data), quiet=quiet)
     cleanup_all()
 
     if perf_stats is not None:
@@ -4687,6 +5014,24 @@ def _content_match_score(rows, recorded_root, mount):
     return hits, checked
 
 
+def _id_shape(volume_id):
+    """Rough format of a volume ID, e.g. "XXXX-XXXX" serials vs 36-char UUIDs."""
+    return re.sub(r"[0-9A-Fa-f]", "X", volume_id)
+
+
+def list_belongs_to_other_drive(volume_ids, drive):
+    """True if a list's recorded volume IDs show it belongs to a different drive.
+
+    Only IDs in the same format are compared: macOS reports exFAT volumes with
+    a UUID where Linux and Windows use a serial, so a list recorded elsewhere
+    may legitimately carry an ID of another shape.
+    """
+    if not volume_ids or not drive.volume_id or drive.volume_id in volume_ids:
+        return False
+    shape = _id_shape(drive.volume_id)
+    return any(_id_shape(v) == shape for v in volume_ids)
+
+
 def match_lists_to_drives(lists, drives):
     """Pair file lists with connected drives, most reliable evidence first:
     recorded volume serial/UUID, then an unchanged mount path, then whether
@@ -4715,9 +5060,12 @@ def match_lists_to_drives(lists, drives):
     for fl in lists:
         if fl.drive or not fl.root:
             continue
-        free = [d for d in drives if d.mount not in taken]
+        # Alan 9/28/26 - A drive holding copies of another drive's folders
+        # must not take over that drive's list; recorded IDs rule it out.
+        free = [d for d in drives if d.mount not in taken
+                and not list_belongs_to_other_drive(fl.volume_ids, d)]
         if not free:
-            break
+            continue
         rows = _sample_inventory_rows(fl.path)
         for d in free:
             hits, checked = _content_match_score(rows, fl.root, d.mount)
@@ -5008,6 +5356,15 @@ def _hash_label(mode):
 
 
 def _run_interactive_scan(settings, directory, output, drive=None):
+    if drive is not None and os.path.exists(output):
+        header, _ = read_inventory_header(output)
+        recorded = [i for i in header.get("volume_ids", "").split(",") if i]
+        if list_belongs_to_other_drive(recorded, drive):
+            owner = header.get("volume_label") or "another drive"
+            print(f"\nNot scanning: '{Path(output).name}' is the file list for {owner} "
+                  f"(drive ID {', '.join(recorded)}), but {drive.display_name} has drive ID "
+                  f"{drive.volume_id}. Its list would have been overwritten.")
+            return False
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     print()
     ok = run_scan(
@@ -5051,22 +5408,59 @@ def _update_drive(settings, drive, fl, list_dir):
     return True
 
 
+def _last_updated_label(timestamp, now=None):
+    """A friendly local-time label shared by the menu and desktop GUI."""
+    updated = datetime.fromtimestamp(timestamp)
+    current = now or datetime.now()
+    if updated.date() == current.date():
+        return updated.strftime("Today %H:%M")
+    return updated.strftime("%Y-%m-%d")
+
+
+def _drive_table_row(values, widths):
+    """Return wrapped ASCII rows, keeping every value visible."""
+    import textwrap
+
+    cells = [textwrap.wrap(str(value), width=width, break_long_words=True,
+                           break_on_hyphens=False) or [""]
+             for value, width in zip(values, widths)]
+    height = max(map(len, cells))
+    return ["| " + " | ".join((cell[line] if line < len(cell) else "").ljust(width)
+                              for cell, width in zip(cells, widths)) + " |"
+            for line in range(height)]
+
+
 def _print_drive_menu(drives, list_for, list_dir, lists):
+    import textwrap
+
     print(f"\nFile lists are kept in: {list_dir}  ({len(lists)} list{'s' if len(lists) != 1 else ''})")
     if not drives:
         print("\nNo drives found. Plug in a drive and choose r to look again, or use the")
         print("advanced menu to list a specific folder.")
     else:
         print("\nConnected drives:")
-    for n, drive in enumerate(drives, 1):
-        details = "  ".join(x for x in (_human_size(drive.size_bytes), drive.fstype) if x)
-        print(f"  {n}) {drive.display_name:<24} {details:<16} {drive.mount}")
-        fl = list_for.get(drive.mount)
-        if fl:
-            updated = datetime.fromtimestamp(fl.path.stat().st_mtime).strftime("%Y-%m-%d")
-            print(f"       Update its file list: {fl.path.name} (last updated {updated})")
-        else:
-            print("       No file list yet: choose this to make one")
+        widths = (3, 20, 9, 10, 17)
+        rule = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+        detail_width = len(rule) - 4
+        print(rule)
+        for line in _drive_table_row(("#", "Drive", "Size", "Filesystem", "Updated"), widths):
+            print(line)
+        print(rule)
+        for n, drive in enumerate(drives, 1):
+            fl = list_for.get(drive.mount)
+            updated = _last_updated_label(fl.path.stat().st_mtime) if fl else "Never"
+            values = (n, drive.display_name, _human_size(drive.size_bytes) or "—",
+                      drive.fstype or "—", updated)
+            for line in _drive_table_row(values, widths):
+                print(line)
+            for label, value in (("Location", drive.mount),
+                                 ("File list", fl.path.name if fl else
+                                  f"New: {canonical_list_name(drive)}")):
+                for line in textwrap.wrap(f"{label}: {value}", width=detail_width - 2,
+                                          subsequent_indent="  ", break_long_words=True,
+                                          break_on_hyphens=False):
+                    print("| " + line.ljust(detail_width) + " |")
+            print(rule)
     print()
     if len(drives) > 1:
         print("  To do several drives in a row, type their numbers, e.g. 1 3 or 2-4")
@@ -5087,7 +5481,7 @@ def _show_all_lists(lists):
     print()
     for fl in lists:
         stat_info = fl.path.stat()
-        updated = datetime.fromtimestamp(stat_info.st_mtime).strftime("%Y-%m-%d")
+        updated = _last_updated_label(stat_info.st_mtime)
         if fl.drive:
             where = f"drive connected at {fl.drive.mount}"
         elif not fl.volume_ids and fl.root and os.path.isdir(fl.root):
@@ -5324,9 +5718,11 @@ _ATA_WARNING_ATTRIBUTES = {
 class HealthTarget:
     """A physical drive to check (Linux) or a volume on it (Windows/macOS/WSL)."""
 
-    __slots__ = ("device", "name", "model", "size_bytes", "transport", "rotational", "mounts")
+    __slots__ = ("device", "name", "model", "size_bytes", "transport", "rotational", "mounts",
+                 "volume_ids")
 
-    def __init__(self, device, name, model="", size_bytes=0, transport="", rotational=None, mounts=()):
+    def __init__(self, device, name, model="", size_bytes=0, transport="", rotational=None, mounts=(),
+                 volume_ids=()):
         self.device = device
         self.name = name
         self.model = (model or "").strip()
@@ -5334,6 +5730,7 @@ class HealthTarget:
         self.transport = (transport or "").lower()
         self.rotational = rotational
         self.mounts = list(mounts)
+        self.volume_ids = [v for v in (_normalize_volume_id(i) for i in volume_ids) if v]
 
     @property
     def kind(self):
@@ -5419,7 +5816,7 @@ def health_tool_advice():
 
 
 def _linux_health_targets():
-    out = _run_quiet(["lsblk", "-J", "-b", "-o", "PATH,NAME,TYPE,TRAN,MODEL,SIZE,ROTA,LABEL,MOUNTPOINT"])
+    out = _run_quiet(["lsblk", "-J", "-b", "-o", "PATH,NAME,TYPE,TRAN,MODEL,SIZE,ROTA,LABEL,UUID,MOUNTPOINT"])
     if not out:
         return []
     try:
@@ -5431,7 +5828,7 @@ def _linux_health_targets():
         name = dev.get("name") or ""
         if dev.get("type") != "disk" or name.startswith(("zram", "loop", "ram", "sr", "fd")):
             continue
-        labels, mounts = [], []
+        labels, mounts, uuids = [], [], []
         stack = list(dev.get("children") or [])
         while stack:
             child = stack.pop(0)
@@ -5440,6 +5837,8 @@ def _linux_health_targets():
                 labels.append(child["label"])
             if child.get("mountpoint"):
                 mounts.append(child["mountpoint"])
+            if child.get("uuid"):
+                uuids.append(child["uuid"])
         path = dev.get("path") or f"/dev/{name}"
         rota = dev.get("rota")
         targets.append(
@@ -5451,6 +5850,7 @@ def _linux_health_targets():
                 dev.get("tran"),
                 None if rota is None else bool(int(rota) if not isinstance(rota, bool) else rota),
                 mounts,
+                uuids,
             )
         )
     return targets
@@ -5469,7 +5869,12 @@ def _macos_whole_disk(mount):
 
 
 def detect_health_targets():
-    """Drives whose health can be checked on this system."""
+    """Drives whose health can be checked, ordered like the main menu (by mount point)."""
+    return sorted(_detect_health_targets(),
+                  key=lambda t: (not t.mounts, min((m.lower() for m in t.mounts), default="")))
+
+
+def _detect_health_targets():
     system = platform.system()
     if system == "Linux" and not _is_wsl():
         return _linux_health_targets()
@@ -5481,11 +5886,11 @@ def detect_health_targets():
             targets.append(HealthTarget(device, drive.display_name, info.get("MediaName", ""),
                                         drive.size_bytes, info.get("BusProtocol", ""),
                                         None if "SolidState" not in info else not info["SolidState"],
-                                        [drive.mount]))
+                                        [drive.mount], [drive.volume_id]))
         else:  # Windows or WSL: smartctl and PowerShell both accept a drive letter
             letter = drive.mount[0] if system == "Windows" else drive.mount[-1]
             targets.append(HealthTarget(f"{letter.upper()}:", drive.display_name, "",
-                                        drive.size_bytes, "", None, [drive.mount]))
+                                        drive.size_bytes, "", None, [drive.mount], [drive.volume_id]))
     return targets
 
 
@@ -5784,7 +6189,7 @@ _HEALTH_LOG_COLUMNS = [
     "date", "drive", "model", "serial", "check", "health", "power_on_hours",
     "temperature_c", "reallocated_sectors", "pending_sectors", "uncorrectable_sectors",
     "read_errors", "connection_errors", "ssd_wear_percent", "ssd_media_errors",
-    "last_self_test", "notes",
+    "last_self_test", "notes", "volume_ids",
 ]
 # Counters where any increase since the last check is worth pointing out.
 _HEALTH_TREND_METRICS = {
@@ -5833,12 +6238,14 @@ def append_health_log(report, check="quick", notes=None, list_dir=None, when=Non
         "check": check,
         "health": _VERDICT_TEXT[report.verdict],
         "notes": notes,
+        "volume_ids": ",".join(target.volume_ids),
     }
     for key, value in report.metrics.items():
         row[key] = value
     path = health_log_path(list_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _upgrade_health_log_columns(path)
         new_file = not path.exists() or path.stat().st_size == 0
         with open(path, "a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=_HEALTH_LOG_COLUMNS, delimiter="\t",
@@ -5850,6 +6257,25 @@ def append_health_log(report, check="quick", notes=None, list_dir=None, when=Non
         print(f"  (Couldn't write the health log {path}: {e})")
         return None
     return row
+
+
+def _upgrade_health_log_columns(path):
+    """Rewrite a log made by an earlier version so it has the current columns."""
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            if reader.fieldnames is None or reader.fieldnames == _HEALTH_LOG_COLUMNS:
+                return
+            rows = list(reader)
+    except OSError:
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_HEALTH_LOG_COLUMNS, delimiter="\t",
+                                extrasaction="ignore", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, path)
 
 
 def _as_number(value):

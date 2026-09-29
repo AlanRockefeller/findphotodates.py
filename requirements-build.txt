@@ -1,0 +1,2 @@
+# Install with requirements-gui.txt on each target platform.
+pyinstaller>=6.6,<7

@@ -1,0 +1,88 @@
+name: Build GUI apps
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: FindPhotoDates-Linux
+          - os: macos-latest
+            artifact: FindPhotoDates-macOS
+          - os: windows-latest
+            artifact: FindPhotoDates-Windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python packaging/check_release.py
+      - name: Install Linux Tk libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-gui.txt -r requirements-build.txt
+      - name: Build desktop app
+        run: pyinstaller --clean packaging/findphotodates_gui.spec
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        run: hdiutil create -volname FindPhotoDates -srcfolder dist/FindPhotoDates.app -ov -format UDZO dist/FindPhotoDates-macOS.dmg
+      - name: Package Linux app
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf dist/FindPhotoDates-Linux.tar.gz FindPhotoDates
+      - name: Package Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/FindPhotoDates -DestinationPath dist/FindPhotoDates-Windows.zip
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/FindPhotoDates-macOS.dmg
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/FindPhotoDates-Linux.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/FindPhotoDates-Windows.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            assets/FindPhotoDates-macOS.dmg
+            assets/FindPhotoDates-Windows.zip
+            assets/FindPhotoDates-Linux.tar.gz
+          fail_on_unmatched_files: true

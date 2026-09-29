@@ -380,3 +380,52 @@ def test_renamed_or_modified_photo_is_read_again(tmp_path):
     os.replace(photo, drive / "a" / "renamed.JPG")  # different name: no reuse
     assert fpd.run_scan(str(drive), str(out), None, quiet=True) is not False
     assert _rows(out)[os.path.join("a", "renamed.JPG")][1] == ""
+
+
+# ---------------------------------------------------------------------------
+# A drive holding copies of another drive's folders must not take its list
+# ---------------------------------------------------------------------------
+
+
+def test_copy_drive_does_not_take_another_drives_list(tmp_path):
+    copy_drive = tmp_path / "Erowid"
+    rows = _make_drive_tree(copy_drive)  # same folders as the Backblaze drive
+    p = tmp_path / "Backblaze (6498-2A47).tsv"
+    _write_inventory(p, "/run/media/u/Backblaze", rows, ["volume_ids=6498-2A47"])
+    fl = fpd.FileList(p, fpd.read_inventory_header(p)[0])
+    fpd.match_lists_to_drives([fl], [fpd.DriveInfo(str(copy_drive), "Erowid", "5D85-2968")])
+    assert fl.drive is None
+
+
+def test_content_match_still_allowed_across_id_formats(tmp_path):
+    # e.g. a list made on Linux (exFAT serial) read on a Mac (volume UUID)
+    drive_dir = tmp_path / "Sierra Club"
+    rows = _make_drive_tree(drive_dir)
+    p = tmp_path / "Sierra Club (5F61-DDF5).tsv"
+    _write_inventory(p, "/run/media/u/Sierra Club", rows, ["volume_ids=5F61-DDF5"])
+    fl = fpd.FileList(p, fpd.read_inventory_header(p)[0])
+    mac = fpd.DriveInfo(str(drive_dir), "Sierra Club", "3F2A9C1B-0000-4000-8000-123456789ABC")
+    fpd.match_lists_to_drives([fl], [mac])
+    assert fl.drive is mac and fl.matched_by == "contents"
+
+
+def test_list_belongs_to_other_drive():
+    erowid = fpd.DriveInfo("/x", "Erowid", "5D85-2968")
+    assert fpd.list_belongs_to_other_drive(["6498-2A47"], erowid)
+    assert not fpd.list_belongs_to_other_drive(["5D85-2968"], erowid)
+    assert not fpd.list_belongs_to_other_drive([], erowid)
+    assert not fpd.list_belongs_to_other_drive(["6498-2A47"], fpd.DriveInfo("/y", "NoID", ""))
+    assert not fpd.list_belongs_to_other_drive(["3F2A9C1B-0000-4000-8000-123456789ABC"], erowid)
+
+
+def test_scan_refuses_to_overwrite_another_drives_list(tmp_path, capsys):
+    drive_dir = tmp_path / "Erowid"
+    _make_drive_tree(drive_dir, count=2)
+    p = tmp_path / "Backblaze (6498-2A47).tsv"
+    _write_inventory(p, "/run/media/u/Backblaze", [("x.jpg", 1)],
+                     ["volume_label=Backblaze", "volume_ids=6498-2A47"])
+    before = p.read_bytes()
+    drive = fpd.DriveInfo(str(drive_dir), "Erowid", "5D85-2968")
+    assert fpd._run_interactive_scan(fpd._InteractiveSettings(), str(drive_dir), p, drive=drive) is False
+    assert p.read_bytes() == before
+    assert "is the file list for Backblaze" in capsys.readouterr().out

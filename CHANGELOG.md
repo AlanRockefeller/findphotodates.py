@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.6.0 (2026-09-28)
+
+- Added a desktop GUI for the interactive workflow, with connected drive selection, live scan progress, resumable stop, list browsing, and drive health checks.
+- Added a collapsible Advanced section with the menu's scan settings, folder scans, backup checks, list import and location controls, and equivalent command copy.
+- Added Linux, macOS, and Windows GUI build configuration, a release workflow, and `build-release.sh`.
+- Stopping a scan no longer shrinks the file list. Progress saves (every 15 minutes, on Ctrl-C, or when a drive disconnects) now keep the previous list's entries for files the scan hasn't reached yet. Before, stopping partway through dropped them until the next full scan.
+- Files and folders that can't be read are now reported instead of silently skipped. Each one is shown as it happens (up to 20; the rest go in the end summary), the progress line keeps a running count of unreadable files, and each scan ends with a summary, also when stopped with Ctrl-C, and the full list is saved in a `Read errors` folder next to the file lists. Entries for files in folders that couldn't be read are kept from the previous list rather than reported as removed. ExifTool's "Error reading file" results are included.
+- One unreadable file no longer stops the whole scan as a "disconnected drive"; the scan only stops if the drive itself has gone.
+- When a drive is struggling (several read errors, or reading becomes extremely slow), the scan warns you that the drive may be failing, suggests stopping to copy your files off, and reads one file at a time instead of four so it doesn't hammer damaged areas.
+- Before scanning a drive whose last health check found bad sectors or read errors, or rated it FAILING, the program warns you and asks whether to continue (in a terminal), and reads one file at a time if you go ahead.
+- The health log now records each drive's volume IDs, so warnings find the right drive even if it's renamed. Logs from earlier versions are upgraded automatically.
+- The health check lists drives in the same order as the main menu.
+- Fix: a drive holding copies of another drive's folders could be matched to that other drive's file list by its contents, and scanning it would have overwritten that list. Lists that record a different drive's serial number are no longer matched by contents, and the menu and GUI refuse to scan a drive into a list recorded for another drive.
+- GUI startup now names missing Tk or CustomTkinter and gives the matching installation steps.
+- Enlarged GUI text on Linux, reduced the requested window size, and added hover explanations for Advanced controls. Connected drives now appear in tables in both interfaces, and lists updated today show "Today" with the update time.
+
 ## v1.5.3 (2026-09-28)
 
 - New menu. Run the program with no options and it shows your connected drives and their file lists. Pick a drive to update its list, or to make one if it doesn't have one yet. `u` updates every connected drive. Everything else is under *Advanced options*, and each option explains what it does and why you might want it. `--interactive` opens the menu explicitly; running with any other options works as before.

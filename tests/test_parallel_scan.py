@@ -907,6 +907,7 @@ def test_worker_result_count_mismatch_fails_scan(tmp_path, monkeypatch, capsys):
         location_cache_pending,
         error_log,
         error_log_lock,
+        **_kwargs,
     ):
         batch = work_queue.get(timeout=1)
         results_queue.put(

@@ -4992,7 +4992,8 @@ def _sample_inventory_rows(path, samples=40):
                     continue
     except OSError:
         pass
-    return rows
+    # Small lists land on the same row repeatedly; count each file once.
+    return list(dict.fromkeys(rows))
 
 
 def _content_match_score(rows, recorded_root, mount):
@@ -5103,13 +5104,14 @@ def _legacy_list_name(fl):
     return _safe_filename(fl.path.stem) + ".tsv"
 
 
-def _unused_path(path):
+def _unused_path(path, taken=()):
+    """*path*, or "name (2).ext" and so on if it exists or is in *taken*."""
     path = Path(path)
-    if not path.exists():
+    if not path.exists() and path not in taken:
         return path
     for n in range(2, 1000):
         candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
-        if not candidate.exists():
+        if not candidate.exists() and candidate not in taken:
             return candidate
     raise FileExistsError(path)
 
@@ -5829,7 +5831,9 @@ def _linux_health_targets():
         if dev.get("type") != "disk" or name.startswith(("zram", "loop", "ram", "sr", "fd")):
             continue
         labels, mounts, uuids = [], [], []
-        stack = list(dev.get("children") or [])
+        # The disk itself too: a drive formatted without partitions is mounted
+        # straight from /dev/sdX.
+        stack = [dev]
         while stack:
             child = stack.pop(0)
             stack.extend(child.get("children") or [])
@@ -6875,18 +6879,6 @@ For more details on a specific option, you can also use:
 """)
         return
 
-    try:
-        result = subprocess.run(["exiftool", "-ver"], capture_output=True, timeout=5)
-        if result.returncode != 0:
-            print("Error: ExifTool is required but the 'exiftool' command failed.")
-            return
-    except FileNotFoundError:
-        print("Error: ExifTool is required but was not found.")
-        return
-    except subprocess.TimeoutExpired:
-        print("Error: ExifTool check timed out.")
-        return
-
     parser = argparse.ArgumentParser(
         description="Index files in a directory tree. Extracts EXIF dates and GPS from media files; indexes all other files with filesystem metadata."
     )
@@ -7082,6 +7074,19 @@ For more details on a specific option, you can also use:
             targets, extended=args.health == "extended", interactive=sys.stdin.isatty()
         )
         sys.exit(0 if healthy else 1)
+
+    # Health checks don't use ExifTool, so check for it only after them.
+    try:
+        result = subprocess.run(["exiftool", "-ver"], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            print("Error: ExifTool is required but the 'exiftool' command failed.")
+            return
+    except FileNotFoundError:
+        print("Error: ExifTool is required but was not found.")
+        return
+    except subprocess.TimeoutExpired:
+        print("Error: ExifTool check timed out.")
+        return
 
     migrate_default_hash_cache(quiet=args.quiet, debug=args.debug)
 

@@ -429,3 +429,22 @@ def test_scan_refuses_to_overwrite_another_drives_list(tmp_path, capsys):
     assert fpd._run_interactive_scan(fpd._InteractiveSettings(), str(drive_dir), p, drive=drive) is False
     assert p.read_bytes() == before
     assert "is the file list for Backblaze" in capsys.readouterr().out
+
+
+def test_one_row_list_does_not_match_by_contents(tmp_path):
+    # Sampling a tiny list lands on the same row again and again; one matching
+    # file must not count as several.
+    drive_dir = tmp_path / "drive"
+    rows = _make_drive_tree(drive_dir, count=1)
+    p = tmp_path / "tiny.tsv"
+    _write_inventory(p, "/mnt/z", rows)
+    assert len(fpd._sample_inventory_rows(p)) == 1
+    fl = fpd.FileList(p, fpd.read_inventory_header(p)[0])
+    fpd.match_lists_to_drives([fl], [fpd.DriveInfo(str(drive_dir), "Z", "0000-0009")])
+    assert fl.drive is None
+
+
+def test_unused_path_skips_paths_already_assigned(tmp_path):
+    first = fpd._unused_path(tmp_path / "Card.tsv")
+    second = fpd._unused_path(tmp_path / "Card.tsv", {first})
+    assert first == tmp_path / "Card.tsv" and second == tmp_path / "Card (2).tsv"

@@ -1,5 +1,6 @@
 """Tests for drive health checks: smartctl JSON interpretation and the file read check."""
 
+import json
 import os
 
 import pytest
@@ -303,3 +304,26 @@ def test_interpret_smart_fills_metrics_and_serial():
     assert report.metrics["power_on_hours"] == 17532 and report.metrics["temperature_c"] == 34
     assert report.metrics["reallocated_sectors"] == 2 and report.metrics["pending_sectors"] == 0
     assert report.metrics["connection_errors"] == 7
+
+
+def test_linux_targets_include_disk_mounted_without_partitions(monkeypatch):
+    lsblk = {"blockdevices": [{"path": "/dev/sdb", "name": "sdb", "type": "disk", "tran": "usb",
+                               "model": "Stick", "size": 64_000_000_000, "rota": False,
+                               "label": "CARD", "uuid": "1234-ABCD", "mountpoint": "/run/media/u/CARD"}]}
+    monkeypatch.setattr(fpd, "_run_quiet", lambda cmd: json.dumps(lsblk))
+    [target] = fpd._linux_health_targets()
+    assert target.mounts == ["/run/media/u/CARD"] and target.name == "CARD"
+
+
+def test_health_history_does_not_need_exiftool(monkeypatch, capsys):
+    def no_exiftool(cmd, *a, **kw):
+        if cmd[0] == "exiftool":
+            raise FileNotFoundError(cmd[0])
+        raise AssertionError(cmd)
+
+    shown = []
+    monkeypatch.setattr(fpd.subprocess, "run", no_exiftool)
+    monkeypatch.setattr(fpd, "print_health_history", lambda *a, **kw: shown.append(True))
+    monkeypatch.setattr(fpd.sys, "argv", ["findphotodates.py", "--health", "history"])
+    fpd.main()
+    assert shown and "ExifTool" not in capsys.readouterr().out

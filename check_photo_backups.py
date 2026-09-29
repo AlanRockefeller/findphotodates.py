@@ -2,7 +2,8 @@
 """
 Check whether files under a target directory exist on other drives,
 using Alan's `findphotodates.py` inventory files (by default every .tsv in
-Documents/findphotodates, plus older ~/*:photo.taken.dates.txt lists)
+findphotodates.py's file lists folder, Documents/findphotodates unless changed,
+plus older ~/*:photo.taken.dates.txt lists)
 
 Supports BOTH inventory formats:
 
@@ -502,7 +503,8 @@ def main() -> int:
     ap.add_argument(
         "--inventories",
         default="",
-        help="Comma-separated inventory files (default: every .tsv in Documents/findphotodates, "
+        help="Comma-separated inventory files (default: every .tsv in the file lists folder, "
+        "Documents/findphotodates unless changed, "
         "plus older ~/*:photo.taken.dates.txt lists)",
     )
     ap.add_argument(

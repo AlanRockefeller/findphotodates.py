@@ -498,9 +498,11 @@ class FindPhotoDatesGUI(ctk.CTk):
                                    + "\n\nThe first scan of a large drive can take hours."):
             return
         self._pending_scans = []
+        assigned = set()  # new lists don't exist until scanned; keep same-named drives apart
         for drive in chosen:
             fl = self.list_for.get(drive.mount)
-            output = fl.path if fl else fp._unused_path(self.list_dir / fp.canonical_list_name(drive))
+            output = fl.path if fl else fp._unused_path(self.list_dir / fp.canonical_list_name(drive), assigned)
+            assigned.add(Path(output))
             self._pending_scans.append((f"Scanning {drive.display_name}",
                                         scan_arguments(self.settings, drive.mount, output, self.list_dir,
                                                        whole_drive=True)))
@@ -669,8 +671,10 @@ class FindPhotoDatesGUI(ctk.CTk):
         if self.running:
             return
         if extended is None:
-            extended = messagebox.askyesno("Drive health", "Run an extended surface check?\n\n"
-                                           "Yes: extended (can take hours)\nNo: quick health check")
+            extended = messagebox.askyesnocancel("Drive health", "Run an extended surface check?\n\n"
+                                                 "Yes: extended (can take hours)\nNo: quick health check")
+            if extended is None:
+                return
         selected = [drive for drive in self.drives if self.selected.get(drive.mount) and self.selected[drive.mount].get()]
         if extended and not messagebox.askyesno("Extended health check", "Extended checks can take hours and may read every file "
                                              "on drives that cannot self-test. Start now?"):

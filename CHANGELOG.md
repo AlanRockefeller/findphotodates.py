@@ -13,6 +13,12 @@
 - The health log now records each drive's volume IDs, so warnings find the right drive even if it's renamed. Logs from earlier versions are upgraded automatically.
 - The health check lists drives in the same order as the main menu.
 - Fix: a drive holding copies of another drive's folders could be matched to that other drive's file list by its contents, and scanning it would have overwritten that list. Lists that record a different drive's serial number are no longer matched by contents, and the menu and GUI refuse to scan a drive into a list recorded for another drive.
+- Fix: a small file list could be matched to the wrong drive by its contents, because one matching file was counted several times.
+- `--health` no longer requires ExifTool, which it doesn't use.
+- Health checks now find drives formatted without partitions (mounted straight from the disk, as some memory cards and USB sticks are).
+- The GUI's drive health dialog has a Cancel button; closing it no longer starts a quick check of every drive.
+- Fix: in the GUI, two selected drives with the same name and no serial number were given the same new file list, so the second scan overwrote the first.
+- `build-release.sh` stops if it can't check GitHub for an existing tag, instead of assuming the tag is free.
 - GUI startup now names missing Tk or CustomTkinter and gives the matching installation steps.
 - Enlarged GUI text on Linux, reduced the requested window size, and added hover explanations for Advanced controls. Connected drives now appear in tables in both interfaces, and lists updated today show "Today" with the update time.
 

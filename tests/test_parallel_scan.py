@@ -66,6 +66,11 @@ def _responses_for_fixture(root):
 
 def _patch_fixture_exiftool(monkeypatch, responses):
     class FixtureExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -201,6 +206,11 @@ def test_scan_activity_status_labels_hashing_and_location_work():
 
 def _patch_recording_exiftool(monkeypatch, calls):
     class RecordingExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -515,6 +525,11 @@ def test_keyboard_interrupt_during_dispatch_writes_clean_partial_tsv(
         path.write_bytes(b"jpg")
 
     class SlowExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -561,6 +576,11 @@ def test_repeated_keyboard_interrupt_during_cleanup_stays_friendly(
         path.write_bytes(b"jpg")
 
     class SlowExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -611,6 +631,11 @@ def test_second_keyboard_interrupt_can_abort_interrupted_save(
         path.write_bytes(b"jpg")
 
     class SlowExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -665,6 +690,11 @@ def test_crashing_worker_records_failed_batch_with_blank_exif(
         path.write_bytes(b"jpg")
 
     class FlakyExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         calls = 0
         lock = threading.Lock()
 
@@ -719,6 +749,11 @@ def test_missing_exiftool_startup_failure_fails_scan(tmp_path, monkeypatch, caps
     path.write_bytes(b"jpg")
 
     class MissingExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             raise FileNotFoundError("exiftool")
 
@@ -754,6 +789,11 @@ def test_normal_shutdown_timeout_fails_and_returns_quickly(
     path.write_bytes(b"jpg")
 
     class HangingStopExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -809,6 +849,11 @@ def test_exiftool_backlog_drains_before_normal_shutdown(tmp_path, monkeypatch):
         path.write_bytes(b"jpg")
 
     class SlowButHealthyExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -851,6 +896,11 @@ def test_exiftool_drain_tracks_metadata_before_slow_postprocessing(
     path.write_bytes(b"jpg")
 
     class FastExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 
@@ -953,6 +1003,11 @@ def test_exiftool_drain_no_progress_timeout_fails_scan(tmp_path, monkeypatch, ca
     path.write_bytes(b"jpg")
 
     class HangingExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 

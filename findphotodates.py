@@ -1188,7 +1188,7 @@ class ExifToolPersistent:
             # U+202F (narrow no-break space).  "-charset filename=UTF8" tells
             # ExifTool that filenames arriving on the -@ argfile pipe are
             # UTF-8 rather than the active Windows code page.
-            self._proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 [
                     "exiftool",
                     "-charset",
@@ -1209,6 +1209,16 @@ class ExifToolPersistent:
             raise FileNotFoundError(
                 "Exiftool is required but was not found. Please install it."
             ) from e
+        # abort() sets aborted before reading _proc, so checking aborted after
+        # publishing _proc catches an abort that ran while Popen was starting.
+        self._proc = proc
+        if self.aborted:
+            self._proc = None
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
     def stop(self):
         if self._proc is None:
@@ -1246,6 +1256,8 @@ class ExifToolPersistent:
                 return None
             self.start()
             proc = self._proc
+            if proc is None:  # aborted while restarting
+                return None
             # Alan 5/4/26 - Catch BrokenPipeError/OSError on the retry too:
             # if the freshly-restarted ExifTool also dies during write/flush,
             # we previously tracebacked. Treat this like the encode failure:
@@ -2168,16 +2180,26 @@ def _build_other_lists_index(output, quiet=False):
                         sig = _other_list_key(name, size_bytes, int(row[col["mtime_ns"]]))
                     except ValueError:
                         continue
-                    if size_bytes and sig not in index:
-                        date_taken = _normalize_exif_date(date_taken) if date_taken else None
-                        location = row[col["location"]]
-                        if location and is_coordinate_string(location):
-                            location = ""
-                        if gps_lat or gps_lon or location:
-                            index[sig] = (date_taken, gps_lat or None, gps_lon or None,
-                                          location or None)
-                        else:
-                            index[sig] = date_taken
+                    if not size_bytes:
+                        continue
+                    date_taken = _normalize_exif_date(date_taken) if date_taken else None
+                    location = row[col["location"]]
+                    if location and is_coordinate_string(location):
+                        location = ""
+                    fields = (date_taken, gps_lat or None, gps_lon or None, location or None)
+                    existing = index.get(sig)
+                    if existing is not None:
+                        # Another list has this photo too: keep what it has and
+                        # fill in whatever it is missing (e.g. a date) from this one.
+                        if not isinstance(existing, tuple):
+                            existing = (existing, None, None, None)
+                        fields = tuple(old or new for old, new in zip(existing, fields))
+                        if fields == existing:
+                            continue
+                    if fields[1] or fields[2] or fields[3]:
+                        index[sig] = fields
+                    else:
+                        index[sig] = fields[0]
         except (OSError, UnicodeDecodeError, csv.Error):
             continue
     if not quiet:
@@ -2911,11 +2933,16 @@ def _build_exiftool_rows(
     hash_options,
     hash_conn,
     hash_cache_pending,
+    stop_event=None,
 ):
+    """Build inventory rows for a batch.  Returns None if *stop_event* is set
+    part way through, since a stopped batch must not be published."""
     results = []
     file_counts = Counter()
     stats = {"t_hashing": 0.0, "t_geolocate": 0.0}
     for out_path, os_path, key_path, size_bytes, mtime_ns, ext in batch:
+        if stop_event is not None and stop_event.is_set():
+            return None
         date_taken, gps_lat, gps_lon = batch_results.get(os_path, (None, None, None))
         location = None
         if locate and gps_lat and gps_lon:
@@ -3078,7 +3105,7 @@ def _exiftool_worker(
                 # real. Leave the files out of the list so a resumed scan reads them.
                 break
 
-            results, file_counts, stats = _build_exiftool_rows(
+            built = _build_exiftool_rows(
                 batch,
                 batch_results,
                 locate,
@@ -3087,7 +3114,12 @@ def _exiftool_worker(
                 hash_options,
                 hash_conn,
                 hash_cache_pending,
+                stop_event,
             )
+            if stop_event.is_set():
+                # Stopped while hashing: leave the batch out so a resumed scan reads it.
+                break
+            results, file_counts, stats = built
             worker_stats["t_hashing"] += stats["t_hashing"]
             worker_stats["t_geolocate"] += stats["t_geolocate"]
             worker_stats["batches"] += 1

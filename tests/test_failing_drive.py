@@ -78,6 +78,11 @@ def _fake_exiftool(monkeypatch, error_for_all=True, delay=0.0):
     lock = threading.Lock()
 
     class FakeExifTool:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def __init__(self):
             self.last_errors = {}
 

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# findphotodates.py - Version 1.6.0 (2026-09-28) - By Alan Rockefeller
+# findphotodates.py - Version 1.6.1 (2026-09-29) - By Alan Rockefeller
 # Generates inventory TSV with filepath, date_taken, size, mtime, GPS, location, and content_hash
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
@@ -32,7 +32,7 @@ import threading
 import types
 import unicodedata
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # Optional fast hash (prefer over stdlib when available)
 try:
@@ -1078,6 +1078,32 @@ def _is_read_error_message(message):
                                          "input/output", "file not found", "truncated"))
 
 
+def _is_spinning_disk(path):
+    """True if *path* is on a hard drive with spinning platters (Linux only).
+
+    Returns None when it can't be told, e.g. on Windows, WSL drive mounts or
+    network shares.
+    """
+    try:
+        dev = os.stat(path).st_dev
+        block = os.path.realpath(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+    except (OSError, AttributeError):
+        return None
+    for folder in (block, os.path.dirname(block)):  # a partition's disk is its parent
+        try:
+            with open(os.path.join(folder, "queue", "rotational")) as f:
+                return f.read().strip() == "1"
+        except OSError:
+            continue
+    return None
+
+
+# Alan 9/28/26 - A hard drive has one set of heads: more readers than this just
+# make it seek back and forth between folders (and USB drives without UAS take
+# one command at a time anyway).
+SPINNING_DISK_MAX_READERS = 2
+
+
 class _ReadThrottle:
     """Limits how many ExifTool workers read the drive at the same time.
 
@@ -1137,10 +1163,22 @@ class ExifToolPersistent:
 
     def __init__(self):
         self._proc = None
+        self.aborted = False
         self.last_errors = {}  # filepath -> ExifTool error from the last batch_query
 
+    def abort(self):
+        """Kill ExifTool now, from any thread. A query in progress returns
+        blank results at once, and nothing is started again."""
+        self.aborted = True
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
     def start(self):
-        if self._proc is not None:
+        if self._proc is not None or self.aborted:
             return
         try:
             # Alan 5/3/26 - Force UTF-8 on the pipes to ExifTool.  Without
@@ -1150,7 +1188,7 @@ class ExifToolPersistent:
             # U+202F (narrow no-break space).  "-charset filename=UTF8" tells
             # ExifTool that filenames arriving on the -@ argfile pipe are
             # UTF-8 rather than the active Windows code page.
-            self._proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 [
                     "exiftool",
                     "-charset",
@@ -1171,6 +1209,16 @@ class ExifToolPersistent:
             raise FileNotFoundError(
                 "Exiftool is required but was not found. Please install it."
             ) from e
+        # abort() sets aborted before reading _proc, so checking aborted after
+        # publishing _proc catches an abort that ran while Popen was starting.
+        self._proc = proc
+        if self.aborted:
+            self._proc = None
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
     def stop(self):
         if self._proc is None:
@@ -1196,14 +1244,20 @@ class ExifToolPersistent:
         if self._proc is None:
             self.start()
         proc = self._proc
+        if proc is None:  # aborted
+            return None
         payload = "\n".join(args) + "\n-execute\n"
         try:
             proc.stdin.write(payload)
             proc.stdin.flush()
         except (BrokenPipeError, OSError):
             self._proc = None
+            if self.aborted:
+                return None
             self.start()
             proc = self._proc
+            if proc is None:  # aborted while restarting
+                return None
             # Alan 5/4/26 - Catch BrokenPipeError/OSError on the retry too:
             # if the freshly-restarted ExifTool also dies during write/flush,
             # we previously tracebacked. Treat this like the encode failure:
@@ -1287,12 +1341,14 @@ class ExifToolPersistent:
         lines = self._send_and_read(args)
 
         retries = 3
-        while lines is None and retries > 0:
+        while lines is None and retries > 0 and not self.aborted:
             time.sleep(0.1)
             lines = self._send_and_read(args)
             retries -= 1
 
         results = {fp: (None, None, None) for fp in filepaths}
+        if lines is None and self.aborted:
+            return results
         if lines is None:
             # Fallback: query one at a time. query() intentionally full-parses;
             # this rare path prefers correctness over preserving fast2.
@@ -2073,6 +2129,84 @@ def _build_moved_index(cache):
     return index
 
 
+def _other_list_key(name_lower, size_bytes, mtime_ns):
+    return f"{name_lower}\t{size_bytes}\t{mtime_ns}"
+
+
+def _build_other_lists_index(output, quiet=False):
+    """Index photos/videos in the other file lists beside *output* by (name, size, mtime).
+
+    Backup drives mostly hold copies of the same photos, and a copy keeps its
+    name, size and modification time, so its EXIF date and GPS can be taken
+    from another drive's list instead of reading the file again.  Only rows
+    with a date or GPS are indexed: a blank row may just mean that scan skipped
+    or couldn't read the file.  Keys come from _other_list_key(); values are
+    (date_taken, gps_lat, gps_lon, location), or just date_taken when there is
+    no GPS (most rows; this keeps a few million entries to a few hundred MB).
+    """
+    index = {}
+    output_abs = os.path.abspath(output)
+    lists = [fl for fl in find_file_lists(os.path.dirname(output_abs))
+             if os.path.abspath(fl.path) != output_abs]
+    if not lists:
+        return index
+    if not quiet:
+        print(f"Reading {len(lists)} other file list{'s' if len(lists) != 1 else ''} "
+              "to reuse dates of photos already scanned on other drives...")
+    for fl in lists:
+        try:
+            with open(fl.path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader((line for line in f if not line.startswith("#")),
+                                    delimiter="\t")
+                header = next(reader, None)
+                if not header or not set(TSV_COLUMNS[:7]) <= set(header):
+                    continue
+                col = {name: header.index(name) for name in TSV_COLUMNS[:7]}
+                width = max(col.values()) + 1
+                for row in reader:
+                    if len(row) < width:
+                        continue
+                    date_taken = row[col["date_taken"]]
+                    gps_lat = row[col["gps_lat"]]
+                    gps_lon = row[col["gps_lon"]]
+                    if not date_taken and not (gps_lat and gps_lon):
+                        continue
+                    path = row[col["filepath"]].replace("\\", "/")
+                    name = path.rsplit("/", 1)[-1].lower()
+                    if name.rsplit(".", 1)[-1] not in EXIFTOOL_EXTENSIONS:
+                        continue
+                    try:
+                        size_bytes = int(row[col["size_bytes"]])
+                        sig = _other_list_key(name, size_bytes, int(row[col["mtime_ns"]]))
+                    except ValueError:
+                        continue
+                    if not size_bytes:
+                        continue
+                    date_taken = _normalize_exif_date(date_taken) if date_taken else None
+                    location = row[col["location"]]
+                    if location and is_coordinate_string(location):
+                        location = ""
+                    fields = (date_taken, gps_lat or None, gps_lon or None, location or None)
+                    existing = index.get(sig)
+                    if existing is not None:
+                        # Another list has this photo too: keep what it has and
+                        # fill in whatever it is missing (e.g. a date) from this one.
+                        if not isinstance(existing, tuple):
+                            existing = (existing, None, None, None)
+                        fields = tuple(old or new for old, new in zip(existing, fields))
+                        if fields == existing:
+                            continue
+                    if fields[1] or fields[2] or fields[3]:
+                        index[sig] = fields
+                    else:
+                        index[sig] = fields[0]
+        except (OSError, UnicodeDecodeError, csv.Error):
+            continue
+    if not quiet:
+        print(f"  {len(index):,} photos/videos available for reuse.")
+    return index
+
+
 def _pair_moved_files(new_files, removed):
     """Match new files to removed ones with the same size and modification time.
 
@@ -2799,11 +2933,16 @@ def _build_exiftool_rows(
     hash_options,
     hash_conn,
     hash_cache_pending,
+    stop_event=None,
 ):
+    """Build inventory rows for a batch.  Returns None if *stop_event* is set
+    part way through, since a stopped batch must not be published."""
     results = []
     file_counts = Counter()
     stats = {"t_hashing": 0.0, "t_geolocate": 0.0}
     for out_path, os_path, key_path, size_bytes, mtime_ns, ext in batch:
+        if stop_event is not None and stop_event.is_set():
+            return None
         date_taken, gps_lat, gps_lon = batch_results.get(os_path, (None, None, None))
         location = None
         if locate and gps_lat and gps_lon:
@@ -2858,6 +2997,7 @@ def _exiftool_worker(
     error_log,
     error_log_lock,
     throttle=None,
+    active_exiftools=None,
 ):
     exiftool = None
     worker_started = time.time()
@@ -2891,6 +3031,10 @@ def _exiftool_worker(
             try:
                 if exiftool is None:
                     exiftool = ExifToolPersistent()
+                    if active_exiftools is not None:
+                        active_exiftools.append(exiftool)
+                    if stop_event.is_set():
+                        exiftool.abort()
                     try:
                         exiftool.start()
                     except Exception as e:
@@ -2956,7 +3100,12 @@ def _exiftool_worker(
                     )
                 batch_results = {item[1]: (None, None, None) for item in batch}
 
-            results, file_counts, stats = _build_exiftool_rows(
+            if exiftool is not None and exiftool.aborted:
+                # Alan 9/28/26 - Stopped mid-batch: these blank results aren't
+                # real. Leave the files out of the list so a resumed scan reads them.
+                break
+
+            built = _build_exiftool_rows(
                 batch,
                 batch_results,
                 locate,
@@ -2965,7 +3114,12 @@ def _exiftool_worker(
                 hash_options,
                 hash_conn,
                 hash_cache_pending,
+                stop_event,
             )
+            if stop_event.is_set():
+                # Stopped while hashing: leave the batch out so a resumed scan reads it.
+                break
+            results, file_counts, stats = built
             worker_stats["t_hashing"] += stats["t_hashing"]
             worker_stats["t_geolocate"] += stats["t_geolocate"]
             worker_stats["batches"] += 1
@@ -3027,10 +3181,13 @@ def run_scan(
     min_image_size=MIN_EXIFTOOL_IMAGE_BYTES,
     retry_blank_exif=False,
     volume_info=None,
+    reuse_other_lists=True,
 ):
     """Run a scan on the specified directory.
 
     If perf_stats is a dict, it will be populated with detailed timing breakdowns.
+    reuse_other_lists takes dates for copied photos from the other file lists
+    in the output's folder (matched by name, size and modification time).
     volume_info (a DriveInfo) identifies the drive when *directory* is a whole
     drive; it is recorded in the inventory header so the list can be matched
     to its drive later even if the mount point or drive letter changes.
@@ -3142,6 +3299,10 @@ def run_scan(
     # modification time; reuse their earlier EXIF results instead of re-reading.
     moved_index = None  # (name_lower, size, mtime_ns) -> cached entry, built on first need
     moved_reused_count = 0
+    # Alan 9/28/26 - Copies of photos already listed for another drive in the
+    # same folder reuse that list's dates too.
+    other_index = None  # (name_lower, size, mtime_ns) -> (date, lat, lon, location)
+    other_reused_count = 0
     # Alan 9/28/26 - Read problems (e.g. a failing drive). Folder/file errors from
     # the directory walk are collected in discovery.read_errors; these are the rest.
     read_problems = []  # (kind, path, is_io_error, message)
@@ -3264,7 +3425,15 @@ def run_scan(
         progress_line_len = 0
 
         work_queue = queue.Queue(maxsize=max(1, worker_count * 4))
-        throttle = _ReadThrottle(1 if health_row is not None else worker_count)
+        read_limit = worker_count
+        if health_row is not None:
+            read_limit = 1
+        elif worker_count > SPINNING_DISK_MAX_READERS and _is_spinning_disk(directory):
+            read_limit = SPINNING_DISK_MAX_READERS
+            if not quiet:
+                print(f"Hard drive detected: reading {read_limit} files at a time "
+                      "to keep the drive from seeking back and forth.")
+        throttle = _ReadThrottle(read_limit)
         results_queue = queue.Queue()
         stop_event = threading.Event()
         error_log_lock = threading.Lock()
@@ -3272,6 +3441,7 @@ def run_scan(
         worker_done_count = 0
         fatal_worker_error = None
         worker_shutdown_timed_out = False
+        active_exiftools = []  # each worker's ExifToolPersistent, so a stop can kill them
         exiftool_files_queued = 0
         exiftool_metadata_done_count = 0
         exiftool_files_completed = 0
@@ -3293,7 +3463,7 @@ def run_scan(
                     error_log,
                     error_log_lock,
                 ),
-                kwargs={"throttle": throttle},
+                kwargs={"throttle": throttle, "active_exiftools": active_exiftools},
                 daemon=True,
             )
             t.start()
@@ -3609,6 +3779,10 @@ def run_scan(
             nonlocal worker_shutdown_timed_out
             if interrupt:
                 stop_event.set()
+                # Alan 9/28/26 - Don't wait for batches in progress: on a slow
+                # drive one can take minutes. Their files are read on resume.
+                for et in list(active_exiftools):
+                    et.abort()
                 for _ in worker_threads:
                     try:
                         work_queue.put_nowait(None)
@@ -3800,6 +3974,31 @@ def run_scan(
                         ):
                             source_entry = moved_entry
                             reused_moved = True
+                    reused_other = False
+                    if (
+                        source_entry is None
+                        and reuse_other_lists
+                        and not old_format
+                        and not retry_cached_blank_exif
+                        and size_bytes
+                        and ext in EXIFTOOL_EXTENSIONS
+                    ):
+                        if other_index is None:
+                            other_index = _build_other_lists_index(output, quiet=quiet)
+                        other_row = other_index.get(_other_list_key(
+                            key_path.rsplit("/", 1)[-1].lower(), size_bytes, mtime_ns
+                        ))
+                        if other_row is not None:
+                            if isinstance(other_row, str):
+                                other_row = (other_row, None, None, None)
+                            date_taken, gps_lat, gps_lon, location = other_row
+                            source_entry = {
+                                "date_taken": date_taken,
+                                "gps_lat": gps_lat,
+                                "gps_lon": gps_lon,
+                                "location": location,
+                            }
+                            reused_other = True
 
                     if source_entry is not None:
                         date_taken = source_entry["date_taken"]
@@ -3846,6 +4045,8 @@ def run_scan(
                         _mark_done(key_path)
                         if reused_moved:
                             moved_reused_count += 1
+                        if reused_other:
+                            other_reused_count += 1
                         # fall through to progress/checkpoint below
 
                     else:
@@ -4095,6 +4296,11 @@ def run_scan(
                 f"  {moved_reused_count:,} moved or copied photos/videos reused their "
                 "earlier dates without being read again"
             )
+        if other_reused_count:
+            print(
+                f"  {other_reused_count:,} photos/videos reused dates from other drives' "
+                "lists without being read"
+            )
         if retry_blank_exif:
             print(f"Blank EXIF rows retried: {retry_blank_exif_count:,}")
 
@@ -4145,6 +4351,7 @@ def run_scan(
         perf_stats["files_total"] = total_seen
         perf_stats["files_cached"] = cached_count
         perf_stats["files_moved_reused"] = moved_reused_count
+        perf_stats["files_other_lists_reused"] = other_reused_count
         perf_stats["files_processed"] = processed_count
         perf_stats["retry_blank_exif_count"] = retry_blank_exif_count
 
@@ -6866,6 +7073,7 @@ Options:
   --workers N       Number of parallel ExifTool worker threads (default: 4).
   --min-image-size BYTES  Skip ExifTool for tiny JPG/JPEG/PNG/WebP images (default: 100,000; 0 disables).
   --retry-blank-exif      Re-query ExifTool-eligible cached rows with blank date_taken.
+  --no-reuse-other-lists  Don't reuse dates from other inventories in the output's folder.
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
   --save             Save the current scan configuration for later use.
@@ -7016,6 +7224,12 @@ For more details on a specific option, you can also use:
         help="Re-query ExifTool-eligible cached rows with blank date_taken instead of reusing them.",
     )
     parser.add_argument(
+        "--no-reuse-other-lists",
+        dest="reuse_other_lists",
+        action="store_false",
+        help="Read every new photo with ExifTool instead of reusing dates from other inventories in the output's folder.",
+    )
+    parser.add_argument(
         "--linux",
         action="store_const",
         dest="path_style",
@@ -7146,6 +7360,7 @@ For more details on a specific option, you can also use:
             "workers": _clamp_worker_count(args.workers),
             "min_image_size": _clamp_min_image_size(args.min_image_size),
             "retry_blank_exif": args.retry_blank_exif,
+            "reuse_other_lists": args.reuse_other_lists,
         }
 
         config = load_config()
@@ -7215,6 +7430,7 @@ For more details on a specific option, you can also use:
                 workers=args.workers,
                 min_image_size=args.min_image_size,
                 retry_blank_exif=args.retry_blank_exif,
+                reuse_other_lists=args.reuse_other_lists,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
@@ -7281,6 +7497,7 @@ For more details on a specific option, you can also use:
                         "min_image_size", MIN_EXIFTOOL_IMAGE_BYTES
                     ),
                     retry_blank_exif=flags.get("retry_blank_exif", False),
+                    reuse_other_lists=flags.get("reuse_other_lists", True),
                 )
                 if ok is False:
                     any_scan_failed = True
@@ -7331,6 +7548,7 @@ For more details on a specific option, you can also use:
         workers=args.workers,
         min_image_size=args.min_image_size,
         retry_blank_exif=args.retry_blank_exif,
+        reuse_other_lists=args.reuse_other_lists,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)

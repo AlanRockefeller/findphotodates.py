@@ -56,6 +56,11 @@ def _write_photo(directory, name):
 
 def _patch_exiftool(monkeypatch, responses_by_name):
     class FakeExifToolPersistent:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
         def start(self):
             pass
 

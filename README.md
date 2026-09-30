@@ -1,6 +1,6 @@
 # findphotodates.py
 
-**Version 1.6.0 (2026-09-28)**, by Alan Rockefeller
+**Version 1.6.1 (2026-09-29)**, by Alan Rockefeller
 
 A filesystem inventory tool that indexes all files and extracts EXIF dates and GPS from media files.
 
@@ -188,11 +188,12 @@ The output is `dist/FindPhotoDates/` on Linux and Windows, or `dist/FindPhotoDat
 - Skips files that haven't changed since the last scan, using the previous list and a SQLite hash cache
 - After a rescan, reports what's new, changed, moved or renamed, and removed since the last scan
 - Photos moved or copied to another folder keep their dates without being read again (same name, size and modification time)
+- Photos already scanned on another drive take their dates from that drive's list (any list in the same folder) instead of being read again
 - Checks drive health (quick SMART check, or an extended full-surface test), with plain explanations of any warnings, and keeps a health log so you can see unplugged drives and changes over time
 - Lists made under WSL are reused when scanning from native Windows and vice versa, including filenames with "funny characters" (like quotes) that the two represent differently.
 - Saves progress every 15 minutes, and saves again if a drive is disconnected. Running it again picks up where it left off.
 - Sends files to ExifTool in batches, which is faster on large scans
-- Runs several ExifTool processes at once (`--workers`, default 4)
+- Runs several ExifTool processes at once (`--workers`, default 4), limited to two reading at a time on a hard drive (Linux)
 - Uses ExifTool's faster `-fast2` mode for JPEG/PNG/WebP files, and skips JPEG/PNG/WebP files smaller than `--min-image-size`
 - Uses `os.scandir()` instead of `os.walk()` to find files faster
 - Remembers place names looked up from GPS coordinates (in SQLite) and shares them between lists
@@ -315,7 +316,8 @@ usage: findphotodates.py [-h] [-i] [--health [{quick,extended,history}]] [--dire
                         [--hash-cache PATH] [--no-hash-cache] [--hash-exts LIST]
                         [--location-cache PATH] [--no-location-cache]
                         [--old-format] [--debugperformance] [--workers N]
-                        [--min-image-size BYTES] [--linux] [--windows]
+                        [--min-image-size BYTES] [--no-reuse-other-lists]
+                        [--linux] [--windows]
                         [--save] [--scan]
 ```
 
@@ -344,6 +346,7 @@ usage: findphotodates.py [-h] [-i] [--health [{quick,extended,history}]] [--dire
 | `--debugperformance`      | Print detailed timing statistics after each scan                      |
 | `--workers`               | Number of parallel ExifTool worker threads (default: 4)               |
 | `--min-image-size`        | Skip ExifTool for tiny JPG/JPEG/PNG/WebP files (default: 100,000)     |
+| `--no-reuse-other-lists`  | Don't reuse dates from other lists in the output file's folder        |
 | `--linux`                 | Force Linux-style paths (/mnt/c/...) in output (default: auto-detect) |
 | `--windows`               | Force Windows-style paths (C:\...) in output (default: auto-detect)   |
 | `--save`                  | Save current scan configuration for later use with --scan             |

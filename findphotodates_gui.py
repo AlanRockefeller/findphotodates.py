@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import datetime as _datetime
 import os
 import queue
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -15,7 +17,8 @@ from pathlib import Path
 from findphotodates_gui_startup import dependency_message
 
 try:
-    from tkinter import TclError, filedialog, messagebox
+    from tkinter import TclError, filedialog, messagebox, ttk
+
     import customtkinter as ctk
 except (ImportError, OSError) as exc:
     if __name__ == "__main__":
@@ -33,7 +36,7 @@ except (ImportError, OSError) as exc:
     raise
 
 import findphotodates as fp
-
+from findphotodates_search import InventorySearchIndex, SearchQueryError
 
 APP_TITLE = f"Find Photo Dates {fp.__version__}"
 
@@ -134,6 +137,340 @@ class HoverHelp:
             self.popup = None
 
 
+class FileSearchDialog(ctk.CTkToplevel):
+    """Responsive search window backed by a persistent inventory index."""
+
+    RESULT_LIMIT = 500
+
+    def __init__(self, parent, file_lists):
+        super().__init__(parent)
+        self.parent = parent
+        self.file_lists = list(file_lists)
+        self.index = InventorySearchIndex(fp.DEFAULT_CACHE_DIR / "inventory_search.sqlite3")
+        self.events = queue.Queue()
+        self.results = {}
+        self.generation = 0
+        self.index_ready = False
+        self.pending_search = False
+        self.offset = 0
+        self._after_id = None
+        self._closed = False
+
+        self.title("Search file lists")
+        self.geometry("1120x690")
+        self.minsize(760, 480)
+        self.transient(parent)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build_controls()
+        self._build_results()
+        self._build_details()
+        self._after_id = self.after(75, self._drain_events)
+        self._start_index()
+
+    def _build_controls(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(15, 5))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Search every file list", anchor="w",
+                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(head, text="Search help", width=100, fg_color="transparent",
+                      border_width=1, command=self._show_help).grid(row=0, column=1, padx=(8, 0))
+
+        controls = ctk.CTkFrame(self, corner_radius=8)
+        controls.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 8))
+        controls.grid_columnconfigure(0, weight=1)
+        self.query_var = ctk.StringVar()
+        self.query_entry = ctk.CTkEntry(
+            controls, textvariable=self.query_var, height=38,
+            placeholder_text='Name or path, or filters such as ext:jpg date>=2020 size>10MB',
+        )
+        self.query_entry.grid(row=0, column=0, sticky="ew", padx=(10, 7), pady=(10, 5))
+        self.query_entry.bind("<Return>", self._search)
+        self.query_entry.bind("<KeyRelease>", self._schedule_search)
+        self.search_btn = ctk.CTkButton(controls, text="Search", width=92, height=38,
+                                        command=self._search, state="disabled")
+        self.search_btn.grid(row=0, column=1, padx=(0, 7), pady=(10, 5))
+
+        labels = ["All lists"]
+        self.list_choices = {"All lists": None}
+        for file_list in self.file_lists:
+            label = file_list.path.name
+            if label in self.list_choices:
+                label = str(file_list.path)
+            labels.append(label)
+            self.list_choices[label] = file_list.path
+        self.list_var = ctk.StringVar(value="All lists")
+        self.list_menu = ctk.CTkOptionMenu(controls, variable=self.list_var, values=labels,
+                                           width=220, command=lambda _value: self._search())
+        self.list_menu.grid(row=0, column=2, padx=(0, 10), pady=(10, 5))
+        self.status_var = ctk.StringVar(value="Preparing the search index…")
+        ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
+                     text_color=("gray35", "gray72"))\
+            .grid(row=1, column=0, columnspan=3, sticky="ew", padx=11, pady=(0, 8))
+
+    def _build_results(self):
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        style = ttk.Style(self)
+        dark = ctk.get_appearance_mode() == "Dark"
+        style.configure("FileSearch.Treeview", rowheight=27,
+                        background="#242424" if dark else "#ffffff",
+                        fieldbackground="#242424" if dark else "#ffffff",
+                        foreground="#f2f2f2" if dark else "#202020")
+        style.map("FileSearch.Treeview",
+                  background=[("selected", "#1f6aa5")],
+                  foreground=[("selected", "#ffffff")])
+        columns = ("path", "date", "size", "modified", "location", "list")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings",
+                                 style="FileSearch.Treeview", selectmode="browse")
+        headings = (("path", "File path", 390), ("date", "Photo date", 145),
+                    ("size", "Size", 85), ("modified", "Modified", 145),
+                    ("location", "Place", 170), ("list", "File list", 170))
+        for column, title, width in headings:
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, minwidth=60, stretch=column in ("path", "location"))
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(8, 0))
+        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=(8, 0))
+        horizontal.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed)
+        self.tree.bind("<Double-1>", self._open_containing_folder)
+
+    def _build_details(self):
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        footer.grid_columnconfigure(0, weight=1)
+        self.detail_var = ctk.StringVar(value="Select a result to see its GPS coordinates and content hash.")
+        ctk.CTkLabel(footer, textvariable=self.detail_var, anchor="w", justify="left",
+                     wraplength=720).grid(row=0, column=0, sticky="ew")
+        self.more_btn = ctk.CTkButton(footer, text="Load more", width=90,
+                                      fg_color="transparent", border_width=1,
+                                      command=self._load_more)
+        self.more_btn.grid(row=0, column=1, padx=(8, 0))
+        self.more_btn.grid_remove()
+        self.copy_btn = ctk.CTkButton(footer, text="Copy path", width=90,
+                                      fg_color="transparent", border_width=1,
+                                      command=self._copy_path, state="disabled")
+        self.copy_btn.grid(row=0, column=2, padx=(8, 0))
+        self.open_btn = ctk.CTkButton(footer, text="Open folder", width=100,
+                                      command=self._open_containing_folder, state="disabled")
+        self.open_btn.grid(row=0, column=3, padx=(8, 0))
+
+    def _show_help(self):
+        messagebox.showinfo(
+            "Search file lists",
+            "Type ordinary words to search paths, dates, GPS, places, hashes, and list names. "
+            "Words are combined with AND. Put phrases in quotes.\n\n"
+            "Field filters:\n"
+            "  path:vacation   name:IMG_1234   ext:jpg|png\n"
+            "  date>=2020-01-01   date:missing\n"
+            "  size>10MB   modified<2024-06-30\n"
+            "  lat>35   lon<-120   location:\"New York\"\n"
+            "  hash:abc123   list:Archive\n\n"
+            "Use : for contains, = for an exact value, * and ? as wildcards, | for alternatives, "
+            "and a leading - to exclude a word or filter (for example -ext:tmp). "
+            "Use missing or present to test empty fields.",
+            parent=self,
+        )
+
+    def _start_index(self):
+        paths = [file_list.path for file_list in self.file_lists]
+
+        def progress(number, total, name, rows):
+            self.events.put(("progress", number, total, name, rows))
+
+        def work():
+            try:
+                changed, total = self.index.refresh(paths, progress=progress)
+                self.events.put(("ready", changed, total))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _schedule_search(self, event=None):
+        if event and event.keysym in ("Return", "Up", "Down", "Left", "Right", "Shift_L", "Shift_R"):
+            return
+        self.generation += 1
+        generation = self.generation
+
+        def later():
+            if generation == self.generation and self.query_var.get().strip():
+                self._search()
+        self.after(350, later)
+
+    def _search(self, _event=None, *, append=False):
+        if not self.index_ready:
+            self.pending_search = True
+            return
+        query = self.query_var.get().strip()
+        self.generation += 1
+        generation = self.generation
+        if not append:
+            self.offset = 0
+        selected = self.list_choices.get(self.list_var.get())
+        sources = [selected] if selected else None
+        self.search_btn.configure(state="disabled")
+        self.more_btn.configure(state="disabled")
+        self.status_var.set("Searching…")
+
+        def work():
+            try:
+                rows, more = self.index.search(query, source_paths=sources,
+                                               limit=self.RESULT_LIMIT, offset=self.offset)
+                self.events.put(("results", generation, query, append, rows, more))
+            except (SearchQueryError, sqlite3.Error) as exc:
+                self.events.put(("search_error", generation, str(exc)))
+            except Exception as exc:
+                self.events.put(("search_error", generation, f"Search failed: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _load_more(self):
+        self.offset = len(self.results)
+        self._search(append=True)
+
+    @staticmethod
+    def _human_size(size):
+        return fp._human_size(size) or "0 B"
+
+    @staticmethod
+    def _modified(value):
+        if not value:
+            return ""
+        try:
+            return _datetime.datetime.fromtimestamp(value / 1_000_000_000).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            return ""
+
+    def _show_results(self, query, append, rows, more):
+        if not append:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.results.clear()
+            self.copy_btn.configure(state="disabled")
+            self.open_btn.configure(state="disabled")
+            self.detail_var.set("Select a result to see its GPS coordinates and content hash.")
+        for result in rows:
+            item = self.tree.insert("", "end", values=(
+                result.filepath, result.date_taken, self._human_size(result.size_bytes),
+                self._modified(result.mtime_ns), result.location, Path(result.source_path).name,
+            ))
+            self.results[item] = result
+        count = len(self.results)
+        suffix = " — more matches available" if more else ""
+        label = "all indexed files" if not query else "your search"
+        self.status_var.set(f"{count:,} result{'s' if count != 1 else ''} for {label}{suffix}")
+        (self.more_btn.grid if more else self.more_btn.grid_remove)()
+        self.more_btn.configure(state="normal")
+        self.search_btn.configure(state="normal")
+
+    def _selected_result(self):
+        selected = self.tree.selection()
+        return self.results.get(selected[0]) if selected else None
+
+    def _selection_changed(self, _event=None):
+        result = self._selected_result()
+        if not result:
+            return
+        gps = ", ".join(part for part in (result.gps_lat, result.gps_lon) if part) or "none"
+        content_hash = result.content_hash or "none"
+        self.detail_var.set(f"GPS: {gps}    Hash: {content_hash}")
+        self.copy_btn.configure(state="normal")
+        self.open_btn.configure(state="normal")
+
+    def _resolved_path(self, result):
+        local = Path(fp._resolve_local_inventory_path(result.filepath))
+        if local.exists():
+            return local
+        file_list = next((item for item in self.file_lists
+                          if str(item.path.resolve()) == result.source_path), None)
+        if file_list and file_list.drive and file_list.root:
+            key = fp._normalize_cache_key(result.filepath)
+            prefix = fp._root_cache_prefix(file_list.root)
+            if key.startswith(prefix):
+                return Path(file_list.drive.mount, *key[len(prefix):].split("/"))
+        return local if local.is_absolute() else None
+
+    def _copy_path(self):
+        result = self._selected_result()
+        if result:
+            self.clipboard_clear()
+            self.clipboard_append(result.filepath)
+            self.status_var.set("Path copied to the clipboard.")
+
+    def _open_containing_folder(self, _event=None):
+        result = self._selected_result()
+        if not result:
+            return
+        path = self._resolved_path(result)
+        if path is None:
+            messagebox.showinfo("Drive not connected",
+                                "The file is in the list, but its containing folder is not available right now.\n\n"
+                                + result.filepath, parent=self)
+            return
+        folder = path if path.is_dir() else path.parent
+        if not folder.is_dir():
+            messagebox.showinfo("Drive not connected",
+                                "The file is in the list, but its containing folder is not available right now.\n\n"
+                                + result.filepath, parent=self)
+            return
+        try:
+            open_folder(folder)
+        except Exception as exc:
+            messagebox.showerror("Open folder", str(exc), parent=self)
+
+    def _drain_events(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    _, number, total, name, rows = event
+                    detail = f" — {rows:,} files" if rows is not None else ""
+                    self.status_var.set(f"Indexing {name} ({number}/{total}){detail}")
+                elif kind == "ready":
+                    _, changed, total = event
+                    self.index_ready = True
+                    self.search_btn.configure(state="normal")
+                    action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
+                    self.status_var.set(f"{action}{total:,} files ready to search.")
+                    if self.pending_search or self.query_var.get().strip():
+                        self.pending_search = False
+                        self._search()
+                elif kind == "error":
+                    self.status_var.set("Could not build the search index: " + event[1])
+                elif kind == "results":
+                    _, generation, query, append, rows, more = event
+                    if generation == self.generation:
+                        self._show_results(query, append, rows, more)
+                elif kind == "search_error":
+                    _, generation, error = event
+                    if generation == self.generation:
+                        self.status_var.set(error)
+                        self.more_btn.configure(state="normal")
+                        self.search_btn.configure(state="normal")
+        except queue.Empty:
+            pass
+        self._after_id = self.after(75, self._drain_events)
+
+    def _close(self):
+        self._closed = True
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        if getattr(self.parent, "search_dialog", None) is self:
+            self.parent.search_dialog = None
+        self.destroy()
+
+
 class FindPhotoDatesGUI(ctk.CTk):
     def __init__(self):
         # CustomTkinter detects display DPI on macOS and Windows, but Linux
@@ -167,6 +504,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._advanced_auto_height = None
         self._compact_height = None
         self._hover_help = []
+        self.search_dialog = None
 
         self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.body.grid(row=0, column=0, sticky="nsew")
@@ -240,7 +578,8 @@ class FindPhotoDatesGUI(ctk.CTk):
                      text_color=("gray35", "gray72"), wraplength=530,
                      font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="ew")
         self._text_button(footer, "Open folder", lambda: self._open_path(self.list_dir)).grid(row=0, column=1)
-        self._text_button(footer, "Show all lists", self._show_lists).grid(row=0, column=2)
+        self._text_button(footer, "Search files", self._show_search).grid(row=0, column=2)
+        self._text_button(footer, "Show all lists", self._show_lists).grid(row=0, column=3)
 
     def _build_actions(self):
         frame = ctk.CTkFrame(self.body, fg_color="transparent")
@@ -818,6 +1157,18 @@ class FindPhotoDatesGUI(ctk.CTk):
         box.pack(fill="both", expand=True, padx=15, pady=15)
         box.insert("1.0", "\n\n".join(lines))
         box.configure(state="disabled")
+
+    def _show_search(self):
+        if not self.lists:
+            messagebox.showinfo("Search file lists", "Make at least one file list first.")
+            return
+        if self.search_dialog is not None and self.search_dialog.winfo_exists():
+            self.search_dialog.deiconify()
+            self.search_dialog.lift()
+            self.search_dialog.query_entry.focus_set()
+            return
+        self.search_dialog = FileSearchDialog(self, self.lists)
+        self.search_dialog.query_entry.focus_set()
 
     def _open_path(self, path):
         try:

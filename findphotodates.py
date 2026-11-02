@@ -6665,17 +6665,25 @@ def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
             existing = _read_sys(f"{sys_root}/module/usb_storage/parameters/quirks")
             # Linux uses the first entry for a device, so add "u" to any
             # flags this device already has rather than a second entry.
-            device = f"{vid}:{pid}".lower()
+            # IDs are compared as numbers: "bc2" and "0bc2" are the same.
+            def ids(entry):
+                parts = entry.split(":")
+                try:
+                    return int(parts[0], 16), int(parts[1], 16)
+                except (IndexError, ValueError):
+                    return None
+
+            device = ids(quirk)
             entries, merged = [], False
             for entry in (q.strip() for q in existing.split(",")):
                 if not entry:
                     continue
-                if entry.lower().rsplit(":", 1)[0] == device and not merged:
-                    flags = entry.rsplit(":", 1)[1] if entry.count(":") == 2 else ""
+                if ids(entry) == device:
+                    if merged:
+                        continue  # a later entry for this device would be ignored anyway
+                    flags = entry.split(":")[2] if entry.count(":") == 2 else ""
                     entry = f"{vid}:{pid}:{flags if 'u' in flags else flags + 'u'}"
                     merged = True
-                elif entry.lower().rsplit(":", 1)[0] == device:
-                    continue  # a later duplicate would be ignored anyway
                 entries.append(entry)
             value = ",".join(entries if merged else entries + [quirk])
             seen = ", ".join(x for x in (

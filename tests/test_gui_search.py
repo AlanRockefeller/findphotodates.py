@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from findphotodates_search import InventorySearchIndex, SearchQueryError, compile_query
+from findphotodates_search import (
+    InventorySearchIndex,
+    SearchQueryError,
+    compile_query,
+    normalize_photo_day,
+)
 
 FIELDS = [
     "filepath",
@@ -97,6 +102,12 @@ class InventorySearchTests(unittest.TestCase):
         self.assertEqual(
             paths(self.index, "list:Archive"), ["/old/family portrait.png"]
         )
+        self.assertEqual(
+            paths(self.index, "date=2024-06-30"), ["/photos/New York/Sunset.JPG"]
+        )
+        self.assertNotIn(
+            "/photos/New York/Sunset.JPG", paths(self.index, "date!=2024-06-30")
+        )
 
     def test_ranges_missing_values_wildcards_and_exclusions(self):
         self.assertEqual(
@@ -152,3 +163,9 @@ class InventorySearchTests(unittest.TestCase):
             compile_query("size>large")
         with self.assertRaisesRegex(SearchQueryError, "quote"):
             compile_query('location:"New York')
+
+    def test_photo_day_input_is_normalized_and_validated(self):
+        self.assertEqual(normalize_photo_day("2024-06-30"), "2024-06-30")
+        self.assertEqual(normalize_photo_day("06/30/2024"), "2024-06-30")
+        with self.assertRaisesRegex(SearchQueryError, "YYYY-MM-DD"):
+            normalize_photo_day("2024-02-30")

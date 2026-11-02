@@ -18,6 +18,7 @@ from findphotodates_gui_startup import dependency_message
 
 try:
     from tkinter import TclError, filedialog, messagebox, ttk
+    from tkinter import font as tkfont
 
     import customtkinter as ctk
 except (ImportError, OSError) as exc:
@@ -36,9 +37,24 @@ except (ImportError, OSError) as exc:
     raise
 
 import findphotodates as fp
-from findphotodates_search import InventorySearchIndex, SearchQueryError
+from findphotodates_search import (
+    InventorySearchIndex,
+    SearchQueryError,
+    normalize_photo_day,
+)
 
 APP_TITLE = f"Find Photo Dates {fp.__version__}"
+GUI_SCALE_CHOICES = {
+    "Text: 100%": 1.0,
+    "Text: 125%": 1.25,
+    "Text: 150%": 1.5,
+    "Text: 175%": 1.75,
+    "Text: 200%": 2.0,
+}
+
+
+def _closest_scale_label(scale):
+    return min(GUI_SCALE_CHOICES, key=lambda label: abs(GUI_SCALE_CHOICES[label] - scale))
 
 
 def worker_command(arguments):
@@ -185,7 +201,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.query_var = ctk.StringVar()
         self.query_entry = ctk.CTkEntry(
             controls, textvariable=self.query_var, height=38,
-            placeholder_text='Name or path, or filters such as ext:jpg date>=2020 size>10MB',
+            placeholder_text='Optional: filename, folder, place, or filters such as ext:jpg size>10MB',
         )
         self.query_entry.grid(row=0, column=0, sticky="ew", padx=(10, 7), pady=(10, 5))
         self.query_entry.bind("<Return>", self._search)
@@ -205,11 +221,24 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.list_var = ctk.StringVar(value="All lists")
         self.list_menu = ctk.CTkOptionMenu(controls, variable=self.list_var, values=labels,
                                            width=220, command=lambda _value: self._search())
-        self.list_menu.grid(row=0, column=2, padx=(0, 10), pady=(10, 5))
+        self.list_menu.grid(row=1, column=2, padx=(0, 10), pady=(5, 5))
+
+        date_row = ctk.CTkFrame(controls, fg_color="transparent")
+        date_row.grid(row=1, column=0, columnspan=2, sticky="w", padx=11, pady=(5, 5))
+        ctk.CTkLabel(date_row, text="Photos taken on:",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=(0, 7))
+        self.date_var = ctk.StringVar()
+        self.date_entry = ctk.CTkEntry(date_row, textvariable=self.date_var, width=150,
+                                       placeholder_text="YYYY-MM-DD")
+        self.date_entry.grid(row=0, column=1)
+        self.date_entry.bind("<Return>", self._search)
+        self.date_entry.bind("<KeyRelease>", self._schedule_search)
+        self.parent._text_button(date_row, "Today", self._use_today).grid(row=0, column=2, padx=(7, 0))
+        self.parent._text_button(date_row, "Clear", self._clear_date).grid(row=0, column=3, padx=(3, 0))
         self.status_var = ctk.StringVar(value="Preparing the search index…")
         ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
                      text_color=("gray35", "gray72"))\
-            .grid(row=1, column=0, columnspan=3, sticky="ew", padx=11, pady=(0, 8))
+            .grid(row=2, column=0, columnspan=3, sticky="ew", padx=11, pady=(0, 8))
 
     def _build_results(self):
         frame = ctk.CTkFrame(self, corner_radius=8)
@@ -217,26 +246,31 @@ class FileSearchDialog(ctk.CTkToplevel):
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
 
-        style = ttk.Style(self)
+        self.tree_style = ttk.Style(self)
         dark = ctk.get_appearance_mode() == "Dark"
-        style.configure("FileSearch.Treeview", rowheight=27,
-                        background="#242424" if dark else "#ffffff",
-                        fieldbackground="#242424" if dark else "#ffffff",
-                        foreground="#f2f2f2" if dark else "#202020")
-        style.map("FileSearch.Treeview",
-                  background=[("selected", "#1f6aa5")],
-                  foreground=[("selected", "#ffffff")])
+        self.tree_style.configure("FileSearch.Treeview",
+                                  background="#242424" if dark else "#ffffff",
+                                  fieldbackground="#242424" if dark else "#ffffff",
+                                  foreground="#f2f2f2" if dark else "#202020")
+        self.tree_style.map("FileSearch.Treeview",
+                            background=[("selected", "#1f6aa5")],
+                            foreground=[("selected", "#ffffff")])
         columns = ("path", "date", "size", "modified", "location", "list")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings",
                                  style="FileSearch.Treeview", selectmode="browse")
-        headings = (("path", "File path", 390), ("date", "Photo date", 145),
-                    ("size", "Size", 85), ("modified", "Modified", 145),
-                    ("location", "Place", 170), ("list", "File list", 170))
-        for column, title, width in headings:
+        self.tree_columns = (("path", "File path", 390), ("date", "Photo date", 145),
+                             ("size", "Size", 85), ("modified", "Modified", 145),
+                             ("location", "Place", 170), ("list", "File list", 170))
+        for column, title, width in self.tree_columns:
             self.tree.heading(column, text=title)
             self.tree.column(column, width=width, minwidth=60, stretch=column in ("path", "location"))
-        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.tree_heading_font = tkfont.nametofont("TkHeadingFont").copy()
+        self.apply_scale(self.parent.gui_scale)
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview,
+                                 style="FileSearch.Vertical.TScrollbar")
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview,
+                                   style="FileSearch.Horizontal.TScrollbar")
         self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(8, 0))
         vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=(8, 0))
@@ -267,11 +301,13 @@ class FileSearchDialog(ctk.CTkToplevel):
     def _show_help(self):
         messagebox.showinfo(
             "Search file lists",
+            "To find photos from one day, enter it in Photos taken on using YYYY-MM-DD. "
+            "You can combine the date with a filename, folder, place, or another filter.\n\n"
             "Type ordinary words to search paths, dates, GPS, places, hashes, and list names. "
             "Words are combined with AND. Put phrases in quotes.\n\n"
             "Field filters:\n"
             "  path:vacation   name:IMG_1234   ext:jpg|png\n"
-            "  date>=2020-01-01   date:missing\n"
+            "  date:2024-06-30   date>=2020-01-01   date:missing\n"
             "  size>10MB   modified<2024-06-30\n"
             "  lat>35   lon<-120   location:\"New York\"\n"
             "  hash:abc123   list:Archive\n\n"
@@ -302,15 +338,26 @@ class FileSearchDialog(ctk.CTkToplevel):
         generation = self.generation
 
         def later():
-            if generation == self.generation and self.query_var.get().strip():
+            if generation == self.generation and (self.query_var.get().strip()
+                                                   or self.date_var.get().strip()):
                 self._search()
         self.after(350, later)
 
     def _search(self, _event=None, *, append=False):
+        query = self.query_var.get().strip()
+        raw_day = self.date_var.get().strip()
+        if raw_day:
+            try:
+                day = normalize_photo_day(raw_day)
+            except SearchQueryError as exc:
+                self.status_var.set(str(exc))
+                return
+            if day != raw_day:
+                self.date_var.set(day)
+            query = f"{query} date:{day}".strip()
         if not self.index_ready:
             self.pending_search = True
             return
-        query = self.query_var.get().strip()
         self.generation += 1
         generation = self.generation
         if not append:
@@ -331,6 +378,31 @@ class FileSearchDialog(ctk.CTkToplevel):
             except Exception as exc:
                 self.events.put(("search_error", generation, f"Search failed: {exc}"))
         threading.Thread(target=work, daemon=True).start()
+
+    def _use_today(self):
+        self.date_var.set(_datetime.date.today().isoformat())
+        self._search()
+
+    def _clear_date(self):
+        self.date_var.set("")
+        self._search()
+
+    def apply_scale(self, scale):
+        """Scale the native ttk result table along with CustomTkinter widgets."""
+        if not hasattr(self, "tree"):
+            return
+        self.tree_font.configure(size=max(10, round(11 * scale)))
+        self.tree_heading_font.configure(size=max(10, round(11 * scale)), weight="bold")
+        self.tree_style.configure("FileSearch.Treeview", rowheight=round(27 * scale),
+                                  font=self.tree_font)
+        self.tree_style.configure("FileSearch.Treeview.Heading", font=self.tree_heading_font)
+        scrollbar_size = round(15 * scale)
+        self.tree_style.configure("FileSearch.Vertical.TScrollbar", width=scrollbar_size,
+                                  arrowsize=scrollbar_size)
+        self.tree_style.configure("FileSearch.Horizontal.TScrollbar", width=scrollbar_size,
+                                  arrowsize=scrollbar_size)
+        for column, _title, width in self.tree_columns:
+            self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale))
 
     def _load_more(self):
         self.offset = len(self.results)
@@ -443,7 +515,8 @@ class FileSearchDialog(ctk.CTkToplevel):
                     self.search_btn.configure(state="normal")
                     action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
                     self.status_var.set(f"{action}{total:,} files ready to search.")
-                    if self.pending_search or self.query_var.get().strip():
+                    if (self.pending_search or self.query_var.get().strip()
+                            or self.date_var.get().strip()):
                         self.pending_search = False
                         self._search()
                 elif kind == "error":
@@ -473,11 +546,22 @@ class FileSearchDialog(ctk.CTkToplevel):
 
 class FindPhotoDatesGUI(ctk.CTk):
     def __init__(self):
-        # CustomTkinter detects display DPI on macOS and Windows, but Linux
-        # needs an application-level boost on dense screens.
-        if sys.platform.startswith("linux"):
-            ctk.set_widget_scaling(1.2)
         super().__init__()
+        config = fp.load_config()
+        if sys.platform.startswith("linux"):
+            screen_height = self.winfo_screenheight()
+            default_scale = 1.75 if screen_height >= 1800 else (1.5 if screen_height >= 1200 else 1.25)
+        else:
+            # CustomTkinter already follows native DPI scaling on macOS and Windows.
+            default_scale = 1.0
+        try:
+            requested_scale = float(config.get("gui_scale", default_scale))
+        except (TypeError, ValueError):
+            requested_scale = default_scale
+        self.gui_scale_label = _closest_scale_label(requested_scale)
+        self.gui_scale = GUI_SCALE_CHOICES[self.gui_scale_label]
+        ctk.set_widget_scaling(self.gui_scale)
+        ctk.set_window_scaling(self.gui_scale)
         self.title(APP_TITLE)
         self.geometry("820x560")
         self.minsize(700, 480)
@@ -538,20 +622,36 @@ class FindPhotoDatesGUI(ctk.CTk):
                      font=ctk.CTkFont(size=27, weight="bold")).grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(frame, text=APP_TITLE, text_color=("gray45", "gray62"),
                      font=ctk.CTkFont(size=14)).grid(row=0, column=1, sticky="e")
+        self.scale_var = ctk.StringVar(value=self.gui_scale_label)
+        ctk.CTkOptionMenu(frame, variable=self.scale_var, values=list(GUI_SCALE_CHOICES),
+                          width=125, command=self._set_gui_scale).grid(row=0, column=2,
+                                                                       sticky="e", padx=(10, 0))
         ctk.CTkLabel(frame, text="Choose a connected drive to make or update its file list. "
                      "Later scans read only new or changed files. Lists stay in Documents so you "
                      "can see what is on drives even while they are unplugged.",
                      wraplength=740, anchor="w", justify="left",
                      font=ctk.CTkFont(size=14),
-                     text_color=("gray35", "gray70")).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+                     text_color=("gray35", "gray70")).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
         self.exif_var = ctk.StringVar(value="Checking ExifTool…")
         exif_row = ctk.CTkFrame(frame, fg_color="transparent")
-        exif_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        exif_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         exif_row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(exif_row, textvariable=self.exif_var, anchor="w",
                      text_color=("gray35", "gray72"), font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="ew")
         self._text_button(exif_row, "Get ExifTool", lambda: __import__("webbrowser").open("https://exiftool.org/"))\
             .grid(row=0, column=1, sticky="e")
+
+    def _set_gui_scale(self, label):
+        scale = GUI_SCALE_CHOICES[label]
+        self.gui_scale_label = label
+        self.gui_scale = scale
+        ctk.set_widget_scaling(scale)
+        ctk.set_window_scaling(scale)
+        if self.search_dialog is not None and self.search_dialog.winfo_exists():
+            self.search_dialog.apply_scale(scale)
+        config = fp.load_config()
+        config["gui_scale"] = scale
+        fp.save_config(config)
 
     def _build_drives(self):
         outer = ctk.CTkFrame(self.body, corner_radius=10)
@@ -1165,10 +1265,10 @@ class FindPhotoDatesGUI(ctk.CTk):
         if self.search_dialog is not None and self.search_dialog.winfo_exists():
             self.search_dialog.deiconify()
             self.search_dialog.lift()
-            self.search_dialog.query_entry.focus_set()
+            self.search_dialog.date_entry.focus_set()
             return
         self.search_dialog = FileSearchDialog(self, self.lists)
-        self.search_dialog.query_entry.focus_set()
+        self.search_dialog.date_entry.focus_set()
 
     def _open_path(self, path):
         try:

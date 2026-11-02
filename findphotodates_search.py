@@ -7,6 +7,7 @@ import datetime as _datetime
 import re
 import shlex
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +39,20 @@ class SearchResult:
     gps_lon: str
     location: str
     content_hash: str
+
+
+def normalize_photo_day(value):
+    """Return a user-entered calendar day as YYYY-MM-DD."""
+    text = value.strip()
+    formats = ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y", "%Y%m%d")
+    for date_format in formats:
+        try:
+            return _datetime.datetime.strptime(text, date_format).date().isoformat()
+        except ValueError:
+            pass
+    raise SearchQueryError(
+        "Enter the photo date as YYYY-MM-DD (for example, 2024-06-30)."
+    )
 
 
 _FIELD_ALIASES = {
@@ -278,6 +293,13 @@ def compile_query(query, *, fts_enabled=True):
         else:
             if field == "date_taken":
                 value = value.replace("-", ":")
+                # A calendar day is the useful meaning of date=2024-06-30;
+                # inventory values also contain a time, so make it a prefix match.
+                if re.fullmatch(r"\d{4}:\d{2}:\d{2}", value):
+                    if operator == "!=":
+                        negative = not negative
+                    if operator in ("=", "!="):
+                        operator = ":"
             if field == "extension":
                 value = value.lstrip(".")
             columns = _ALL_TEXT_COLUMNS if field == "all" else (_TEXT_COLUMNS[field],)
@@ -381,7 +403,7 @@ class InventorySearchIndex:
             signatures[str(path)] = (stat.st_mtime_ns, stat.st_size, path.name)
 
         changed = 0
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             existing = {
                 row[1]: row
                 for row in connection.execute(
@@ -491,7 +513,7 @@ class InventorySearchIndex:
         return count
 
     def search(self, query, *, source_paths=None, limit=500, offset=0):
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             join, where, params, order = compile_query(
                 query, fts_enabled=self._has_fts(connection)
             )

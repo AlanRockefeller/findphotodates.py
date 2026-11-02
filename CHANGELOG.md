@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.7.0 (2026-11-01)
+
+- New coverage report: "do my photos and videos have a second copy?" It compares every file list, including unplugged drives, and shows for each drive how many photos and videos are the only copy anywhere, how many have copies only on weak drives, and whether a drive is safe to retire. Drives can be marked Automatic (follows the health log; cable errors alone don't count), Keep, Weak or Gone. In the GUI (**Coverage**), the menu (`c`) and with `--coverage`.
+- Backblaze awareness: mark which drives Backblaze backs up and set your version history, 30 days or 1 year (`--backblaze-history`). The report remembers when each drive was last connected and warns before a disconnected drive's backup would expire.
+- Duplicate cleanup in the GUI: **Clean up duplicates…** deletes photos and videos on a connected drive that already have a copy in a keep folder (library `YYYY/YYYY-MM-DD` folders and `Important` by default) on another drive you keep. Kept copies are checked on disk first, read-only card folders are handled, and every deletion is logged.
+- Cloud placeholders (OneDrive online-only, Phone Link, evicted iCloud files) are recognized and listed without being read, which would download them. They never count as backups or copies.
+- Files inside `.zip` archives are listed, so exports such as Facebook or Google Photos downloads count as copies; only each zip's table of contents is read. `--archives all` adds `.tar`/`.tgz`; `--archives off` turns it off. Unchanged archives aren't read again.
+- File lists have a new last column, `flags` (`placeholder`, `archive`). Lists from earlier versions are read as before.
+- Linux health checks suggest the `usb-storage` UAS quirk for drives whose kernel log shows UAS resets, and point out USB 3 drives connected at USB 2 speed.
+- GUI: a "Photos taken on" search field, and a Text menu that scales the interface from 100% to 200%.
+
 ## v1.6.1 (2026-09-29)
 
 - Much faster scans of backup drives. Photos and videos that were already scanned on another drive (same name, size and modification time, as copies keep) now take their date and GPS from that drive's list instead of being read again. Every list in the same folder as the one being written is used, so in the menu and GUI that's all your drive lists. A partial scan of the Erowid drive found 99% of its photos already listed for other drives. Only list entries with a date or GPS are reused; photos whose earlier scan found nothing are read again. `--no-reuse-other-lists` turns this off.

@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# findphotodates.py - Version 1.6.1 (2026-09-29) - By Alan Rockefeller
+# findphotodates.py - Version 1.7.0 (2026-11-01) - By Alan Rockefeller
 # Generates inventory TSV with filepath, date_taken, size, mtime, GPS, location, and content_hash
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
@@ -32,7 +32,7 @@ import threading
 import types
 import unicodedata
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 # Optional fast hash (prefer over stdlib when available)
 try:
@@ -6572,6 +6572,90 @@ def _basic_health(target):
     return report
 
 
+# Alan 11/1/26 - Some USB enclosures handle Linux's fast "UAS" protocol badly:
+# commands time out, the connection resets, and it looks like a failing drive.
+# Telling Linux to use plain usb-storage for that one device (the "u" quirk)
+# usually fixes it. Also spot USB 3 drives stuck at USB 2 speed (bad cable).
+_UAS_ERROR_RE = re.compile(r"uas_eh_|uas-tag|uas_zap|uas_.*abort", re.IGNORECASE)
+
+
+def _read_sys(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def _kernel_log():
+    """This boot's kernel messages, or '' if they can't be read."""
+    out = _run_quiet(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"], timeout=30)
+    return out or _run_quiet(["dmesg"], timeout=30) or ""
+
+
+def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
+    """[(level, headline, explanation)] about how a Linux USB drive is connected."""
+    name = os.path.basename(device)
+    try:
+        scsi = Path(os.path.realpath(f"{sys_root}/block/{name}/device"))
+    except OSError:
+        return []
+    interface = usb_device = None
+    for parent in scsi.parents:
+        if interface is None and (parent / "bInterfaceNumber").exists():
+            interface = parent
+        if (parent / "idVendor").exists():
+            usb_device = parent
+            break
+    if interface is None or usb_device is None:
+        return []
+    driver = os.path.basename(os.path.realpath(interface / "driver"))
+    vid, pid = _read_sys(usb_device / "idVendor"), _read_sys(usb_device / "idProduct")
+    findings = []
+
+    if driver == "uas" and vid and pid:
+        log = _kernel_log() if kernel_log is None else kernel_log
+        port = usb_device.name
+        uas_errors = sum(1 for line in log.splitlines()
+                         if f"[{name}]" in line and _UAS_ERROR_RE.search(line))
+        resets = sum(1 for line in log.splitlines()
+                     if f"usb {port}: reset" in line)
+        if uas_errors or resets >= 2:
+            quirk = f"{vid}:{pid}:u"
+            existing = _read_sys(f"{sys_root}/module/usb_storage/parameters/quirks")
+            value = f"{existing},{quirk}" if existing and quirk not in existing else quirk
+            seen = ", ".join(x for x in (
+                f"{uas_errors} UAS command error(s)" if uas_errors else "",
+                f"{resets} connection reset(s)" if resets else "") if x)
+            findings.append((
+                HEALTH_WARNING,
+                f"The USB connection is resetting ({seen} since this computer started)",
+                "Linux talks to this drive with the fast UAS method, which some USB "
+                "enclosures handle badly: commands time out and the connection resets. It "
+                "looks like a failing drive and can cause read errors. Telling Linux to use "
+                "the older usb-storage method for this one drive usually fixes it:\n"
+                f"  echo {value} | sudo tee /sys/module/usb_storage/parameters/quirks\n"
+                "then unplug the drive and plug it back in. To keep the setting after a "
+                "restart, put this line in /etc/modprobe.d/usb-storage-quirks.conf:\n"
+                f"  options usb-storage quirks={value}\n"
+                "(and rebuild the initramfs if your system loads usb-storage early), or add "
+                f"usb-storage.quirks={value} to the kernel command line.",
+            ))
+
+    speed, version = _read_sys(usb_device / "speed"), _read_sys(usb_device / "version")
+    try:
+        usb3_capable = float(version.split()[0]) >= 3 if version else False
+    except ValueError:
+        usb3_capable = False
+    if usb3_capable and speed == "480":
+        findings.append((
+            HEALTH_NOTE,
+            "Connected at USB 2 speed, although the drive supports USB 3",
+            "Reading and copying will be about ten times slower than they could be. Try "
+            "the drive's own USB 3 cable and a USB 3 port (often blue, or marked SS).",
+        ))
+    return findings
+
+
 def quick_health_check(target, use_sudo=False):
     """Read a drive's health. Uses smartctl when installed, else what the OS reports."""
     if target.kind == "SD card":
@@ -6584,8 +6668,23 @@ def quick_health_check(target, use_sudo=False):
         report = interpret_smart(target, data)
         report.device_type = used_type
         if report.smart_available or platform.system() == "Linux":
+            _add_usb_findings(report)
             return report
-    return _basic_health(target)
+    report = _basic_health(target)
+    _add_usb_findings(report)
+    return report
+
+
+def _add_usb_findings(report):
+    target = report.target
+    if platform.system() != "Linux" or _is_wsl() or target.transport != "usb":
+        return
+    try:
+        findings = usb_connection_findings(target.device)
+    except Exception:
+        return  # advice about the connection is never worth failing a health check
+    for level, headline, explanation in findings:
+        report.add(level, headline, explanation)
 
 
 # Alan 9/28/26 - Every health check is appended to a log kept with the file

@@ -60,6 +60,12 @@ def test_quirk_already_set_is_not_duplicated_or_used_to_drop_others(tmp_path):
     assert "echo 0bc2:2322:u,1058:2627:u |" in explanation
 
 
+def test_quirk_is_merged_into_existing_flags_for_the_same_device(tmp_path):
+    root = _fake_sys(tmp_path, quirks="0bc2:2322:u,1058:2627:m")
+    _, _, explanation = fpd.usb_connection_findings("/dev/sdb", root, UAS_LOG)[0]
+    assert "echo 0bc2:2322:u,1058:2627:mu |" in explanation
+
+
 def test_usb3_drive_enumerated_at_usb2_is_found_from_bos(tmp_path):
     root = _fake_sys(tmp_path, driver="usb-storage", speed="480", version=" 2.10")
     usb = tmp_path / "sys/devices/pci0000:00/usb6/6-1"

@@ -399,10 +399,13 @@ class InventorySearchIndex:
         self.skipped = []
         paths = [Path(path).resolve() for path in inventory_paths]
         signatures = {}
+        unreadable = set()  # supplied but can't be read now: keep what's indexed
         for path in paths:
             try:
                 stat = path.stat()
-            except OSError:
+            except OSError as exc:
+                unreadable.add(str(path))
+                self.skipped.append((path.name, exc.strerror or str(exc)))
                 continue
             signatures[str(path)] = (stat.st_mtime_ns, stat.st_size, path.name)
 
@@ -415,7 +418,7 @@ class InventorySearchIndex:
                 )
             }
             for old_path, row in existing.items():
-                if old_path not in signatures:
+                if old_path not in signatures and old_path not in unreadable:
                     self._remove_source(connection, row[0])
             connection.commit()
 

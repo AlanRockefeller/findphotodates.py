@@ -57,7 +57,7 @@ def test_scan_lists_placeholders_without_reading_them(tmp_path, monkeypatch):
     _patch_exiftool(monkeypatch, {str(root / "real.jpg"): ("2024:01:01 10:00:00", "", "")},
                     queried)
     output = tmp_path / "list.tsv"
-    options = fpd.parse_hash_args(hash_mode="sample")
+    options = fpd.parse_hash_args(hash_mode="sample", no_hash_cache=True)
     assert fpd.run_scan(str(root), str(output), None, quiet=True, hash_options=options,
                         workers=1, min_image_size=0, reuse_other_lists=False)
     rows = _rows(output)
@@ -121,11 +121,28 @@ def test_add_hashes_skips_flagged_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(fpd, "get_content_hash",
                         lambda key, *a, **k: hashed.append(k.get("os_path") or key)
                         or real_hash(key, *a, **k))
-    fpd.add_hashes_to_inventory(str(output), fpd.parse_hash_args(hash_mode="sample"),
+    fpd.add_hashes_to_inventory(str(output), fpd.parse_hash_args(hash_mode="sample", no_hash_cache=True),
                                 quiet=True, path_style="linux")
     assert [os.path.basename(p) for p in hashed] == ["real.jpg"]
     rows = _rows(output)
     assert rows["real.jpg"]["content_hash"] and not rows["cloud.jpg"]["content_hash"]
+
+
+@pytest.mark.skipif(not hasattr(os.stat_result, "st_blocks"), reason="needs st_blocks")
+def test_placeholders_found_when_scan_folder_is_relative(tmp_path, monkeypatch):
+    root = tmp_path / "drive"
+    root.mkdir()
+    with open(root / "cloud.zip", "wb") as handle:
+        handle.truncate(2_000_000)
+    if os.stat(root / "cloud.zip").st_blocks != 0:
+        pytest.skip("this filesystem doesn't make sparse files")
+    _patch_exiftool(monkeypatch, {}, [])
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "list.tsv"
+    assert fpd.run_scan("drive", str(output), None, quiet=True,
+                        hash_options=fpd.parse_hash_args(hash_mode="off"), workers=1,
+                        min_image_size=0, reuse_other_lists=False)
+    assert _rows(output)["cloud.zip"]["flags"] == fpd.FLAG_PLACEHOLDER
 
 
 def test_lists_without_flags_column_are_still_reused(tmp_path, monkeypatch):

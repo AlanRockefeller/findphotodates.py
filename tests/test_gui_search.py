@@ -173,6 +173,16 @@ class InventorySearchTests(unittest.TestCase):
         self.assertEqual([name for name, _ in self.index.skipped], ["Broken.tsv"])
         self.assertEqual(paths(self.index, "list:Archive"), ["/old/family portrait.png"])
 
+    def test_list_that_disappears_is_named_and_its_rows_kept(self):
+        missing = self.camera.parent / "Camera-moved.tsv"
+        self.camera.rename(missing)
+        try:
+            self.index.refresh([self.camera, self.archive])
+            self.assertEqual([name for name, _ in self.index.skipped], ["Camera.tsv"])
+            self.assertIn("/photos/New York/Sunset.JPG", paths(self.index, "sun"))
+        finally:
+            missing.rename(self.camera)
+
     def test_bad_queries_have_useful_errors(self):
         with self.assertRaisesRegex(SearchQueryError, "Unknown field"):
             compile_query("camera:nikon")

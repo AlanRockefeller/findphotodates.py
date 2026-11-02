@@ -4103,7 +4103,8 @@ def run_scan(
                     # Reading a cloud placeholder would download it (or fail), so
                     # it is listed from what the drive reports, without ExifTool
                     # or hashing; a date read while it was stored here is kept.
-                    placeholder = not is_symlink and fs_path in discovery.placeholders
+                    # Same string the producer recorded (the scan folder may be relative).
+                    placeholder = not is_symlink and file in discovery.placeholders
                     archive_type = ("" if placeholder or old_format
                                     else archive_kind(basename, archives))
                     if archive_type:
@@ -6662,8 +6663,21 @@ def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
         if uas_errors or resets >= 2:
             quirk = f"{vid}:{pid}:u"
             existing = _read_sys(f"{sys_root}/module/usb_storage/parameters/quirks")
-            others = [q for q in existing.split(",") if q and q.lower() != quirk.lower()]
-            value = ",".join(others + [quirk])
+            # Linux uses the first entry for a device, so add "u" to any
+            # flags this device already has rather than a second entry.
+            device = f"{vid}:{pid}".lower()
+            entries, merged = [], False
+            for entry in (q.strip() for q in existing.split(",")):
+                if not entry:
+                    continue
+                if entry.lower().rsplit(":", 1)[0] == device and not merged:
+                    flags = entry.rsplit(":", 1)[1] if entry.count(":") == 2 else ""
+                    entry = f"{vid}:{pid}:{flags if 'u' in flags else flags + 'u'}"
+                    merged = True
+                elif entry.lower().rsplit(":", 1)[0] == device:
+                    continue  # a later duplicate would be ignored anyway
+                entries.append(entry)
+            value = ",".join(entries if merged else entries + [quirk])
             seen = ", ".join(x for x in (
                 f"{uas_errors} UAS command error(s)" if uas_errors else "",
                 f"{resets} connection reset(s)" if resets else "") if x)

@@ -70,7 +70,7 @@ def scan_arguments(settings, directory, output, list_dir, *, whole_drive=False):
     args = ["scan", "--directory", str(directory), "--output", str(output),
             "--list-dir", str(list_dir), "--hash", settings.hash_mode,
             "--workers", str(settings.workers), "--min-image-size", str(settings.min_image_size),
-            "--path-style", settings.path_style]
+            "--path-style", settings.path_style, "--archives", settings.archives]
     if settings.only_media:
         args.append("--only-media")
     if settings.locate:
@@ -1295,6 +1295,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.workers_var = ctk.StringVar(value="4")
         self.min_var = ctk.StringVar(value=str(fp.MIN_EXIFTOOL_IMAGE_BYTES // 1000))
         self.path_var = ctk.StringVar(value="Automatic")
+        self.archives_var = ctk.StringVar(value=fp._ARCHIVE_LABELS[fp.DEFAULT_ARCHIVE_MODE])
         options = ctk.CTkFrame(self.advanced, fg_color="transparent")
         options.grid(row=1, column=0, sticky="ew", padx=16)
         options.grid_columnconfigure(1, weight=1)
@@ -1312,8 +1313,10 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._help(options, "retry", 2)
         self._option_row(options, 3, "File fingerprints", self.hash_var, ("Off", "Quick", "Full"), "hash")
         self._option_row(options, 4, "Path style", self.path_var, ("Automatic", "Linux style", "Windows style"), "path_style")
-        self._entry_row(options, 5, "Photos read at the same time (1–32)", self.workers_var, "workers")
-        self._entry_row(options, 6, "Skip images smaller than (KB; 0 = off)", self.min_var, "min_size")
+        self._option_row(options, 5, "Look inside archives", self.archives_var,
+                         tuple(fp._ARCHIVE_LABELS.values()), "archives")
+        self._entry_row(options, 6, "Photos read at the same time (1–32)", self.workers_var, "workers")
+        self._entry_row(options, 7, "Skip images smaller than (KB; 0 = off)", self.min_var, "min_size")
         ctk.CTkLabel(self.advanced, text="Other tasks", anchor="w",
                      font=ctk.CTkFont(size=16, weight="bold")).grid(row=2, column=0, sticky="ew", padx=16, pady=(16, 5))
         tasks = ctk.CTkFrame(self.advanced, fg_color="transparent")
@@ -1477,6 +1480,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.settings.retry_blank_exif = self.retry_var.get()
         self.settings.hash_mode = {"Off": "off", "Quick": "sample", "Full": "full"}[self.hash_var.get()]
         self.settings.path_style = {"Automatic": "auto", "Linux style": "linux", "Windows style": "windows"}[self.path_var.get()]
+        self.settings.archives = next(mode for mode, label in fp._ARCHIVE_LABELS.items()
+                                      if label == self.archives_var.get())
         self.settings.workers = workers
         self.settings.min_image_size = minimum * 1000
         return True

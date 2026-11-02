@@ -168,6 +168,11 @@ def iter_inventory_rows(
                 if not filepath:
                     skipped += 1
                     continue
+                # SAFETY: a cloud placeholder isn't stored on the drive, and a
+                # file inside an archive can't be checked; neither is a backup.
+                if (row.get("flags") or "").strip():
+                    skipped += 1
+                    continue
                 date_taken = row.get("date_taken", "")
                 size_bytes: Optional[int] = None
                 mtime_ns: Optional[int] = None

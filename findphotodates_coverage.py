@@ -101,6 +101,7 @@ class MediaRow:
     mtime_ns: int
     kind: str  # 'photo' or 'video'
     placeholder: bool
+    in_archive: bool  # a file inside a .zip/.tar; it can't be deleted on its own
 
 
 def list_root(path):
@@ -178,7 +179,7 @@ def _media_tuples(path):
             flags = fields[c_flags] if c_flags is not None and c_flags < len(fields) else ""
             yield (filepath, relative, match_name(filepath), size,
                    usable_date(fields[c_date] if c_date is not None else ""), mtime, kind,
-                   is_placeholder(filepath, flags))
+                   is_placeholder(filepath, flags), "archive" in flags)
 
 
 # --- Settings ---------------------------------------------------------------
@@ -424,7 +425,7 @@ def build_coverage(file_lists, settings, health_rows=(), today=None, progress=No
         bit = 1 << number
         if bit & gone_mask:
             continue
-        for _, _, name, size, date, _, _, placeholder in _media_tuples(fl.path):
+        for _, _, name, size, date, _, _, placeholder, _ in _media_tuples(fl.path):
             if placeholder:
                 continue
             dates = index_by_key[(name, size)]
@@ -437,7 +438,7 @@ def build_coverage(file_lists, settings, health_rows=(), today=None, progress=No
         if coverage.role == ROLE_GONE:
             continue
         bit = 1 << number
-        for _, relative, name, size, date, _, _, placeholder in _media_tuples(fl.path):
+        for _, relative, name, size, date, _, _, placeholder, _ in _media_tuples(fl.path):
             coverage.total.add(size)
             if placeholder:
                 coverage.placeholders.add(size)
@@ -603,8 +604,11 @@ def plan_cleanup(file_lists, settings, target, keep_folders=DEFAULT_KEEP_FOLDERS
     for number, fl in enumerate(others, 1):
         if progress:
             progress(number, len(others) + 1, list_display_name(fl))
-        for path, relative, name, size, date, mtime, _, placeholder in _media_tuples(fl.path):
-            if placeholder or not in_keep_folder(relative, keep_folders, library_days):
+        for path, relative, name, size, date, mtime, _, placeholder, archived in \
+                _media_tuples(fl.path):
+            # A copy inside an archive can't be checked on disk, so it doesn't count here.
+            if placeholder or archived or not in_keep_folder(relative, keep_folders,
+                                                             library_days):
                 continue
             now = _current_path(fl, relative)
             kept[(name, size)].append((date, mtime, now or path, now is not None))
@@ -612,8 +616,9 @@ def plan_cleanup(file_lists, settings, target, keep_folders=DEFAULT_KEEP_FOLDERS
     plan = CleanupPlan(drive_name=list_display_name(target_fl))
     if progress:
         progress(len(others) + 1, len(others) + 1, plan.drive_name)
-    for _, relative, name, size, date, mtime, _, placeholder in _media_tuples(target_fl.path):
-        if placeholder or in_keep_folder(relative, keep_folders, library_days):
+    for _, relative, name, size, date, mtime, _, placeholder, archived in \
+            _media_tuples(target_fl.path):
+        if placeholder or archived or in_keep_folder(relative, keep_folders, library_days):
             continue
         matches = [(p, connected) for d, m, p, connected in kept.get((name, size), ())
                    if (date and d == date) or (not date and not d and abs(m - mtime) <= 2e9)]

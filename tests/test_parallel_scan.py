@@ -105,6 +105,7 @@ def _expected_inventory_bytes(root, hash_options):
                 gps_lon or "",
                 "",
                 "",
+                "",
             ]
         )
 

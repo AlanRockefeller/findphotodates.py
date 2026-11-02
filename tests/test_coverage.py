@@ -3,6 +3,7 @@ import datetime
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import findphotodates as fp
@@ -264,6 +265,26 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue((cards / "a.mp4").exists())
         counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv", trust_lists=True)
         self.assertEqual(counts["deleted"], 1)
+
+    def test_cleanup_keeps_file_when_kept_copy_is_now_cloud_only(self):
+        self.make_drive("Library", {"Important/a.mp4": ("2020:01:01 00:00:00", 20)})
+        cards = self.make_drive("Cards", {"a.mp4": ("2020:01:01 00:00:00", 20)})
+        plan = cov.plan_cleanup(self.connected_lists("Library", "Cards"),
+                                cov.CoverageSettings(), Path(self.folder) / "Cards.tsv")
+        log = Path(self.folder) / "log.tsv"
+        with unittest.mock.patch.object(fp, "is_placeholder_stat", lambda st: True):
+            counts, _ = cov.run_cleanup(plan, log)
+        self.assertEqual(counts["kept: other copy not found on disk"], 1)
+        self.assertTrue((cards / "a.mp4").exists())
+        self.assertEqual(len(log.read_text().splitlines()), 2)  # written straight away
+
+    def test_png_and_webp_photos_count_but_small_graphics_do_not(self):
+        self.make_drive("Phone", {"Pictures/screenshot.png": ("", 2_000_000),
+                                  "Pictures/photo.webp": ("", 900_000),
+                                  "Pictures/icon.png": ("", 4_000)})
+        drives = self.by_name(cov.build_coverage(fp.find_file_lists(self.folder),
+                                                 cov.CoverageSettings()))
+        self.assertEqual(drives["Phone"].total.files, 2)
 
     def test_cleanup_requires_connected_target(self):
         self.make_drive("Cards", {"a.mp4": ("", 20)})

@@ -327,7 +327,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         def work():
             try:
                 changed, total = self.index.refresh(paths, progress=progress)
-                self.events.put(("ready", changed, total))
+                self.events.put(("ready", changed, total, list(self.index.skipped)))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
         threading.Thread(target=work, daemon=True).start()
@@ -511,11 +511,13 @@ class FileSearchDialog(ctk.CTkToplevel):
                     detail = f" — {rows:,} files" if rows is not None else ""
                     self.status_var.set(f"Indexing {name} ({number}/{total}){detail}")
                 elif kind == "ready":
-                    _, changed, total = event
+                    _, changed, total, skipped = event
                     self.index_ready = True
                     self.search_btn.configure(state="normal")
                     action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
-                    self.status_var.set(f"{action}{total:,} files ready to search.")
+                    problem = (" Couldn't read " + ", ".join(name for name, _ in skipped) + "."
+                               if skipped else "")
+                    self.status_var.set(f"{action}{total:,} files ready to search.{problem}")
                     if (self.pending_search or self.query_var.get().strip()
                             or self.date_var.get().strip()):
                         self.pending_search = False

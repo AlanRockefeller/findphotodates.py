@@ -287,9 +287,11 @@ def compile_query(query, *, fts_enabled=True):
                     "Text fields support :, =, and !=; ranges work with date, size, modified, lat, and lon."
                 )
             normalized = value.replace("-", ":")
-            sql = f"f.date_taken {operator} ?"
-            conditions.append(f"NOT ({sql})" if negative else sql)
-            params.append(normalized)
+            # Compare only as much of the date as the query gives, so
+            # date<=2024-06-30 includes that whole day; undated rows never match.
+            sql = f"f.date_taken != '' AND substr(f.date_taken, 1, ?) {operator} ?"
+            conditions.append(f"NOT ({sql})" if negative else f"({sql})")
+            params.extend([len(normalized), normalized])
         else:
             if field == "date_taken":
                 value = value.replace("-", ":")
@@ -392,7 +394,9 @@ class InventorySearchIndex:
         connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
 
     def refresh(self, inventory_paths, progress=None):
-        """Synchronize the index and return (changed lists, total indexed rows)."""
+        """Synchronize the index and return (changed lists, total indexed rows).
+        Lists that can't be read are skipped and named in self.skipped."""
+        self.skipped = []
         paths = [Path(path).resolve() for path in inventory_paths]
         signatures = {}
         for path in paths:
@@ -413,6 +417,7 @@ class InventorySearchIndex:
             for old_path, row in existing.items():
                 if old_path not in signatures:
                     self._remove_source(connection, row[0])
+            connection.commit()
 
             total_lists = len(signatures)
             for list_number, (path_text, signature) in enumerate(signatures.items(), 1):
@@ -434,9 +439,14 @@ class InventorySearchIndex:
                     row_progress = lambda n, number=list_number, name=signature[2]: (
                         progress(number, total_lists, name, n)
                     )
-                count = self._import_inventory(
-                    connection, source_id, Path(path_text), signature[2], row_progress
-                )
+                try:
+                    count = self._import_inventory(
+                        connection, source_id, Path(path_text), signature[2], row_progress
+                    )
+                except (SearchQueryError, OSError, csv.Error, UnicodeError) as exc:
+                    connection.rollback()  # leaves this list as it was before
+                    self.skipped.append((signature[2], str(exc)))
+                    continue
                 connection.execute(
                     "UPDATE sources SET row_count=? WHERE id=?", (count, source_id)
                 )

@@ -75,6 +75,59 @@ def test_scan_lists_placeholders_without_reading_them(tmp_path, monkeypatch):
     assert queried == []
 
 
+@pytest.mark.skipif(not hasattr(os.stat_result, "st_blocks"), reason="needs st_blocks")
+def test_downloaded_placeholder_is_read_on_the_next_scan(tmp_path, monkeypatch):
+    root = tmp_path / "drive"
+    root.mkdir()
+    photo = root / "cloud.jpg"
+    with open(photo, "wb") as handle:
+        handle.truncate(2_000_000)
+    if os.stat(photo).st_blocks != 0:
+        pytest.skip("this filesystem doesn't make sparse files")
+    st = os.stat(photo)
+    queried = []
+    _patch_exiftool(monkeypatch, {str(photo): ("2024:01:01 10:00:00", "", "")}, queried)
+    output = tmp_path / "list.tsv"
+    options = fpd.parse_hash_args(hash_mode="off")
+    assert fpd.run_scan(str(root), str(output), None, quiet=True, hash_options=options,
+                        workers=1, min_image_size=0, reuse_other_lists=False)
+    assert queried == []
+    # "Downloaded": same size and time, but the data is now on the drive.
+    photo.write_bytes(b"y" * 2_000_000)
+    os.utime(photo, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert fpd.run_scan(str(root), str(output), None, quiet=True, hash_options=options,
+                        workers=1, min_image_size=0, reuse_other_lists=False)
+    assert queried == [str(photo)]
+    row = _rows(output)["cloud.jpg"]
+    assert (row["flags"], row["date_taken"]) == ("", "2024:01:01 10:00:00")
+
+
+def test_add_hashes_skips_flagged_rows(tmp_path, monkeypatch):
+    root = tmp_path / "drive"
+    root.mkdir()
+    real, cloud = root / "real.jpg", root / "cloud.jpg"
+    real.write_bytes(b"x" * 300)
+    cloud.write_bytes(b"z" * 300)
+    output = tmp_path / "list.tsv"
+    with open(output, "w", encoding="utf-8", newline="") as handle:
+        handle.write(f"# inventory_root={root}\n{fpd.TSV_HEADER}\n")
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(fpd.TSV_COLUMNS)
+        for path, flags in ((real, ""), (cloud, fpd.FLAG_PLACEHOLDER)):
+            st = path.stat()
+            writer.writerow([str(path), "", st.st_size, st.st_mtime_ns, "", "", "", "", flags])
+    hashed = []
+    real_hash = fpd.get_content_hash
+    monkeypatch.setattr(fpd, "get_content_hash",
+                        lambda key, *a, **k: hashed.append(k.get("os_path") or key)
+                        or real_hash(key, *a, **k))
+    fpd.add_hashes_to_inventory(str(output), fpd.parse_hash_args(hash_mode="sample"),
+                                quiet=True, path_style="linux")
+    assert [os.path.basename(p) for p in hashed] == ["real.jpg"]
+    rows = _rows(output)
+    assert rows["real.jpg"]["content_hash"] and not rows["cloud.jpg"]["content_hash"]
+
+
 def test_lists_without_flags_column_are_still_reused(tmp_path, monkeypatch):
     root = tmp_path / "drive"
     root.mkdir()

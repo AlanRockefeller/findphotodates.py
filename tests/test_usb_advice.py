@@ -54,6 +54,23 @@ def test_quirk_keeps_existing_entries(tmp_path):
     assert "echo 0bc2:2322:u,1058:2627:u |" in explanation
 
 
+def test_quirk_already_set_is_not_duplicated_or_used_to_drop_others(tmp_path):
+    root = _fake_sys(tmp_path, quirks="0bc2:2322:u,1058:2627:u")
+    _, _, explanation = fpd.usb_connection_findings("/dev/sdb", root, UAS_LOG)[0]
+    assert "echo 0bc2:2322:u,1058:2627:u |" in explanation
+
+
+def test_usb3_drive_enumerated_at_usb2_is_found_from_bos(tmp_path):
+    root = _fake_sys(tmp_path, driver="usb-storage", speed="480", version=" 2.10")
+    usb = tmp_path / "sys/devices/pci0000:00/usb6/6-1"
+    (usb / "bos_descriptors").write_bytes(bytes.fromhex(
+        "050f1600020710020e0f00000a1003000e00010a2000"))
+    findings = fpd.usb_connection_findings("/dev/sdb", root, "")
+    assert [f[0] for f in findings] == [fpd.HEALTH_NOTE]
+    (usb / "bos_descriptors").write_bytes(bytes.fromhex("050f0c000107100206000000"))
+    assert fpd.usb_connection_findings("/dev/sdb", root, "") == []
+
+
 def test_no_advice_without_errors_or_with_usb_storage(tmp_path):
     assert fpd.usb_connection_findings("/dev/sdb", _fake_sys(tmp_path), "") == []
     other = tmp_path / "other"

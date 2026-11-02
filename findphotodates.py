@@ -1040,6 +1040,13 @@ def archive_kind(name, mode=DEFAULT_ARCHIVE_MODE):
     return ""
 
 
+def archive_extensions(mode=DEFAULT_ARCHIVE_MODE):
+    """Extensions of the archives *mode* looks inside (for the file-type filter)."""
+    if mode == "all":
+        return {"zip"} | {suffix.lstrip(".") for suffix in _TAR_SUFFIXES}
+    return {"zip"} if mode == "zip" else set()
+
+
 def list_archive(path, kind):
     """(path inside the archive, size, mtime_ns) for each file in an archive.
     Only the archive's directory is read for a .zip; nothing is extracted."""
@@ -2199,6 +2206,8 @@ def _build_moved_index(cache):
     """
     index = {}
     for key, entry in cache.items():
+        if entry.get("flags"):
+            continue  # placeholders and files inside archives were never read
         name = key.rsplit("/", 1)[-1].lower()
         if not entry.get("size_bytes") or name.rsplit(".", 1)[-1] not in EXIFTOOL_EXTENSIONS:
             continue
@@ -3547,7 +3556,12 @@ def run_scan(
     discovery = _DiscoveryState()
     producer = threading.Thread(
         target=_discovery_producer,
-        args=(file_queue, directory, extensions, discovery, debug),
+        # Archives are found even when only some file types are listed; the
+        # filter is applied to the files inside them instead.
+        args=(file_queue, directory,
+              extensions if extensions is None or old_format
+              else set(extensions) | archive_extensions(archives),
+              discovery, debug),
         daemon=True,
     )
     producer.start()
@@ -4108,8 +4122,13 @@ def run_scan(
                                     f"Debug: Retrying blank EXIF cache row: {out_path}"
                                 )
 
+                    # A placeholder that has since been downloaded is read now.
+                    downloaded = (cache_valid and not placeholder and FLAG_PLACEHOLDER
+                                  in (cached_entry.get("flags") or ""))
                     source_entry = (
-                        cached_entry if cache_valid and not retry_cached_blank_exif else None
+                        cached_entry
+                        if cache_valid and not retry_cached_blank_exif and not downloaded
+                        else None
                     )
                     reused_moved = False
                     if (
@@ -4708,9 +4727,7 @@ def add_hashes_to_inventory(
         with _StatusOutputPauseController(
             enabled=(not quiet and _IS_TTY)
         ) as status_pause:
-            for row in rows:
-                if row.get("content_hash", "").strip():
-                    continue  # already has hash
+            for row in need_hash:  # rows without a hash that aren't flagged
 
                 filepath = row.get("filepath", "")
                 if not filepath:
@@ -6586,6 +6603,29 @@ def _read_sys(path):
         return ""
 
 
+def _usb3_capable(usb_device):
+    """True when a USB device can run at USB 3 speed. A USB 3 device plugged in
+    over USB 2 reports version 2.10, so its SuperSpeed capability is read from
+    the BOS descriptor; the version is the fallback when that isn't available."""
+    try:
+        bos = Path(usb_device, "bos_descriptors").read_bytes()
+    except OSError:
+        bos = b""
+    position = bos[0] if len(bos) >= 5 and bos[1] == 0x0F else 0
+    while position and position + 3 <= len(bos):
+        length = bos[position]
+        if length < 3:
+            break
+        if bos[position + 1] == 0x10 and bos[position + 2] in (0x03, 0x0A):
+            return True  # SuperSpeed or SuperSpeedPlus device capability
+        position += length
+    version = _read_sys(Path(usb_device, "version"))
+    try:
+        return float(version.split()[0]) >= 3 if version else False
+    except ValueError:
+        return False
+
+
 def _kernel_log():
     """This boot's kernel messages, or '' if they can't be read."""
     out = _run_quiet(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"], timeout=30)
@@ -6622,7 +6662,8 @@ def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
         if uas_errors or resets >= 2:
             quirk = f"{vid}:{pid}:u"
             existing = _read_sys(f"{sys_root}/module/usb_storage/parameters/quirks")
-            value = f"{existing},{quirk}" if existing and quirk not in existing else quirk
+            others = [q for q in existing.split(",") if q and q.lower() != quirk.lower()]
+            value = ",".join(others + [quirk])
             seen = ", ".join(x for x in (
                 f"{uas_errors} UAS command error(s)" if uas_errors else "",
                 f"{resets} connection reset(s)" if resets else "") if x)
@@ -6641,12 +6682,7 @@ def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
                 f"usb-storage.quirks={value} to the kernel command line.",
             ))
 
-    speed, version = _read_sys(usb_device / "speed"), _read_sys(usb_device / "version")
-    try:
-        usb3_capable = float(version.split()[0]) >= 3 if version else False
-    except ValueError:
-        usb3_capable = False
-    if usb3_capable and speed == "480":
+    if _read_sys(usb_device / "speed") == "480" and _usb3_capable(usb_device):
         findings.append((
             HEALTH_NOTE,
             "Connected at USB 2 speed, although the drive supports USB 3",

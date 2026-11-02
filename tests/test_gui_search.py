@@ -156,6 +156,23 @@ class InventorySearchTests(unittest.TestCase):
         self.assertEqual(self.index.refresh([self.camera, self.archive]), (1, 2))
         self.assertEqual(paths(self.index, "list:Camera"), ["/new.mov"])
 
+    def test_date_ranges_treat_a_day_as_a_whole_day(self):
+        self.assertIn("/photos/New York/Sunset.JPG", paths(self.index, "date<=2024-06-30"))
+        self.assertNotIn("/photos/New York/Sunset.JPG", paths(self.index, "date>2024-06-30"))
+        self.assertIn("/photos/New York/Sunset.JPG", paths(self.index, "date>=2024-06"))
+        self.assertNotIn("/docs/report.pdf", paths(self.index, "date<2000"))
+        self.assertNotIn("/docs/report.pdf", paths(self.index, "date<=2024-06"))
+
+    def test_unreadable_list_is_skipped_and_others_are_indexed(self):
+        broken = self.camera.parent / "Broken.tsv"
+        broken.write_text("", encoding="utf-8")
+        stat = self.archive.stat()
+        os.utime(self.archive, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        changed, total = self.index.refresh([broken, self.camera, self.archive])
+        self.assertEqual((changed, total), (1, 3))
+        self.assertEqual([name for name, _ in self.index.skipped], ["Broken.tsv"])
+        self.assertEqual(paths(self.index, "list:Archive"), ["/old/family portrait.png"])
+
     def test_bad_queries_have_useful_errors(self):
         with self.assertRaisesRegex(SearchQueryError, "Unknown field"):
             compile_query("camera:nikon")

@@ -22,11 +22,14 @@ from pathlib import Path
 
 PHOTO_EXTENSIONS = frozenset({
     "jpg", "jpeg", "nef", "orf", "cr2", "cr3", "arw", "dng", "rw2", "raf", "srw",
-    "pef", "x3f", "tif", "tiff", "heic", "heif", "psd",
+    "pef", "x3f", "tif", "tiff", "heic", "heif", "psd", "png", "webp", "avif", "jxl",
 })
+# Below this size these formats are almost always icons and web graphics.
+_SMALL_IMAGE_EXTENSIONS = frozenset({"png", "webp", "avif"})
+_SMALL_IMAGE_BYTES = 100_000
 VIDEO_EXTENSIONS = frozenset({
     "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mts", "m2ts",
-    "vob", "mpg", "mpeg",
+    "vob", "mpg", "mpeg", "ts",
 })
 
 ROLE_AUTO = "auto"
@@ -170,7 +173,8 @@ def _media_tuples(path):
                 size = int(fields[c_size])
             except (TypeError, ValueError):
                 continue
-            if size <= 0:
+            if size <= 0 or (size < _SMALL_IMAGE_BYTES and filepath.rsplit(".", 1)[-1].lower()
+                                 in _SMALL_IMAGE_EXTENSIONS):
                 continue
             try:
                 mtime = int(fields[c_mtime])
@@ -678,6 +682,8 @@ def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
     import os
     import time
 
+    from findphotodates import is_placeholder_stat
+
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     new = not log_path.exists()
@@ -693,11 +699,13 @@ def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
             for kept_path, connected in item.kept:
                 if connected:
                     try:
-                        if os.path.getsize(kept_path) == item.size:
-                            keep = kept_path
-                            break
+                        kept_stat = os.stat(kept_path)
                     except OSError:
                         continue
+                    # A copy that's now only in the cloud doesn't count.
+                    if kept_stat.st_size == item.size and not is_placeholder_stat(kept_stat):
+                        keep = kept_path
+                        break
                 elif trust_lists:
                     keep = kept_path
                     break
@@ -723,7 +731,7 @@ def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
             counts[status] += 1
             writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), status, item.path, item.size,
                              item.date, keep or item.kept[0][0]])
+            handle.flush()  # the log is the only record of what was deleted
             if progress and (number % 200 == 0 or number == len(plan.items)):
-                handle.flush()
                 progress(number, len(plan.items), freed)
     return counts, freed

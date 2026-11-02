@@ -78,6 +78,40 @@ def test_all_mode_lists_tar_archives_and_respects_extensions(tmp_path, monkeypat
     assert "export.zip/notes.txt" not in rows  # not a media file
 
 
+def test_archives_are_found_when_only_media_is_listed(tmp_path, monkeypatch):
+    root = tmp_path / "drive"
+    _make_archives(root)
+    rows = _scan(root, tmp_path / "list.tsv", monkeypatch, extensions=fpd.MEDIA_EXTENSIONS)
+    assert "export.zip/photos/IMG_1.jpg" in rows
+    assert "export.zip/notes.txt" not in rows
+    assert not any(k.startswith("backup.tgz") for k in rows)
+
+
+def test_extracted_copy_is_read_not_matched_to_its_archive_row(tmp_path, monkeypatch):
+    root = tmp_path / "drive"
+    _make_archives(root)
+    output = tmp_path / "list.tsv"
+    _scan(root, output, monkeypatch)
+    inner = next(r for k, r in _scan(root, output, monkeypatch).items()
+                 if k == "export.zip/photos/IMG_1.jpg")
+    extracted = root / "IMG_1.jpg"
+    extracted.write_bytes(b"a" * 1234)
+    mtime = int(inner["mtime_ns"])
+    os.utime(extracted, ns=(mtime, mtime))
+    queried = []
+
+    class Recording(NoExifTool):
+        def batch_query(self, filepaths, fast2=False):
+            queried.extend(filepaths)
+            return super().batch_query(filepaths, fast2)
+
+    monkeypatch.setattr(fpd, "ExifToolPersistent", Recording)
+    assert fpd.run_scan(str(root), str(output), None, quiet=True,
+                        hash_options=fpd.parse_hash_args(hash_mode="off"), workers=1,
+                        min_image_size=0, reuse_other_lists=False)
+    assert str(extracted) in queried
+
+
 def test_unchanged_archives_are_not_opened_again(tmp_path, monkeypatch):
     root = tmp_path / "drive"
     _make_archives(root)

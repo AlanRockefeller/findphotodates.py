@@ -37,6 +37,7 @@ except (ImportError, OSError) as exc:
     raise
 
 import findphotodates as fp
+import findphotodates_coverage as coverage
 from findphotodates_search import (
     InventorySearchIndex,
     SearchQueryError,
@@ -544,6 +545,310 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class CoverageDialog(ctk.CTkToplevel):
+    """Which photos and videos have a second copy, drive by drive."""
+
+    COLUMNS = (("drive", "Drive", 190), ("connected", "Connected", 90),
+               ("role", "Role", 150), ("backblaze", "Backblaze", 125),
+               ("total", "Photos & videos", 130), ("only", "Only copy", 120),
+               ("weak", "Only on weak drives", 150), ("verdict", "Summary", 330))
+
+    def __init__(self, parent, file_lists):
+        super().__init__(parent)
+        self.parent = parent
+        self.file_lists = list(file_lists)
+        self.events = queue.Queue()
+        self.drives = []
+        self.settings = fp._coverage_settings()
+        self.generation = 0
+        self._after_id = None
+        self._closed = False
+
+        self.title("Coverage")
+        self.geometry("1180x720")
+        self.minsize(820, 520)
+        self.transient(parent)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._build_controls()
+        self._build_table()
+        self._build_details()
+        self._after_id = self.after(75, self._drain_events)
+        self._calculate()
+
+    def _build_controls(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(15, 5))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Do your photos and videos have a second copy?", anchor="w",
+                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(head, text="Help", width=80, fg_color="transparent", border_width=1,
+                      command=self._show_help).grid(row=0, column=1, padx=(8, 0))
+        controls = ctk.CTkFrame(self, corner_radius=8)
+        controls.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 8))
+        controls.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(controls, text="Backblaze version history:",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=(12, 7), pady=10)
+        self.history_var = ctk.StringVar(
+            value=coverage.BACKBLAZE_HISTORY_CHOICES[self.settings.backblaze_history_days])
+        ctk.CTkOptionMenu(controls, variable=self.history_var, width=110,
+                          values=list(coverage.BACKBLAZE_HISTORY_CHOICES.values()),
+                          command=self._set_history).grid(row=0, column=1, pady=10)
+        self.recalc_btn = ctk.CTkButton(controls, text="Recalculate", width=110,
+                                        fg_color="transparent", border_width=1,
+                                        command=self._calculate)
+        self.recalc_btn.grid(row=0, column=2, padx=(12, 0), pady=10)
+        self.status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
+                     text_color=("gray35", "gray72")).grid(row=0, column=3, sticky="ew", padx=12)
+        self.progress = ctk.CTkProgressBar(controls, width=160)
+        self.progress.grid(row=0, column=4, padx=(0, 12))
+        self.progress.set(0)
+
+    def _build_table(self):
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        style = ttk.Style(self)
+        dark = ctk.get_appearance_mode() == "Dark"
+        scale = self.parent.gui_scale
+        self.tree_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.tree_font.configure(size=max(10, round(11 * scale)))
+        heading_font = tkfont.nametofont("TkHeadingFont").copy()
+        heading_font.configure(size=max(10, round(11 * scale)), weight="bold")
+        style.configure("Coverage.Treeview", rowheight=round(27 * scale), font=self.tree_font,
+                        background="#242424" if dark else "#ffffff",
+                        fieldbackground="#242424" if dark else "#ffffff",
+                        foreground="#f2f2f2" if dark else "#202020")
+        style.configure("Coverage.Treeview.Heading", font=heading_font,
+                        background="#333333" if dark else "#e6e6e6",
+                        foreground="#f2f2f2" if dark else "#202020")
+        style.map("Coverage.Treeview", background=[("selected", "#1f6aa5")],
+                  foreground=[("selected", "#ffffff")])
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLUMNS], show="headings",
+                                 style="Coverage.Treeview", selectmode="browse")
+        for column, title, width in self.COLUMNS:
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale),
+                             stretch=column == "verdict")
+        self.tree.tag_configure("risk", foreground="#e0603a" if dark else "#b3381a")
+        self.tree.tag_configure("gone", foreground="gray55")
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vertical.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed)
+
+    def _build_details(self):
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        frame.grid_columnconfigure(0, weight=1)
+        self.detail = ctk.CTkTextbox(frame, height=190, wrap="none",
+                                     font=ctk.CTkFont(family="Courier", size=14))
+        self.detail.grid(row=0, column=0, rowspan=4, sticky="nsew", padx=(10, 8), pady=10)
+        self.detail.insert("1.0", "Select a drive to see where its only copies are.")
+        self.detail.configure(state="disabled")
+        side = ctk.CTkFrame(frame, fg_color="transparent")
+        side.grid(row=0, column=1, sticky="n", padx=(0, 12), pady=10)
+        ctk.CTkLabel(side, text="This drive is:", anchor="w",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w")
+        self.role_var = ctk.StringVar(value="")
+        self.role_menu = ctk.CTkOptionMenu(
+            side, variable=self.role_var, width=200,
+            values=[coverage.ROLE_LABELS[r] for r in coverage.ROLES],
+            command=self._set_role, state="disabled")
+        self.role_menu.grid(row=1, column=0, sticky="w", pady=(3, 8))
+        self.backblaze_var = ctk.BooleanVar(value=False)
+        self.backblaze_box = ctk.CTkCheckBox(side, text="Backed up by Backblaze",
+                                             variable=self.backblaze_var,
+                                             command=self._set_backblaze, state="disabled")
+        self.backblaze_box.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        ctk.CTkButton(side, text="Copy report", width=200, fg_color="transparent",
+                      border_width=1, command=self._copy_report).grid(row=3, column=0, sticky="w")
+
+    def _show_help(self):
+        messagebox.showinfo(
+            "Coverage",
+            "This compares all your file lists, including lists of drives that aren't "
+            "connected. A photo or video has a copy when another drive has a file with the "
+            "same name and size, and the same date taken when both have one. Lightroom's "
+            "date prefix (YYYYMMDD-) is ignored.\n\n"
+            "Roles:\n"
+            "  Automatic: kept, unless its last health check found bad sectors or read "
+            "errors.\n"
+            "  Keep: a drive you rely on.\n"
+            "  Weak: failing or about to be retired. Copies on it don't count as safe.\n"
+            "  Gone: wiped or lost. Its list is ignored.\n\n"
+            "Backblaze keeps a disconnected drive's backup for about as long as your "
+            "version history (30 days, or 1 year with the upgrade). Connect each external "
+            "drive before then so Backblaze keeps its backup.\n\n"
+            "Placeholders, such as phone photos shown by Windows Phone Link, aren't really "
+            "stored on the drive and never count as copies.",
+            parent=self,
+        )
+
+    def _calculate(self):
+        self.generation += 1
+        generation = self.generation
+        self.recalc_btn.configure(state="disabled")
+        self.status_var.set("Comparing every file list…")
+        self.progress.set(0)
+        settings = fp._coverage_settings()
+        health = fp.read_health_log(self.parent.list_dir)
+        lists = self.file_lists
+
+        def progress(step, total, name):
+            self.events.put(("progress", generation, step / total, name))
+
+        def work():
+            try:
+                drives = coverage.build_coverage(lists, settings, health, progress=progress)
+                self.events.put(("done", generation, drives, settings))
+            except Exception as exc:
+                self.events.put(("error", generation, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render(self):
+        selected = self._selected()
+        selected_path = selected.list_path if selected else None
+        self.tree.delete(*self.tree.get_children())
+        for number, drive in enumerate(self.drives):
+            if drive.role == coverage.ROLE_GONE:
+                tags = ("gone",)
+            elif (drive.at_risk.files and drive.role == coverage.ROLE_WEAK) or \
+                    drive.backblaze_status in ("expired", "unprotected", "soon"):
+                tags = ("risk",)
+            else:
+                tags = ()
+            gone = drive.role == coverage.ROLE_GONE
+            values = (
+                drive.name,
+                "Yes" if drive.connected else "No",
+                coverage.ROLE_LABELS[drive.role],
+                {"ok": "OK", "soon": "Connect soon", "expired": "Expired",
+                 "unprotected": "Not backed up"}.get(drive.backblaze_status,
+                                                     "Yes" if drive.setting.backblaze else "No"),
+                "" if gone else f"{drive.total.files:,}",
+                "" if gone else coverage.human_size(drive.only_copy.bytes) if drive.only_copy.files else "",
+                "" if gone else coverage.human_size(drive.weak_only.bytes) if drive.weak_only.files else "",
+                coverage.verdict(drive),
+            )
+            self.tree.insert("", "end", iid=str(number), values=values, tags=tags)
+            if drive.list_path == selected_path:
+                self.tree.selection_set(str(number))
+
+    def _selected(self):
+        selection = self.tree.selection()
+        if not selection or int(selection[0]) >= len(self.drives):
+            return None
+        return self.drives[int(selection[0])]
+
+    def _selection_changed(self, _event=None):
+        drive = self._selected()
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        if drive is None:
+            self.role_menu.configure(state="disabled")
+            self.backblaze_box.configure(state="disabled")
+            self.detail.configure(state="disabled")
+            return
+        self.detail.insert("1.0", coverage.format_drive(drive, folders=20))
+        self.detail.configure(state="disabled")
+        self.role_var.set(coverage.ROLE_LABELS[drive.setting.role])
+        self.backblaze_var.set(drive.setting.backblaze)
+        self.role_menu.configure(state="normal")
+        self.backblaze_box.configure(state="normal")
+
+    def _save_settings(self):
+        fp._save_coverage_settings(self.settings)
+
+    def _refresh_backblaze(self):
+        today = _datetime.date.today()
+        for drive in self.drives:
+            drive.backblaze_status = drive.backblaze_message = ""
+            coverage.backblaze_status(drive, self.settings.backblaze_history_days, today)
+        self._render()
+        self._selection_changed()
+
+    def _set_history(self, label):
+        days = next(d for d, text in coverage.BACKBLAZE_HISTORY_CHOICES.items() if text == label)
+        self.settings.backblaze_history_days = days
+        self._save_settings()
+        self._refresh_backblaze()
+
+    def _set_role(self, label):
+        drive = self._selected()
+        if drive is None:
+            return
+        role = next(r for r, text in coverage.ROLE_LABELS.items() if text == label)
+        self.settings.drive(drive.list_path.name).role = role
+        self._save_settings()
+        self._calculate()  # which copies count as safe depends on every drive's role
+
+    def _set_backblaze(self):
+        drive = self._selected()
+        if drive is None:
+            return
+        setting = self.settings.drive(drive.list_path.name)
+        setting.backblaze = bool(self.backblaze_var.get())
+        drive.setting = setting
+        self._save_settings()
+        self._refresh_backblaze()
+
+    def _copy_report(self):
+        if not self.drives:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(coverage.format_report(self.drives, self.settings, 20))
+        self.status_var.set("Report copied.")
+
+    def _drain_events(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind, generation = event[0], event[1]
+                if generation != self.generation:
+                    continue
+                if kind == "progress":
+                    _, _, fraction, name = event
+                    self.progress.set(fraction)
+                    self.status_var.set(f"Reading {name}…")
+                elif kind == "done":
+                    _, _, self.drives, self.settings = event
+                    self.progress.set(1)
+                    self.recalc_btn.configure(state="normal")
+                    retire = [d.name for d in self.drives
+                              if d.role == coverage.ROLE_WEAK and d.can_retire]
+                    attention = [d for d in self.drives if d.backblaze_status in
+                                 ("soon", "expired", "unprotected")]
+                    parts = [f"{len(self.drives)} drives compared."]
+                    if retire:
+                        parts.append("Safe to retire: " + ", ".join(retire) + ".")
+                    if attention:
+                        parts.append(f"{len(attention)} need attention for Backblaze.")
+                    self.status_var.set(" ".join(parts))
+                    self._render()
+                    self._selection_changed()
+                elif kind == "error":
+                    self.recalc_btn.configure(state="normal")
+                    self.status_var.set("Couldn't compare the lists: " + event[2])
+        except queue.Empty:
+            pass
+        self._after_id = self.after(100, self._drain_events)
+
+    def _close(self):
+        self._closed = True
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        if getattr(self.parent, "coverage_dialog", None) is self:
+            self.parent.coverage_dialog = None
+        self.destroy()
+
+
 class FindPhotoDatesGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -589,6 +894,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._compact_height = None
         self._hover_help = []
         self.search_dialog = None
+        self.coverage_dialog = None
 
         self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.body.grid(row=0, column=0, sticky="nsew")
@@ -679,7 +985,8 @@ class FindPhotoDatesGUI(ctk.CTk):
                      font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="ew")
         self._text_button(footer, "Open folder", lambda: self._open_path(self.list_dir)).grid(row=0, column=1)
         self._text_button(footer, "Search files", self._show_search).grid(row=0, column=2)
-        self._text_button(footer, "Show all lists", self._show_lists).grid(row=0, column=3)
+        self._text_button(footer, "Coverage", self._show_coverage).grid(row=0, column=3)
+        self._text_button(footer, "Show all lists", self._show_lists).grid(row=0, column=4)
 
     def _build_actions(self):
         frame = ctk.CTkFrame(self.body, fg_color="transparent")
@@ -840,6 +1147,7 @@ class FindPhotoDatesGUI(ctk.CTk):
                 drives = fp.detect_drives()
                 lists = fp.find_file_lists(self.list_dir)
                 fp.match_lists_to_drives(lists, drives)
+                fp.remember_connected_drives(lists)
                 self.events.put(("refresh", drives, lists, None))
             except Exception as exc:
                 self.events.put(("refresh", [], [], str(exc)))
@@ -1269,6 +1577,16 @@ class FindPhotoDatesGUI(ctk.CTk):
             return
         self.search_dialog = FileSearchDialog(self, self.lists)
         self.search_dialog.date_entry.focus_set()
+
+    def _show_coverage(self):
+        if not self.lists:
+            messagebox.showinfo("Coverage", "Make at least one file list first.")
+            return
+        if self.coverage_dialog is not None and self.coverage_dialog.winfo_exists():
+            self.coverage_dialog.deiconify()
+            self.coverage_dialog.lift()
+            return
+        self.coverage_dialog = CoverageDialog(self, self.lists)
 
     def _open_path(self, path):
         try:

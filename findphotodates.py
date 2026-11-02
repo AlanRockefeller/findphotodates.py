@@ -5677,6 +5677,7 @@ def _print_drive_menu(drives, list_for, list_dir, lists):
     if any(d.mount in list_for for d in drives):
         print("  u) Update every connected drive that has a file list")
     print("  h) Check drive health")
+    print("  c) Coverage report: which photos and videos have a second copy")
     print("  l) Show all file lists, including drives that aren't connected")
     print("  r) Look for drives again (after plugging one in)")
     print("  a) Advanced options")
@@ -6923,6 +6924,115 @@ def _update_drives(settings, drives, list_for, state):
     state["dirty"] = True
 
 
+def _coverage_settings():
+    from findphotodates_coverage import CoverageSettings
+
+    return CoverageSettings.from_config(load_config())
+
+
+def _save_coverage_settings(settings):
+    save_config(settings.to_config(load_config()))
+
+
+def remember_connected_drives(lists):
+    """Record today as the last day each listed drive was seen connected
+    (used for the Backblaze reminder in the coverage report)."""
+    from findphotodates_coverage import record_connected
+
+    try:
+        settings = _coverage_settings()
+        if record_connected(settings, lists):
+            _save_coverage_settings(settings)
+    except Exception:
+        pass  # a reminder date is never worth interrupting the user for
+
+
+def coverage_for(lists=None, list_dir=None, progress=None):
+    """(drives, settings) for every file list; connected drives are matched first."""
+    from findphotodates_coverage import build_coverage
+
+    if lists is None:
+        lists = find_file_lists(list_dir or default_inventory_dir())
+        match_lists_to_drives(lists, detect_drives())
+        remember_connected_drives(lists)
+    settings = _coverage_settings()
+    drives = build_coverage(lists, settings, read_health_log(list_dir), progress=progress)
+    return drives, settings
+
+
+def print_coverage_report(history_days=None, report=True, lists=None, list_dir=None):
+    from findphotodates_coverage import BACKBLAZE_HISTORY_CHOICES, format_report
+
+    if history_days is not None:
+        settings = _coverage_settings()
+        settings.backblaze_history_days = history_days
+        _save_coverage_settings(settings)
+        print(f"Backblaze version history set to {BACKBLAZE_HISTORY_CHOICES[history_days]}.")
+    if not report:
+        return None
+    print("Comparing every file list (this reads the lists, not the drives)...")
+    drives, settings = coverage_for(lists, list_dir)
+    print()
+    print(format_report(drives, settings))
+    return drives
+
+
+def _interactive_coverage(state):
+    from findphotodates_coverage import (
+        BACKBLAZE_HISTORY_CHOICES, ROLE_AUTO, ROLE_GONE, ROLE_KEEP, ROLE_LABELS, ROLE_WEAK,
+        list_display_name,
+    )
+
+    print()
+    print(_wrap(
+        "The coverage report compares all your file lists. A photo or video counts as "
+        "having a copy when another drive has a file with the same name and size (and the "
+        "same date taken, when both have one). Drives you mark as weak (failing, or about "
+        "to be retired) don't count as safe copies.", indent=""))
+    print_coverage_report(lists=state["lists"], list_dir=state["list_dir"])
+    lists = state["lists"]
+    while True:
+        settings = _coverage_settings()
+        print("Settings:")
+        print(f"  b) Backblaze version history: "
+              f"{BACKBLAZE_HISTORY_CHOICES[settings.backblaze_history_days]}")
+        print("  Drives (role / backed up by Backblaze):")
+        for n, fl in enumerate(lists, 1):
+            s = settings.drive(fl.path.name)
+            print(f"  {n:>2}) {list_display_name(fl)}: {ROLE_LABELS[s.role]}, "
+                  f"Backblaze {'yes' if s.backblaze else 'no'}")
+        print("  r) Show the report again   q) Back")
+        choice = _ask("Choose a setting or drive number: ").lower()
+        if choice in ("q", ""):
+            return
+        if choice == "r":
+            print_coverage_report(lists=lists, list_dir=state["list_dir"])
+        elif choice == "b":
+            print("Backblaze version history:")
+            picked = _pick("Choose: ", [(label, days) for days, label
+                                        in BACKBLAZE_HISTORY_CHOICES.items()])
+            if picked is not None:
+                settings.backblaze_history_days = picked
+                _save_coverage_settings(settings)
+        elif choice.isdigit() and 1 <= int(choice) <= len(lists):
+            fl = lists[int(choice) - 1]
+            s = settings.drive(fl.path.name)
+            print(f"What is {list_display_name(fl)}? (now: {ROLE_LABELS[s.role]})")
+            picked = _pick("Choose (Enter keeps it): ", [
+                ("Automatic: keep it unless its health check shows it failing", ROLE_AUTO),
+                ("Keep: a drive you rely on", ROLE_KEEP),
+                ("Weak: failing or about to be retired; copies here don't count as safe",
+                 ROLE_WEAK),
+                ("Gone: wiped or lost; ignore its file list", ROLE_GONE),
+            ])
+            if picked is not None:
+                s.role = picked
+            s.backblaze = _confirm("Does Backblaze back up this drive?", default=s.backblaze)
+            _save_coverage_settings(settings)
+        else:
+            print("Please choose one of the options shown.")
+
+
 def interactive_main():
     """Menu-driven mode used when the program is started with no arguments."""
     print(f"\nfindphotodates {__version__}: lists of the files on your drives\n")
@@ -6951,6 +7061,7 @@ def interactive_main():
                 match_lists_to_drives(state["lists"], state["drives"])
                 state["list_for"] = {fl.drive.mount: fl for fl in state["lists"] if fl.drive}
                 state["dirty"] = False
+                remember_connected_drives(state["lists"])
             drives, list_for = state["drives"], state["list_for"]
             _print_drive_menu(drives, list_for, state["list_dir"], state["lists"])
             choice = _ask("\nChoose: ").lower()
@@ -6961,6 +7072,8 @@ def interactive_main():
             elif choice == "h":
                 _interactive_health()
                 print()
+            elif choice == "c":
+                _interactive_coverage(state)
             elif choice == "l":
                 _show_all_lists(state["lists"])
             elif choice == "a":
@@ -7058,6 +7171,9 @@ Options:
   --interactive      Open the menu (the default when run with no options).
   --health [quick|extended|history]  Check drive health (all drives, or the one holding
                      --directory), or show the health log kept next to the file lists.
+  --coverage         Show which photos/videos have a copy on another drive, which drives
+                     are safe to retire, and which need connecting for Backblaze.
+  --backblaze-history {30,365}  Your Backblaze version history in days (saved).
   --directory DIR    The directory to search (default: current directory).
   --output FILE      The output TSV file to save results (default: photo.dates.tsv).
   --only-media       Index only media files (photos + videos).
@@ -7113,6 +7229,19 @@ For more details on a specific option, you can also use:
         "data; 'extended' (hours) also runs the drive's full-surface self-test. Checks every "
         "drive, or only the one holding --directory if given. Results are added to "
         f"'{HEALTH_LOG_NAME}' next to the file lists; 'history' shows that log.",
+    )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Show which photos and videos on each drive have a copy on another drive, "
+        "which drives are safe to retire, and which need connecting so Backblaze keeps "
+        "their backup. Uses the file lists only; no drive is read.",
+    )
+    parser.add_argument(
+        "--backblaze-history",
+        choices=["30", "365"],
+        help="Your Backblaze version history in days (30 = the standard plan, 365 = 1 year). "
+        "Saved for later coverage reports.",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="Run quietly.")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode.")
@@ -7276,6 +7405,12 @@ For more details on a specific option, you can also use:
 
     if args.health == "history":
         print_health_history()
+        return
+    if args.coverage or args.backblaze_history:
+        print_coverage_report(
+            history_days=int(args.backblaze_history) if args.backblaze_history else None,
+            report=args.coverage,
+        )
         return
     if args.health:
         directory = None if args.directory == "." else _expand_path(args.directory)

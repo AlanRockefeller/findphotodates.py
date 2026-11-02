@@ -665,8 +665,11 @@ class CoverageDialog(ctk.CTkToplevel):
                                              variable=self.backblaze_var,
                                              command=self._set_backblaze, state="disabled")
         self.backblaze_box.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.cleanup_btn = ctk.CTkButton(side, text="Clean up duplicates…", width=200,
+                                         state="disabled", command=self._open_cleanup)
+        self.cleanup_btn.grid(row=3, column=0, sticky="w", pady=(0, 8))
         ctk.CTkButton(side, text="Copy report", width=200, fg_color="transparent",
-                      border_width=1, command=self._copy_report).grid(row=3, column=0, sticky="w")
+                      border_width=1, command=self._copy_report).grid(row=4, column=0, sticky="w")
 
     def _show_help(self):
         messagebox.showinfo(
@@ -752,6 +755,7 @@ class CoverageDialog(ctk.CTkToplevel):
         if drive is None:
             self.role_menu.configure(state="disabled")
             self.backblaze_box.configure(state="disabled")
+            self.cleanup_btn.configure(state="disabled")
             self.detail.configure(state="disabled")
             return
         self.detail.insert("1.0", coverage.format_drive(drive, folders=20))
@@ -760,6 +764,8 @@ class CoverageDialog(ctk.CTkToplevel):
         self.backblaze_var.set(drive.setting.backblaze)
         self.role_menu.configure(state="normal")
         self.backblaze_box.configure(state="normal")
+        can_clean = drive.connected and drive.role != coverage.ROLE_GONE
+        self.cleanup_btn.configure(state="normal" if can_clean else "disabled")
 
     def _save_settings(self):
         fp._save_coverage_settings(self.settings)
@@ -796,6 +802,12 @@ class CoverageDialog(ctk.CTkToplevel):
         drive.setting = setting
         self._save_settings()
         self._refresh_backblaze()
+
+    def _open_cleanup(self):
+        drive = self._selected()
+        if drive is None or not drive.connected:
+            return
+        CleanupDialog(self.parent, self, self.file_lists, drive)
 
     def _copy_report(self):
         if not self.drives:
@@ -846,6 +858,245 @@ class CoverageDialog(ctk.CTkToplevel):
             self.after_cancel(self._after_id)
         if getattr(self.parent, "coverage_dialog", None) is self:
             self.parent.coverage_dialog = None
+        self.destroy()
+
+
+class CleanupDialog(ctk.CTkToplevel):
+    """Find and delete photos and videos already kept on another drive."""
+
+    def __init__(self, parent, coverage_dialog, file_lists, target):
+        super().__init__(parent)
+        self.parent = parent
+        self.coverage_dialog = coverage_dialog
+        self.file_lists = list(file_lists)
+        self.target = target  # DriveCoverage of the drive to clean
+        self.events = queue.Queue()
+        self.plan = None
+        self.stop_event = threading.Event()
+        self.busy = False
+        self.log_path = None
+        self._after_id = None
+        self._closed = False
+        self.settings = fp._coverage_settings()
+
+        self.title(f"Clean up duplicates on {target.name}")
+        self.geometry("980x600")
+        self.minsize(720, 520)
+        self.transient(parent)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._build()
+        self._after_id = self.after(100, self._drain_events)
+
+    def _build(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(15, 5))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text=f"Clean up duplicates on {self.target.name}", anchor="w",
+                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            head, anchor="w", justify="left", wraplength=920,
+            text=("Finds photos and videos on this drive that already have a copy in a keep "
+                  "folder on another drive you keep (same name, size and date taken). Files "
+                  "in keep folders on this drive are never deleted. Nothing is deleted until "
+                  "you confirm, and every deletion is logged."),
+            text_color=("gray35", "gray72")).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        options = ctk.CTkFrame(self, corner_radius=8)
+        options.grid(row=1, column=0, sticky="ew", padx=16, pady=(6, 8))
+        options.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(options, text="Keep folders:", font=ctk.CTkFont(weight="bold"))\
+            .grid(row=0, column=0, sticky="w", padx=(12, 7), pady=(10, 4))
+        self.folders_var = ctk.StringVar(value=", ".join(self.settings.keep_folders))
+        ctk.CTkEntry(options, textvariable=self.folders_var,
+                     placeholder_text="Top-level folders, separated by commas")\
+            .grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(10, 4))
+        self.library_var = ctk.BooleanVar(value=self.settings.keep_library_days)
+        ctk.CTkCheckBox(options, text="Library day folders (YYYY/YYYY-MM-DD) are keep folders too",
+                        variable=self.library_var)\
+            .grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=4)
+        self.trust_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options, variable=self.trust_var,
+                        text="Trust the file lists for drives that aren't connected "
+                             "(otherwise those duplicates are kept)")\
+            .grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 10))
+
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(frame, columns=("folder", "files", "size"), show="headings",
+                                 style="Coverage.Treeview", selectmode="none")
+        scale = self.parent.gui_scale
+        for column, title, width in (("folder", "Folder", 560), ("files", "Files", 110),
+                                     ("size", "Size", 120)):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=round(width * scale), stretch=column == "folder")
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vertical.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        footer.grid_columnconfigure(0, weight=1)
+        self.status_var = ctk.StringVar(value="Choose Find duplicates to see what can be deleted.")
+        ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w", justify="left",
+                     wraplength=900).grid(row=0, column=0, columnspan=5, sticky="ew",
+                                          pady=(0, 8))
+        self.progress = ctk.CTkProgressBar(footer)
+        self.progress.grid(row=1, column=0, sticky="ew")
+        self.progress.set(0)
+        self.find_btn = ctk.CTkButton(footer, text="Find duplicates", width=130,
+                                      command=self._find)
+        self.find_btn.grid(row=1, column=2, padx=(8, 0))
+        self.delete_btn = ctk.CTkButton(footer, text="Delete", width=150, state="disabled",
+                                        fg_color=("#b3381a", "#a33a20"),
+                                        hover_color=("#8f2c14", "#7f2d18"),
+                                        command=self._delete)
+        self.delete_btn.grid(row=1, column=3, padx=(8, 0))
+        self.log_btn = ctk.CTkButton(footer, text="Open log", width=90, fg_color="transparent",
+                                     border_width=1, command=self._open_log)
+        self.log_btn.grid(row=1, column=4, padx=(8, 0))
+        self.log_btn.grid_remove()
+
+    def _keep_folders(self):
+        return [f.strip() for f in self.folders_var.get().split(",") if f.strip()]
+
+    def _find(self):
+        self.settings.keep_folders = self._keep_folders()
+        self.settings.keep_library_days = bool(self.library_var.get())
+        fp._save_coverage_settings(self.settings)
+        self.busy = True
+        self.plan = None
+        self.find_btn.configure(state="disabled")
+        self.delete_btn.configure(state="disabled", text="Delete")
+        self.tree.delete(*self.tree.get_children())
+        self.status_var.set("Reading the file lists…")
+        self.progress.set(0)
+        settings = self.settings
+        health = fp.read_health_log(self.parent.list_dir)
+
+        def progress(step, total, name):
+            self.events.put(("progress", step / total, f"Reading {name}…"))
+
+        def work():
+            try:
+                plan = coverage.plan_cleanup(
+                    self.file_lists, settings, self.target.list_path,
+                    settings.keep_folders, settings.keep_library_days, health, progress)
+                self.events.put(("plan", plan))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_plan(self, plan):
+        self.plan = plan
+        for folder, size in plan.folders.most_common():
+            self.tree.insert("", "end", values=(folder, f"{plan.folder_files[folder]:,}",
+                                                coverage.human_size(size)))
+        count = len(plan.items)
+        if not count:
+            self.status_var.set("No duplicates found. Every photo and video here is either in "
+                                "a keep folder or has no kept copy elsewhere.")
+            return
+        offline = sum(1 for item in plan.items if not any(c for _, c in item.kept))
+        note = (f" {offline:,} of them have their kept copy on a drive that isn't connected."
+                if offline else "")
+        self.status_var.set(
+            f"{count:,} duplicates ({coverage.human_size(plan.total_bytes)}) can be deleted. "
+            f"{plan.kept_without_copy:,} photos and videos have no kept copy and stay.{note}")
+        self.delete_btn.configure(state="normal", text=f"Delete {count:,} files")
+
+    def _delete(self):
+        plan = self.plan
+        if not plan or not plan.items:
+            return
+        trust = bool(self.trust_var.get())
+        if not messagebox.askyesno(
+                "Delete duplicates",
+                f"Permanently delete {len(plan.items):,} files "
+                f"({coverage.human_size(plan.total_bytes)}) from {self.target.name}?\n\n"
+                "Each one's kept copy is checked on disk first when its drive is connected"
+                + ("; for drives that aren't connected, the file lists are trusted."
+                   if trust else "; duplicates whose kept copy's drive isn't connected are kept.")
+                + " Deleted files don't go to the trash.",
+                icon="warning", parent=self):
+            return
+        stamp = _datetime.date.today().isoformat()
+        name = re.sub(r'[<>:"/\\|?*]', "_", self.target.name)
+        self.log_path = (Path(self.parent.list_dir) / "Cleanup logs"
+                         / f"{name} duplicates - delete log {stamp}.tsv")
+        self.busy = True
+        self.stop_event.clear()
+        self.find_btn.configure(state="disabled")
+        self.delete_btn.configure(text="Stop", command=self.stop_event.set)
+        self.status_var.set("Deleting…")
+
+        def progress(done, total, freed):
+            self.events.put(("progress", done / total,
+                             f"Deleted {done:,} of {total:,} — {coverage.human_size(freed)} freed"))
+
+        def work():
+            try:
+                counts, freed = coverage.run_cleanup(plan, self.log_path, trust, progress,
+                                                     self.stop_event)
+                self.events.put(("deleted", counts, freed))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_log(self):
+        if self.log_path:
+            self.parent._open_path(self.log_path.parent)
+
+    def _drain_events(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    self.progress.set(event[1])
+                    self.status_var.set(event[2])
+                elif kind == "plan":
+                    self.busy = False
+                    self.progress.set(1)
+                    self.find_btn.configure(state="normal")
+                    self._show_plan(event[1])
+                elif kind == "deleted":
+                    _, counts, freed = event
+                    self.busy = False
+                    self.plan = None
+                    self.find_btn.configure(state="normal")
+                    self.delete_btn.configure(state="disabled", text="Delete",
+                                              command=self._delete)
+                    parts = [f"{v:,} {k}" for k, v in counts.most_common()]
+                    stopped = " Stopped before the end." if self.stop_event.is_set() else ""
+                    self.status_var.set(f"Done: {coverage.human_size(freed)} freed. "
+                                        + "; ".join(parts) + "." + stopped
+                                        + " Update this drive's file list to keep it current.")
+                    self.log_btn.grid()
+                elif kind == "error":
+                    self.busy = False
+                    self.find_btn.configure(state="normal")
+                    self.delete_btn.configure(state="disabled", text="Delete",
+                                              command=self._delete)
+                    self.status_var.set("Problem: " + event[1])
+        except queue.Empty:
+            pass
+        self._after_id = self.after(100, self._drain_events)
+
+    def _close(self):
+        if self.busy and self.plan is not None:
+            if not messagebox.askyesno("Stop deleting?", "Stop deleting and close?", parent=self):
+                return
+        self.stop_event.set()
+        self._closed = True
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
         self.destroy()
 
 

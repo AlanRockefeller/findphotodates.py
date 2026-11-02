@@ -148,6 +148,7 @@ class CoverageTests(unittest.TestCase):
         config = settings.to_config({})
         loaded = cov.CoverageSettings.from_config(config)
         self.assertEqual(loaded.backblaze_history_days, 365)
+        self.assertEqual((loaded.keep_folders, loaded.keep_library_days), (["Important"], True))
         self.assertEqual(loaded.drives["A.tsv"],
                          cov.DriveSetting(role=cov.ROLE_WEAK, backblaze=True))
         config["coverage"]["backblaze_history_days"] = 90
@@ -174,6 +175,114 @@ class CoverageTests(unittest.TestCase):
         self.assertIn("Only copy of 1 (2.5 MB)", text)
         self.assertIn("x/y/z/w", text)
 
+
+    def make_drive(self, name, files):
+        """A real folder acting as a connected drive, plus its file list.
+        *files* maps relative path -> (date taken, size)."""
+        mount = Path(self.folder) / "mnt" / name
+        rows = []
+        for relative, (date, size) in files.items():
+            path = mount / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * size)
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            rows.append((relative, date, size))
+        write_list(self.folder, name, str(mount), rows)
+        return mount
+
+    def connected_lists(self, *names):
+        lists = fp.find_file_lists(self.folder)
+        for fl in lists:
+            if fl.path.stem in names:
+                fl.drive = fp.DriveInfo(str(Path(self.folder) / "mnt" / fl.path.stem))
+        return lists
+
+    def test_keep_folders(self):
+        self.assertTrue(cov.in_keep_folder("2024/2024-06-30/x.NEF"))
+        self.assertTrue(cov.in_keep_folder("Pictures/Lightroom/2024/2024-06-30/x.NEF"))
+        self.assertTrue(cov.in_keep_folder("important/Videos/x.mp4"))
+        self.assertFalse(cov.in_keep_folder("cards/2024-06-30/x.NEF"))
+        self.assertFalse(cov.in_keep_folder("2024/2024-06-30/x.NEF", library_days=False))
+        self.assertTrue(cov.in_keep_folder("Archive/x.NEF", keep_folders=["Archive"]))
+
+    def test_cleanup_deletes_only_duplicates_of_kept_copies(self):
+        library = self.make_drive("Library", {
+            "2024/2024-06-30/20240630-DSC_1.NEF": ("2024:06:30 10:00:00", 11),
+            "2024/2024-06-30/20240630-DSC_2.NEF": ("2024:06:30 10:00:01", 12),
+            "cards/DSC_5.NEF": ("2024:06:30 10:00:05", 15),  # not in a keep folder
+        })
+        cards = self.make_drive("Cards", {
+            "dump/DSC_1.NEF": ("2024:06:30 10:00:00", 11),  # duplicate: delete
+            "dump/DSC_2.NEF": ("2024:01:01 00:00:00", 12),  # different date: keep
+            "dump/DSC_3.NEF": ("", 13),  # no copy: keep
+            "dump/DSC_5.NEF": ("2024:06:30 10:00:05", 15),  # copy not in keep folder
+            "Important/DSC_1.NEF": ("2024:06:30 10:00:00", 11),  # keep folder: never
+        })
+        lists = self.connected_lists("Library", "Cards")
+        target = Path(self.folder) / "Cards.tsv"
+        plan = cov.plan_cleanup(lists, cov.CoverageSettings(), target)
+        self.assertEqual([Path(i.path).name for i in plan.items], ["DSC_1.NEF"])
+        self.assertEqual(plan.kept_without_copy, 3)
+        log = Path(self.folder) / "logs" / "cleanup.tsv"
+        counts, freed = cov.run_cleanup(plan, log)
+        self.assertEqual((counts["deleted"], freed), (1, 11))
+        self.assertFalse((cards / "dump/DSC_1.NEF").exists())
+        self.assertTrue((cards / "Important/DSC_1.NEF").exists())
+        self.assertTrue((library / "2024/2024-06-30/20240630-DSC_1.NEF").exists())
+        with log.open() as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+        self.assertEqual(rows[0]["status"], "deleted")
+        self.assertTrue(rows[0]["kept copy"].endswith("20240630-DSC_1.NEF"))
+
+    def test_cleanup_checks_kept_copy_and_respects_roles(self):
+        library = self.make_drive("Library", {
+            "Important/a.mp4": ("2020:01:01 00:00:00", 20),
+            "Important/b.mp4": ("2020:01:01 00:00:01", 21)})
+        self.make_drive("Cards", {"a.mp4": ("2020:01:01 00:00:00", 20),
+                                  "b.mp4": ("2020:01:01 00:00:01", 21)})
+        target = Path(self.folder) / "Cards.tsv"
+        settings = cov.CoverageSettings()
+        settings.drive("Library.tsv").role = cov.ROLE_WEAK
+        plan = cov.plan_cleanup(self.connected_lists("Library", "Cards"), settings, target)
+        self.assertEqual(plan.items, [])  # copies on a weak drive don't count
+        settings.drive("Library.tsv").role = cov.ROLE_KEEP
+        plan = cov.plan_cleanup(self.connected_lists("Library", "Cards"), settings, target)
+        self.assertEqual(len(plan.items), 2)
+        (library / "Important/b.mp4").unlink()  # the kept copy vanished since the scan
+        counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv")
+        self.assertEqual(counts["deleted"], 1)
+        self.assertEqual(counts["kept: other copy not found on disk"], 1)
+
+    def test_cleanup_with_disconnected_kept_drive_needs_trust(self):
+        self.make_drive("Library", {"Important/a.mp4": ("2020:01:01 00:00:00", 20)})
+        cards = self.make_drive("Cards", {"a.mp4": ("2020:01:01 00:00:00", 20)})
+        target = Path(self.folder) / "Cards.tsv"
+        lists = self.connected_lists("Cards")
+        plan = cov.plan_cleanup(lists, cov.CoverageSettings(), target)
+        counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv")
+        self.assertEqual(counts["kept: other copy's drive isn't connected"], 1)
+        self.assertTrue((cards / "a.mp4").exists())
+        counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv", trust_lists=True)
+        self.assertEqual(counts["deleted"], 1)
+
+    def test_cleanup_requires_connected_target(self):
+        self.make_drive("Cards", {"a.mp4": ("", 20)})
+        with self.assertRaisesRegex(ValueError, "isn't connected"):
+            cov.plan_cleanup(fp.find_file_lists(self.folder), cov.CoverageSettings(),
+                             Path(self.folder) / "Cards.tsv")
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "POSIX permissions, non-root")
+    def test_cleanup_clears_read_only_folder(self):
+        self.make_drive("Library", {"Important/a.mp4": ("2020:01:01 00:00:00", 20)})
+        cards = self.make_drive("Cards", {"card/a.mp4": ("2020:01:01 00:00:00", 20)})
+        os.chmod(cards / "card", 0o555)
+        try:
+            plan = cov.plan_cleanup(self.connected_lists("Library", "Cards"),
+                                    cov.CoverageSettings(), Path(self.folder) / "Cards.tsv")
+            counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv")
+            self.assertEqual(counts["deleted"], 1)
+        finally:
+            os.chmod(cards / "card", 0o755)
 
 if __name__ == "__main__":
     unittest.main()

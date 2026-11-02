@@ -47,6 +47,10 @@ BACKBLAZE_HISTORY_CHOICES = {30: "30 days", 365: "1 year"}
 DEFAULT_BACKBLAZE_HISTORY_DAYS = 30
 BACKBLAZE_WARN_DAYS_BEFORE = 7
 
+# Top-level folders whose files the duplicate cleanup never deletes, besides
+# library-style day folders (YYYY/YYYY-MM-DD).
+DEFAULT_KEEP_FOLDERS = ("Important",)
+
 _LIGHTROOM_PREFIX = re.compile(r"^\d{8}-")
 _BAD_DATE_PREFIXES = ("0000", "1904", "1970")
 # Windows Phone Link shows phone photos here; they are not stored on the PC.
@@ -191,6 +195,8 @@ class DriveSetting:
 class CoverageSettings:
     backblaze_history_days: int = DEFAULT_BACKBLAZE_HISTORY_DAYS
     drives: dict = field(default_factory=dict)  # list file name -> DriveSetting
+    keep_folders: list = field(default_factory=lambda: list(DEFAULT_KEEP_FOLDERS))
+    keep_library_days: bool = True
 
     def drive(self, list_name):
         return self.drives.setdefault(list_name, DriveSetting())
@@ -202,6 +208,10 @@ class CoverageSettings:
         if days not in BACKBLAZE_HISTORY_CHOICES:
             days = DEFAULT_BACKBLAZE_HISTORY_DAYS
         settings = cls(backblaze_history_days=days)
+        folders = data.get("keep_folders")
+        if isinstance(folders, list):
+            settings.keep_folders = [str(f) for f in folders if str(f).strip()]
+        settings.keep_library_days = bool(data.get("keep_library_days", True))
         for name, value in (data.get("drives") or {}).items():
             if not isinstance(value, dict):
                 continue
@@ -216,6 +226,8 @@ class CoverageSettings:
     def to_config(self, config):
         config["coverage"] = {
             "backblaze_history_days": self.backblaze_history_days,
+            "keep_folders": list(self.keep_folders),
+            "keep_library_days": self.keep_library_days,
             "drives": {
                 name: {"role": s.role, "backblaze": s.backblaze,
                        "last_connected": s.last_connected}
@@ -394,21 +406,7 @@ def build_coverage(file_lists, settings, health_rows=(), today=None, progress=No
     """
     today = today or _datetime.date.today()
     lists = list(file_lists)
-    drives = []
-    for fl in lists:
-        setting = settings.drive(fl.path.name)
-        if setting.role == ROLE_AUTO:
-            health = latest_health(fl, health_rows)
-            if health_is_weak(health):
-                role = ROLE_WEAK
-                reason = f"health check {health.get('date', '')[:10]}: {health.get('health', '')}"
-            else:
-                role, reason = ROLE_KEEP, "automatic"
-        else:
-            role, reason = setting.role, "set by you"
-        drives.append(DriveCoverage(
-            list_path=fl.path, name=list_display_name(fl), role=role, role_reason=reason,
-            connected=fl.drive is not None, setting=setting))
+    drives = build_roles(lists, settings, health_rows)
 
     keep_mask = gone_mask = 0
     for index, coverage in enumerate(drives):
@@ -540,3 +538,187 @@ def format_report(drives, settings, folders_per_drive=8):
         lines.append(format_drive(coverage, folders_per_drive))
         lines.append("")
     return "\n".join(lines)
+
+
+# --- Duplicate cleanup ------------------------------------------------------
+
+_LIBRARY_DAY = re.compile(r"(^|/)((?:19|20)\d\d)/\2-\d\d-\d\d(/|$)")
+
+
+def in_keep_folder(relative, keep_folders=DEFAULT_KEEP_FOLDERS, library_days=True):
+    """True for files the cleanup never deletes and whose copies count as kept:
+    library-style day folders (YYYY/YYYY-MM-DD) and the named top-level folders."""
+    top = relative.split("/", 1)[0].lower()
+    if any(top == folder.strip().strip("/").lower() for folder in keep_folders if folder.strip()):
+        return True
+    return library_days and bool(_LIBRARY_DAY.search(relative))
+
+
+@dataclass
+class CleanupItem:
+    path: str  # where the duplicate is now
+    size: int
+    date: str
+    kept: list  # [(path of the kept copy, True if its drive is connected)]
+
+
+@dataclass
+class CleanupPlan:
+    drive_name: str
+    items: list = field(default_factory=list)
+    folders: Counter = field(default_factory=Counter)  # folder -> bytes
+    folder_files: Counter = field(default_factory=Counter)
+    kept_without_copy: int = 0
+
+    @property
+    def total_bytes(self):
+        return sum(item.size for item in self.items)
+
+
+def _current_path(fl, relative):
+    """Where a file from a list is now: under the drive's current mount, or
+    the recorded path when the drive isn't connected."""
+    if fl.drive is not None:
+        return str(Path(fl.drive.mount).joinpath(*relative.split("/")))
+    return None
+
+
+def plan_cleanup(file_lists, settings, target, keep_folders=DEFAULT_KEEP_FOLDERS,
+                 library_days=True, health_rows=(), progress=None):
+    """Photos and videos on the *target* list's drive that are outside keep
+    folders and have a copy in a keep folder on another drive you keep.
+
+    Same file = same name (Lightroom prefix ignored) and size, and the same date
+    taken; when neither has a date taken, the modification time must agree
+    within two seconds. The target drive must be connected.
+    """
+    lists = list(file_lists)
+    target_fl = next(fl for fl in lists if fl.path == Path(target))
+    if target_fl.drive is None:
+        raise ValueError(f"{list_display_name(target_fl)} isn't connected.")
+    roles = {d.list_path: d.role for d in
+             build_roles(lists, settings, health_rows)}
+    kept = defaultdict(list)  # (name, size) -> [(date, mtime, path, connected)]
+    others = [fl for fl in lists if fl is not target_fl and roles[fl.path] == ROLE_KEEP]
+    for number, fl in enumerate(others, 1):
+        if progress:
+            progress(number, len(others) + 1, list_display_name(fl))
+        for path, relative, name, size, date, mtime, _, placeholder in _media_tuples(fl.path):
+            if placeholder or not in_keep_folder(relative, keep_folders, library_days):
+                continue
+            now = _current_path(fl, relative)
+            kept[(name, size)].append((date, mtime, now or path, now is not None))
+
+    plan = CleanupPlan(drive_name=list_display_name(target_fl))
+    if progress:
+        progress(len(others) + 1, len(others) + 1, plan.drive_name)
+    for _, relative, name, size, date, mtime, _, placeholder in _media_tuples(target_fl.path):
+        if placeholder or in_keep_folder(relative, keep_folders, library_days):
+            continue
+        matches = [(p, connected) for d, m, p, connected in kept.get((name, size), ())
+                   if (date and d == date) or (not date and not d and abs(m - mtime) <= 2e9)]
+        if not matches:
+            plan.kept_without_copy += 1
+            continue
+        plan.items.append(CleanupItem(_current_path(target_fl, relative), size, date, matches))
+        folder = _folder_of(relative, depth=3)
+        plan.folders[folder] += size
+        plan.folder_files[folder] += 1
+    return plan
+
+
+def build_roles(file_lists, settings, health_rows=()):
+    """DriveCoverage objects with roles resolved, without reading the lists."""
+    drives = []
+    for fl in file_lists:
+        setting = settings.drive(fl.path.name)
+        if setting.role == ROLE_AUTO:
+            health = latest_health(fl, health_rows)
+            if health_is_weak(health):
+                role = ROLE_WEAK
+                reason = f"health check {health.get('date', '')[:10]}: {health.get('health', '')}"
+            else:
+                role, reason = ROLE_KEEP, "automatic"
+        else:
+            role, reason = setting.role, "set by you"
+        drives.append(DriveCoverage(list_path=fl.path, name=list_display_name(fl), role=role,
+                                    role_reason=reason, connected=fl.drive is not None,
+                                    setting=setting))
+    return drives
+
+
+CLEANUP_LOG_COLUMNS = ["time", "status", "deleted", "size", "date_taken", "kept copy"]
+
+
+def _remove(path):
+    """Delete a file, clearing a read-only flag on it or its folder if that's
+    what stands in the way (common on folders copied from camera cards)."""
+    import os
+    import stat
+
+    try:
+        os.remove(path)
+    except PermissionError:
+        folder = os.path.dirname(path)
+        os.chmod(folder, os.stat(folder).st_mode | stat.S_IWUSR)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+        os.remove(path)
+
+
+def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
+    """Delete the plan's duplicates. Each kept copy is checked on disk first
+    (same size) when its drive is connected; when it isn't, the file is kept
+    unless *trust_lists* is True. Every file is logged. Returns a Counter of
+    statuses and the bytes freed."""
+    import os
+    import time
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    new = not log_path.exists()
+    counts, freed = Counter(), 0
+    with open(log_path, "a", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        if new:
+            writer.writerow(CLEANUP_LOG_COLUMNS)
+        for number, item in enumerate(plan.items, 1):
+            if stop is not None and stop.is_set():
+                break
+            keep = None
+            for kept_path, connected in item.kept:
+                if connected:
+                    try:
+                        if os.path.getsize(kept_path) == item.size:
+                            keep = kept_path
+                            break
+                    except OSError:
+                        continue
+                elif trust_lists:
+                    keep = kept_path
+                    break
+            try:
+                current = os.path.getsize(item.path)
+            except OSError:
+                current = None
+            if current is None:
+                status = "already gone"
+            elif current != item.size:
+                status = "kept: size changed since the list was made"
+            elif keep is None:
+                status = ("kept: other copy not found on disk"
+                          if any(c for _, c in item.kept) else
+                          "kept: other copy's drive isn't connected")
+            else:
+                try:
+                    _remove(item.path)
+                    status = "deleted"
+                    freed += item.size
+                except OSError as exc:
+                    status = f"kept: couldn't delete ({exc.strerror or exc})"
+            counts[status] += 1
+            writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), status, item.path, item.size,
+                             item.date, keep or item.kept[0][0]])
+            if progress and (number % 200 == 0 or number == len(plan.items)):
+                handle.flush()
+                progress(number, len(plan.items), freed)
+    return counts, freed

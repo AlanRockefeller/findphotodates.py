@@ -327,3 +327,18 @@ def test_health_history_does_not_need_exiftool(monkeypatch, capsys):
     monkeypatch.setattr(fpd.sys, "argv", ["findphotodates.py", "--health", "history"])
     fpd.main()
     assert shown and "ExifTool" not in capsys.readouterr().out
+
+
+def test_report_without_health_data_still_shows_usb_findings(capsys):
+    report = fpd.HealthReport(_target())
+    report.problem = "this drive, or its USB enclosure, doesn't report health data"
+    report.add(fpd.HEALTH_NOTE, "Connected at USB 2 speed, although the drive supports USB 3", "")
+    fpd.print_health_report(report)
+    out = capsys.readouterr().out
+    assert "Health: UNKNOWN. This drive, or its USB enclosure" in out
+    assert "USB 2 speed" in out
+    report.add(fpd.HEALTH_WARNING, "The USB connection is resetting", "")
+    fpd.print_health_report(report)
+    out = capsys.readouterr().out
+    assert "Health: WARNING. This drive, or its USB enclosure" in out
+    assert "resetting" in out

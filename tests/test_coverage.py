@@ -281,7 +281,8 @@ class CoverageTests(unittest.TestCase):
     def test_png_and_webp_photos_count_but_small_graphics_do_not(self):
         self.make_drive("Phone", {"Pictures/screenshot.png": ("", 2_000_000),
                                   "Pictures/photo.webp": ("", 900_000),
-                                  "Pictures/icon.png": ("", 4_000)})
+                                  "Pictures/icon.png": ("", 4_000),
+                                  "src/app.ts": ("", 6_000)})  # TypeScript, not video
         drives = self.by_name(cov.build_coverage(fp.find_file_lists(self.folder),
                                                  cov.CoverageSettings()))
         self.assertEqual(drives["Phone"].total.files, 2)

@@ -24,8 +24,9 @@ PHOTO_EXTENSIONS = frozenset({
     "jpg", "jpeg", "nef", "orf", "cr2", "cr3", "arw", "dng", "rw2", "raf", "srw",
     "pef", "x3f", "tif", "tiff", "heic", "heif", "psd", "png", "webp", "avif", "jxl",
 })
-# Below this size these formats are almost always icons and web graphics.
-_SMALL_IMAGE_EXTENSIONS = frozenset({"png", "webp", "avif"})
+# Below this size these are almost always icons and web graphics, or (.ts)
+# TypeScript source files rather than video.
+_SMALL_IMAGE_EXTENSIONS = frozenset({"png", "webp", "avif", "ts"})
 _SMALL_IMAGE_BYTES = 100_000
 VIDEO_EXTENSIONS = frozenset({
     "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mts", "m2ts",

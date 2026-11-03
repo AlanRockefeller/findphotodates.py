@@ -183,6 +183,14 @@ class InventorySearchTests(unittest.TestCase):
         finally:
             missing.rename(self.camera)
 
+    def test_apostrophes_and_backslashes_are_ordinary_characters(self):
+        from findphotodates_search import _split_query
+        self.assertEqual(_split_query("Mom's"), ["Mom's"])
+        self.assertEqual(_split_query(r"path:C:\Users\me"), [r"path:C:\Users\me"])
+        self.assertEqual(_split_query('location:"New York" sun'),
+                         ["location:New York", "sun"])
+        self.assertEqual(paths(self.index, "Mom's"), [])
+
     def test_bad_queries_have_useful_errors(self):
         with self.assertRaisesRegex(SearchQueryError, "Unknown field"):
             compile_query("camera:nikon")

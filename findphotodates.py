@@ -4095,11 +4095,6 @@ def run_scan(
                         and cached_entry["size_bytes"] == size_bytes
                         and cached_entry["mtime_ns"] == mtime_ns
                     )
-                    if cached_entry is None:
-                        if had_previous_list:
-                            new_files.append((out_path, size_bytes, mtime_ns))
-                    elif not cache_valid:
-                        changed_files.append(out_path)
                     # Reading a cloud placeholder would download it (or fail), so
                     # it is listed from what the drive reports, without ExifTool
                     # or hashing; a date read while it was stored here is kept.
@@ -4110,6 +4105,14 @@ def run_scan(
                     if archive_type:
                         archives_found.append(
                             (out_path, fs_path, key_path, archive_type, bool(cache_valid)))
+                        if (extensions is not None and not old_format
+                                and not is_supported_file(basename, extensions)):
+                            continue  # found only so the files inside it can be listed
+                    if cached_entry is None:
+                        if had_previous_list:
+                            new_files.append((out_path, size_bytes, mtime_ns))
+                    elif not cache_valid:
+                        changed_files.append(out_path)
                     retry_cached_blank_exif = False
                     if cache_valid:
                         # Alan 5/8/26 - Retry blank EXIF cache rows so interrupted TSV inventories can be repaired.
@@ -4433,7 +4436,7 @@ def run_scan(
                                quiet)
 
     total_seen = cached_count + processed_count
-    if total_seen == 0:
+    if total_seen == 0 and not photo_data:  # files inside archives count too
         if not quiet:
             print("No files found.")
         cleanup_all()
@@ -6955,11 +6958,12 @@ def print_health_report(report):
     print(f"\n{target.description()}")
     where = ", ".join(target.mounts) if target.mounts else "not mounted"
     print(f"  Device: {target.device}   Mounted at: {where}")
-    if report.problem and not report.smart_available and report.verdict == HEALTH_UNKNOWN:
+    if report.problem and not report.smart_available:
+        # No health data, but USB connection findings may still follow.
         problem = report.problem.rstrip(".")
-        print(f"  Health: UNKNOWN. {problem[0].upper()}{problem[1:]}.")
-        return
-    print(f"  Health: {_VERDICT_TEXT[report.verdict]}")
+        print(f"  Health: {_VERDICT_TEXT[report.verdict]}. {problem[0].upper()}{problem[1:]}.")
+    else:
+        print(f"  Health: {_VERDICT_TEXT[report.verdict]}")
     for fact in report.facts:
         print(f"  {fact}")
     if report.self_test_running is not None:

@@ -84,6 +84,7 @@ def test_archives_are_found_when_only_media_is_listed(tmp_path, monkeypatch):
     rows = _scan(root, tmp_path / "list.tsv", monkeypatch, extensions=fpd.MEDIA_EXTENSIONS)
     assert "export.zip/photos/IMG_1.jpg" in rows
     assert "export.zip/notes.txt" not in rows
+    assert "export.zip" not in rows  # the archive itself isn't a media file
     assert not any(k.startswith("backup.tgz") for k in rows)
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import datetime as _datetime
 import re
-import shlex
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -211,18 +210,33 @@ def _fts_term(value):
     return " AND ".join('"{}"*'.format(word.replace('"', '""')) for word in words)
 
 
+def _split_query(query):
+    """Split a search into words. Only double quotes group words; apostrophes
+    (Mom's) and backslashes (path:C:\\Users) are ordinary characters."""
+    tokens, current, quoted, in_quote = [], [], False, False
+    for char in query:
+        if char == '"':
+            in_quote, quoted = not in_quote, True
+        elif char.isspace() and not in_quote:
+            if current or quoted:
+                tokens.append("".join(current))
+            current, quoted = [], False
+        else:
+            current.append(char)
+    if in_quote:
+        raise SearchQueryError("Check that every quote in the search has a matching quote.")
+    if current or quoted:
+        tokens.append("".join(current))
+    return tokens
+
+
 def compile_query(query, *, fts_enabled=True):
     """Return (joins, where SQL, parameters, ordering) for a search query.
 
     Plain words use FTS when it is available.  Field filters always use SQL,
     which gives predictable substring, wildcard, exact, and range semantics.
     """
-    try:
-        tokens = shlex.split(query)
-    except ValueError as exc:
-        raise SearchQueryError(
-            "Check that every quote in the search has a matching quote."
-        ) from exc
+    tokens = _split_query(query)
 
     conditions, params, fts_terms = [], [], []
     for token in tokens:

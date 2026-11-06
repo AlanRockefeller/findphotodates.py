@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# findphotodates.py - Version 1.6.1 (2026-09-29) - By Alan Rockefeller
+# findphotodates.py - Version 1.7.0 (2026-11-01) - By Alan Rockefeller
 # Generates inventory TSV with filepath, date_taken, size, mtime, GPS, location, and content_hash
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
@@ -32,7 +32,7 @@ import threading
 import types
 import unicodedata
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 # Optional fast hash (prefer over stdlib when available)
 try:
@@ -111,7 +111,15 @@ TSV_COLUMNS = [
     "gps_lon",
     "location",
     "content_hash",
+    # Optional, comma-separated: "placeholder" (the file's data isn't on the
+    # drive, e.g. a cloud-only OneDrive or Phone Link file) and "archive" (a file
+    # inside a .zip/.tar archive; its path is the archive's path plus the
+    # path inside it). Lists from before v1.7 don't have this column.
+    "flags",
 ]
+# Flags, see TSV_COLUMNS
+FLAG_PLACEHOLDER = "placeholder"
+FLAG_ARCHIVE = "archive"
 
 # Default cache paths
 def _default_cache_dir():
@@ -1012,7 +1020,78 @@ def _is_windows_reparse_point_dir(entry):
     return bool(attrs & reparse_bit)
 
 
-def find_files(directory, extensions, debug=False, errors=None):
+# Alan 11/1/26 - Files inside archives (.zip exports from Facebook or Google,
+# old backups) are listed too, so their photos count as copies. A .zip keeps
+# its table of contents at the end, so listing one reads very little; a .tar
+# or .tgz has to be read from start to finish, so those are opt-in ("all").
+ARCHIVE_MODES = ("off", "zip", "all")
+DEFAULT_ARCHIVE_MODE = "zip"
+_ARCHIVE_LABELS = {"zip": ".zip only", "all": "All archives (.zip, .tar, .tgz)", "off": "Off"}
+_TAR_SUFFIXES = (".tar", ".tgz", ".tar.gz", ".tbz2", ".tar.bz2", ".txz", ".tar.xz")
+
+
+def archive_kind(name, mode=DEFAULT_ARCHIVE_MODE):
+    """'zip' or 'tar' when files inside *name* should be listed, else ''."""
+    lower = name.lower()
+    if mode in ("zip", "all") and lower.endswith(".zip"):
+        return "zip"
+    if mode == "all" and lower.endswith(_TAR_SUFFIXES):
+        return "tar"
+    return ""
+
+
+def archive_extensions(mode=DEFAULT_ARCHIVE_MODE):
+    """Extensions of the archives *mode* looks inside (for the file-type filter)."""
+    if mode == "all":
+        return {"zip"} | {suffix.lstrip(".") for suffix in _TAR_SUFFIXES}
+    return {"zip"} if mode == "zip" else set()
+
+
+def list_archive(path, kind):
+    """(path inside the archive, size, mtime_ns) for each file in an archive.
+    Only the archive's directory is read for a .zip; nothing is extracted."""
+    if kind == "zip":
+        import zipfile
+
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                try:
+                    mtime = int(time.mktime(info.date_time + (0, 0, -1))) * 1_000_000_000
+                except (OverflowError, ValueError):
+                    mtime = 0
+                yield info.filename.replace("\\", "/").lstrip("/"), info.file_size, mtime
+    elif kind == "tar":
+        import tarfile
+
+        with tarfile.open(path, "r|*") as archive:
+            for member in archive:
+                if member.isfile():
+                    name = member.name[2:] if member.name.startswith("./") else member.name
+                    yield name.lstrip("/"), member.size, int(member.mtime) * 1_000_000_000
+
+
+# Windows file attributes of cloud files whose data isn't stored locally
+# (OneDrive "online-only", Phone Link): RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, OFFLINE.
+_WINDOWS_PLACEHOLDER_ATTRIBUTES = 0x400000 | 0x40000 | 0x1000
+_MACOS_SF_DATALESS = 0x40000000  # iCloud files evicted from the Mac
+_PLACEHOLDER_MIN_BYTES = 4096  # tiny files can live inside the directory entry
+
+
+def is_placeholder_stat(st):
+    """True when a file's data isn't actually stored on the drive: a cloud
+    placeholder (OneDrive, Phone Link, iCloud) or a file with no data blocks."""
+    attributes = getattr(st, "st_file_attributes", None)
+    if attributes is not None:
+        return bool(attributes & _WINDOWS_PLACEHOLDER_ATTRIBUTES)
+    if getattr(st, "st_flags", 0) & _MACOS_SF_DATALESS:
+        return True
+    blocks = getattr(st, "st_blocks", None)
+    return blocks == 0 and st.st_size > _PLACEHOLDER_MIN_BYTES
+
+
+def find_files(directory, extensions, debug=False, errors=None, placeholders=None):
     """Recursively find all files with the specified extensions using os.scandir().
 
     Yields (filepath, is_symlink, size_bytes, mtime_ns) tuples.
@@ -1024,6 +1103,8 @@ def find_files(directory, extensions, debug=False, errors=None):
     infinite loops from symlink cycles).  Symlinked files are still yielded.
     Folders and files that can't be read are skipped; if *errors* is a list,
     (kind, path, is_io_error, message) tuples are appended to it for each one.
+    If *placeholders* is a set, paths of files whose data isn't on the drive
+    (see is_placeholder_stat) are added to it before they are yielded.
     """
     try:
         scan_it = os.scandir(directory)
@@ -1052,7 +1133,8 @@ def find_files(directory, extensions, debug=False, errors=None):
                             )
                         continue
                     # Real directory — recurse
-                    yield from find_files(entry.path, extensions, debug=debug, errors=errors)
+                    yield from find_files(entry.path, extensions, debug=debug, errors=errors,
+                                          placeholders=placeholders)
                 elif is_link and entry.is_dir(follow_symlinks=True):
                     # Symlinked directory — skip recursion to avoid
                     # duplicate traversal and symlink loops
@@ -1063,6 +1145,8 @@ def find_files(directory, extensions, debug=False, errors=None):
                             yield entry.path, True, None, None
                         else:
                             st = entry.stat(follow_symlinks=True)
+                            if placeholders is not None and is_placeholder_stat(st):
+                                placeholders.add(entry.path)
                             yield entry.path, False, st.st_size, st.st_mtime_ns
             except (PermissionError, OSError) as e:
                 if errors is not None:
@@ -1745,8 +1829,8 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                 return cache
 
             expected = list(TSV_COLUMNS)
-            legacy = expected[:-1]
-            if fieldnames != expected and fieldnames != legacy:
+            # Older lists: without flags (v1.6), and also without content_hash.
+            if fieldnames not in (expected, expected[:-1], expected[:-2]):
                 if debug:
                     print(
                         f"Debug: Cache file {output_file} header mismatch. Found: {fieldnames}"
@@ -1802,6 +1886,7 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                             # Kept so a partial save can write this row back unchanged.
                             "filepath": display_path,
                             "content_hash": row.get("content_hash", "") or "",
+                            "flags": row.get("flags", "") or "",
                         }
                     except (ValueError, KeyError):
                         continue
@@ -1906,6 +1991,7 @@ def write_dates_to_file_atomic(
                     gps_lon = row[5] if len(row) > 5 else ""
                     location = row[6] if len(row) > 6 else ""
                     content_hash = row[7] if len(row) > 7 else ""
+                    flags = row[8] if len(row) > 8 else ""
                     writer.writerow(
                         [
                             filepath,
@@ -1916,6 +2002,7 @@ def write_dates_to_file_atomic(
                             gps_lon or "",
                             location or "",
                             content_hash or "",
+                            flags or "",
                         ]
                     )
         os.replace(temp_file, output_file)
@@ -2119,6 +2206,8 @@ def _build_moved_index(cache):
     """
     index = {}
     for key, entry in cache.items():
+        if entry.get("flags"):
+            continue  # placeholders and files inside archives were never read
         name = key.rsplit("/", 1)[-1].lower()
         if not entry.get("size_bytes") or name.rsplit(".", 1)[-1] not in EXIFTOOL_EXTENSIONS:
             continue
@@ -2756,6 +2845,7 @@ class _DiscoveryState:
         "done",
         "done_time",
         "error",
+        "placeholders",
         "read_errors",
         "t_queue_wait",
         "t_walk",
@@ -2770,6 +2860,7 @@ class _DiscoveryState:
         self.done = threading.Event()
         self.error = None  # exception from producer, if any
         self.read_errors = []  # (kind, path, is_io_error, message) for unreadable folders/files
+        self.placeholders = set()  # paths of files whose data isn't on the drive
         self.done_time = 0.0  # wall-clock time when discovery finished
         self.t_walk = 0.0  # time spent inside scandir walk (excl. queue blocking)
         self.t_queue_wait = 0.0  # time spent blocked on queue.put()
@@ -2791,7 +2882,8 @@ def _discovery_producer(file_queue, directory, extensions, state, debug=False):
         count = 0
         t_walk = 0.0
         t_queue = 0.0
-        it = iter(find_files(directory, extensions, debug=debug, errors=state.read_errors))
+        it = iter(find_files(directory, extensions, debug=debug, errors=state.read_errors,
+                             placeholders=state.placeholders))
         while True:
             tw0 = time.monotonic()
             try:
@@ -3164,6 +3256,63 @@ def _exiftool_worker(
 # ---------------------------------------------------------------------------
 
 
+def _list_archive_contents(archives, cache, photo_data, mark_done, extensions, quiet):
+    """Add a row for each file inside the scan's archives (flagged "archive",
+    path = archive path + "/" + path inside). An archive unchanged since the
+    last list reuses its earlier rows without being opened."""
+    wanted = {key for _, _, key, _, _ in archives}
+    previous = defaultdict(list)  # archive key -> [(key, entry)] from the last list
+    for key, entry in cache.items():
+        if FLAG_ARCHIVE not in (entry.get("flags") or ""):
+            continue
+        cut = key.rfind("/")
+        while cut > 0:
+            if key[:cut] in wanted:
+                previous[key[:cut]].append((key, entry))
+                break
+            cut = key.rfind("/", 0, cut)
+
+    def reuse(rows):
+        for key, entry in rows:
+            photo_data.append((entry.get("filepath") or key, entry.get("date_taken") or "",
+                               entry["size_bytes"], entry["mtime_ns"], "", "", "", "",
+                               FLAG_ARCHIVE))
+            mark_done(key)
+
+    if not quiet:
+        print(f"Looking inside {len(archives):,} archive(s)...")
+    listed = reused = 0
+    stopped = False
+    for out_path, fs_path, key_path, kind, unchanged in archives:
+        if stopped or (unchanged and previous.get(key_path)):
+            reuse(previous.get(key_path, ()))
+            reused += 1
+            continue
+        rows = []
+        try:
+            for inner, size, mtime in list_archive(fs_path, kind):
+                if extensions is not None and not is_supported_file(inner, extensions):
+                    continue
+                rows.append((f"{out_path}/{inner}", "", size, mtime, "", "", "", "",
+                             FLAG_ARCHIVE))
+        except KeyboardInterrupt:
+            stopped = True
+            reuse(previous.get(key_path, ()))
+            print("Stopped looking inside archives; their earlier contents are kept.")
+            continue
+        except Exception as exc:  # damaged, encrypted index, unsupported...
+            reuse(previous.get(key_path, ()))
+            if not quiet:
+                print(f"  Couldn't look inside {out_path}: {exc}")
+            continue
+        for row in rows:
+            mark_done(_normalize_cache_key(row[0]))
+        photo_data.extend(rows)
+        listed += 1
+    if not quiet and (listed or reused):
+        print(f"  {listed:,} archive(s) listed, {reused:,} unchanged and reused.")
+
+
 def run_scan(
     directory,
     output,
@@ -3182,6 +3331,7 @@ def run_scan(
     retry_blank_exif=False,
     volume_info=None,
     reuse_other_lists=True,
+    archives=DEFAULT_ARCHIVE_MODE,
 ):
     """Run a scan on the specified directory.
 
@@ -3191,6 +3341,8 @@ def run_scan(
     volume_info (a DriveInfo) identifies the drive when *directory* is a whole
     drive; it is recorded in the inventory header so the list can be matched
     to its drive later even if the mount point or drive letter changes.
+    archives ("off", "zip" or "all") chooses which archives have the files
+    inside them listed too (see ARCHIVE_MODES).
     """
     _t0 = time.time()
     worker_count = _clamp_worker_count(workers)
@@ -3299,6 +3451,7 @@ def run_scan(
     # modification time; reuse their earlier EXIF results instead of re-reading.
     moved_index = None  # (name_lower, size, mtime_ns) -> cached entry, built on first need
     moved_reused_count = 0
+    archives_found = []  # (out_path, fs_path, key_path, archive_type, unchanged since last list)
     # Alan 9/28/26 - Copies of photos already listed for another drive in the
     # same folder reuse that list's dates too.
     other_index = None  # (name_lower, size, mtime_ns) -> (date, lat, lon, location)
@@ -3356,6 +3509,7 @@ def run_scan(
                     entry.get("gps_lon") or "",
                     entry.get("location") or "",
                     entry.get("content_hash") or "",
+                    entry.get("flags") or "",
                 )
             )
         return rows
@@ -3402,7 +3556,12 @@ def run_scan(
     discovery = _DiscoveryState()
     producer = threading.Thread(
         target=_discovery_producer,
-        args=(file_queue, directory, extensions, discovery, debug),
+        # Archives are found even when only some file types are listed; the
+        # filter is applied to the files inside them instead.
+        args=(file_queue, directory,
+              extensions if extensions is None or old_format
+              else set(extensions) | archive_extensions(archives),
+              discovery, debug),
         daemon=True,
     )
     producer.start()
@@ -3936,6 +4095,19 @@ def run_scan(
                         and cached_entry["size_bytes"] == size_bytes
                         and cached_entry["mtime_ns"] == mtime_ns
                     )
+                    # Reading a cloud placeholder would download it (or fail), so
+                    # it is listed from what the drive reports, without ExifTool
+                    # or hashing; a date read while it was stored here is kept.
+                    # Same string the producer recorded (the scan folder may be relative).
+                    placeholder = not is_symlink and file in discovery.placeholders
+                    archive_type = ("" if placeholder or old_format
+                                    else archive_kind(basename, archives))
+                    if archive_type:
+                        archives_found.append(
+                            (out_path, fs_path, key_path, archive_type, bool(cache_valid)))
+                        if (extensions is not None and not old_format
+                                and not is_supported_file(basename, extensions)):
+                            continue  # found only so the files inside it can be listed
                     if cached_entry is None:
                         if had_previous_list:
                             new_files.append((out_path, size_bytes, mtime_ns))
@@ -3954,8 +4126,13 @@ def run_scan(
                                     f"Debug: Retrying blank EXIF cache row: {out_path}"
                                 )
 
+                    # A placeholder that has since been downloaded is read now.
+                    downloaded = (cache_valid and not placeholder and FLAG_PLACEHOLDER
+                                  in (cached_entry.get("flags") or ""))
                     source_entry = (
-                        cached_entry if cache_valid and not retry_cached_blank_exif else None
+                        cached_entry
+                        if cache_valid and not retry_cached_blank_exif and not downloaded
+                        else None
                     )
                     reused_moved = False
                     if (
@@ -4019,7 +4196,7 @@ def run_scan(
                                 source_entry["location"] = location
 
                         _th0 = time.time()
-                        content_hash = get_content_hash(
+                        content_hash = "" if placeholder else get_content_hash(
                             key_path,
                             size_bytes,
                             mtime_ns,
@@ -4039,6 +4216,7 @@ def run_scan(
                                 gps_lon or "",
                                 location or "",
                                 content_hash,
+                                FLAG_PLACEHOLDER if placeholder else "",
                             )
                         )
                         cached_count += 1
@@ -4051,7 +4229,13 @@ def run_scan(
 
                     else:
                         # Not cached, stale, or forced retry — check if exiftool-eligible
-                        if ext in EXIFTOOL_EXTENSIONS:
+                        if placeholder:
+                            photo_data.append((out_path, "", size_bytes, mtime_ns, "", "", "",
+                                               "", FLAG_PLACEHOLDER))
+                            _mark_done(key_path)
+                            processed_count += 1
+                            file_counts[ext] += 1
+                        elif ext in EXIFTOOL_EXTENSIONS:
                             # Tiny images (icons, thumbnails) almost never have EXIF.
                             # RAW/video/other EXIFTOOL_EXTENSIONS are not filtered.
                             skip_for_size = (
@@ -4247,9 +4431,12 @@ def run_scan(
     if worker_shutdown_timed_out:
         cleanup_all()
         return False
+    if archives_found:
+        _list_archive_contents(archives_found, cache, photo_data, _mark_done, extensions,
+                               quiet)
 
     total_seen = cached_count + processed_count
-    if total_seen == 0:
+    if total_seen == 0 and not photo_data:  # files inside archives count too
         if not quiet:
             print("No files found.")
         cleanup_all()
@@ -4300,6 +4487,12 @@ def run_scan(
             print(
                 f"  {other_reused_count:,} photos/videos reused dates from other drives' "
                 "lists without being read"
+            )
+        placeholders_listed = len(discovery.placeholders)
+        if placeholders_listed:
+            print(
+                f"  {placeholders_listed:,} cloud placeholder file(s) (data not stored on this "
+                "drive) were listed without being read"
             )
         if retry_blank_exif:
             print(f"Blank EXIF rows retried: {retry_blank_exif_count:,}")
@@ -4502,7 +4695,9 @@ def add_hashes_to_inventory(
         return True
 
     # Count how many need hashes
-    need_hash = [r for r in rows if not r.get("content_hash", "").strip()]
+    # Placeholders and files inside archives can't be read directly.
+    need_hash = [r for r in rows if not r.get("content_hash", "").strip()
+                 and not r.get("flags", "").strip()]
     if not need_hash:
         if not quiet:
             print(f"All {len(rows)} rows already have content hashes.")
@@ -4536,9 +4731,7 @@ def add_hashes_to_inventory(
         with _StatusOutputPauseController(
             enabled=(not quiet and _IS_TTY)
         ) as status_pause:
-            for row in rows:
-                if row.get("content_hash", "").strip():
-                    continue  # already has hash
+            for row in need_hash:  # rows without a hash that aren't flagged
 
                 filepath = row.get("filepath", "")
                 if not filepath:
@@ -4701,6 +4894,7 @@ def add_hashes_to_inventory(
                         row.get("gps_lon", ""),
                         row.get("location", ""),
                         row.get("content_hash", ""),
+                        row.get("flags", ""),
                     ]
                 )
         os.replace(temp_file, tsv_path)
@@ -5384,6 +5578,7 @@ class _InteractiveSettings:
         self.workers = 4
         self.min_image_size = MIN_EXIFTOOL_IMAGE_BYTES
         self.path_style = "auto"
+        self.archives = DEFAULT_ARCHIVE_MODE
 
     def command_line(self, directory, output):
         """The equivalent findphotodates.py command for these settings."""
@@ -5403,6 +5598,8 @@ class _InteractiveSettings:
             args += ["--min-image-size", str(self.min_image_size)]
         if self.path_style != "auto":
             args.append(f"--{self.path_style}")
+        if self.archives != DEFAULT_ARCHIVE_MODE:
+            args += ["--archives", self.archives]
         if platform.system() == "Windows":
             return "python " + subprocess.list2cmdline(args)
         import shlex
@@ -5524,6 +5721,17 @@ _ADVANCED_HELP = {
         "already uses. The lists work on any computer either way; only change this if "
         "another program needs one particular style.",
     ),
+    "archives": (
+        "Look inside archives",
+        "Files inside archives are listed too, so a photo kept only in a .zip (for example "
+        "a Facebook or Google Photos export) counts as a copy. Their location is the "
+        "archive's location followed by the path inside it. Nothing is extracted.\n"
+        ".zip only (default): reads just each .zip's table of contents, which is quick.\n"
+        "All archives: also .tar and .tgz, which have to be read from start to finish; "
+        "slow for large ones, and hard work for a failing drive. Unchanged archives are "
+        "not read again on later scans.\n"
+        "Off: list archives as single files.",
+    ),
     "folder_scan": (
         "Make or update a list for one folder",
         "Lists a single folder instead of a whole drive, for example your Pictures "
@@ -5590,6 +5798,7 @@ def _run_interactive_scan(settings, directory, output, drive=None):
         min_image_size=settings.min_image_size,
         retry_blank_exif=settings.retry_blank_exif,
         volume_info=drive,
+        archives=settings.archives,
     )
     if ok is False:
         print("\nThe scan did not finish. Anything already saved is kept; choose the "
@@ -5677,6 +5886,7 @@ def _print_drive_menu(drives, list_for, list_dir, lists):
     if any(d.mount in list_for for d in drives):
         print("  u) Update every connected drive that has a file list")
     print("  h) Check drive health")
+    print("  c) Coverage report: which photos and videos have a second copy")
     print("  l) Show all file lists, including drives that aren't connected")
     print("  r) Look for drives again (after plugging one in)")
     print("  a) Advanced options")
@@ -5713,6 +5923,7 @@ def _advanced_menu(settings, state):
             ("workers", str(s.workers)),
             ("min_size", f"{s.min_image_size:,} bytes" if s.min_image_size else "Off (open every image)"),
             ("path_style", {"auto": "Automatic", "linux": "Linux style", "windows": "Windows style"}[s.path_style]),
+            ("archives", _ARCHIVE_LABELS[s.archives]),
             ("folder_scan", ""),
             ("check", ""),
             ("import", ""),
@@ -5781,6 +5992,11 @@ def _change_advanced_setting(key, s, state):
                       [("Automatic", "auto"), ("Linux style", "linux"), ("Windows style", "windows")])
         if value is not None:
             s.path_style = value
+    elif key == "archives":
+        value = _pick("  Choose 1-3 (Enter to keep): ",
+                      [(label, mode) for mode, label in _ARCHIVE_LABELS.items()])
+        if value is not None:
+            s.archives = value
     elif key == "folder_scan":
         folder = _ask_folder("  Folder to list: ")
         if folder:
@@ -6377,6 +6593,130 @@ def _basic_health(target):
     return report
 
 
+# Alan 11/1/26 - Some USB enclosures handle Linux's fast "UAS" protocol badly:
+# commands time out, the connection resets, and it looks like a failing drive.
+# Telling Linux to use plain usb-storage for that one device (the "u" quirk)
+# usually fixes it. Also spot USB 3 drives stuck at USB 2 speed (bad cable).
+_UAS_ERROR_RE = re.compile(r"uas_eh_|uas-tag|uas_zap|uas_.*abort", re.IGNORECASE)
+
+
+def _read_sys(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def _usb3_capable(usb_device):
+    """True when a USB device can run at USB 3 speed. A USB 3 device plugged in
+    over USB 2 reports version 2.10, so its SuperSpeed capability is read from
+    the BOS descriptor; the version is the fallback when that isn't available."""
+    try:
+        bos = Path(usb_device, "bos_descriptors").read_bytes()
+    except OSError:
+        bos = b""
+    position = bos[0] if len(bos) >= 5 and bos[1] == 0x0F else 0
+    while position and position + 3 <= len(bos):
+        length = bos[position]
+        if length < 3:
+            break
+        if bos[position + 1] == 0x10 and bos[position + 2] in (0x03, 0x0A):
+            return True  # SuperSpeed or SuperSpeedPlus device capability
+        position += length
+    version = _read_sys(Path(usb_device, "version"))
+    try:
+        return float(version.split()[0]) >= 3 if version else False
+    except ValueError:
+        return False
+
+
+def _kernel_log():
+    """This boot's kernel messages, or '' if they can't be read."""
+    out = _run_quiet(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"], timeout=30)
+    return out or _run_quiet(["dmesg"], timeout=30) or ""
+
+
+def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
+    """[(level, headline, explanation)] about how a Linux USB drive is connected."""
+    name = os.path.basename(device)
+    try:
+        scsi = Path(os.path.realpath(f"{sys_root}/block/{name}/device"))
+    except OSError:
+        return []
+    interface = usb_device = None
+    for parent in scsi.parents:
+        if interface is None and (parent / "bInterfaceNumber").exists():
+            interface = parent
+        if (parent / "idVendor").exists():
+            usb_device = parent
+            break
+    if interface is None or usb_device is None:
+        return []
+    driver = os.path.basename(os.path.realpath(interface / "driver"))
+    vid, pid = _read_sys(usb_device / "idVendor"), _read_sys(usb_device / "idProduct")
+    findings = []
+
+    if driver == "uas" and vid and pid:
+        log = _kernel_log() if kernel_log is None else kernel_log
+        port = usb_device.name
+        uas_errors = sum(1 for line in log.splitlines()
+                         if f"[{name}]" in line and _UAS_ERROR_RE.search(line))
+        resets = sum(1 for line in log.splitlines()
+                     if f"usb {port}: reset" in line)
+        if uas_errors or resets >= 2:
+            quirk = f"{vid}:{pid}:u"
+            existing = _read_sys(f"{sys_root}/module/usb_storage/parameters/quirks")
+            # Linux uses the first entry for a device, so add "u" to any
+            # flags this device already has rather than a second entry.
+            # IDs are compared as numbers: "bc2" and "0bc2" are the same.
+            def ids(entry):
+                parts = entry.split(":")
+                try:
+                    return int(parts[0], 16), int(parts[1], 16)
+                except (IndexError, ValueError):
+                    return None
+
+            device = ids(quirk)
+            entries, merged = [], False
+            for entry in (q.strip() for q in existing.split(",")):
+                if not entry:
+                    continue
+                if ids(entry) == device:
+                    if merged:
+                        continue  # a later entry for this device would be ignored anyway
+                    flags = entry.split(":")[2] if entry.count(":") == 2 else ""
+                    entry = f"{vid}:{pid}:{flags if 'u' in flags else flags + 'u'}"
+                    merged = True
+                entries.append(entry)
+            value = ",".join(entries if merged else entries + [quirk])
+            seen = ", ".join(x for x in (
+                f"{uas_errors} UAS command error(s)" if uas_errors else "",
+                f"{resets} connection reset(s)" if resets else "") if x)
+            findings.append((
+                HEALTH_WARNING,
+                f"The USB connection is resetting ({seen} since this computer started)",
+                "Linux talks to this drive with the fast UAS method, which some USB "
+                "enclosures handle badly: commands time out and the connection resets. It "
+                "looks like a failing drive and can cause read errors. Telling Linux to use "
+                "the older usb-storage method for this one drive usually fixes it:\n"
+                f"  echo {value} | sudo tee /sys/module/usb_storage/parameters/quirks\n"
+                "then unplug the drive and plug it back in. To keep the setting after a "
+                "restart, put this line in /etc/modprobe.d/usb-storage-quirks.conf:\n"
+                f"  options usb-storage quirks={value}\n"
+                "(and rebuild the initramfs if your system loads usb-storage early), or add "
+                f"usb-storage.quirks={value} to the kernel command line.",
+            ))
+
+    if _read_sys(usb_device / "speed") == "480" and _usb3_capable(usb_device):
+        findings.append((
+            HEALTH_NOTE,
+            "Connected at USB 2 speed, although the drive supports USB 3",
+            "Reading and copying will be about ten times slower than they could be. Try "
+            "the drive's own USB 3 cable and a USB 3 port (often blue, or marked SS).",
+        ))
+    return findings
+
+
 def quick_health_check(target, use_sudo=False):
     """Read a drive's health. Uses smartctl when installed, else what the OS reports."""
     if target.kind == "SD card":
@@ -6389,8 +6729,23 @@ def quick_health_check(target, use_sudo=False):
         report = interpret_smart(target, data)
         report.device_type = used_type
         if report.smart_available or platform.system() == "Linux":
+            _add_usb_findings(report)
             return report
-    return _basic_health(target)
+    report = _basic_health(target)
+    _add_usb_findings(report)
+    return report
+
+
+def _add_usb_findings(report):
+    target = report.target
+    if platform.system() != "Linux" or _is_wsl() or target.transport != "usb":
+        return
+    try:
+        findings = usb_connection_findings(target.device)
+    except Exception:
+        return  # advice about the connection is never worth failing a health check
+    for level, headline, explanation in findings:
+        report.add(level, headline, explanation)
 
 
 # Alan 9/28/26 - Every health check is appended to a log kept with the file
@@ -6603,11 +6958,12 @@ def print_health_report(report):
     print(f"\n{target.description()}")
     where = ", ".join(target.mounts) if target.mounts else "not mounted"
     print(f"  Device: {target.device}   Mounted at: {where}")
-    if report.problem and not report.smart_available and report.verdict == HEALTH_UNKNOWN:
+    if report.problem and not report.smart_available:
+        # No health data, but USB connection findings may still follow.
         problem = report.problem.rstrip(".")
-        print(f"  Health: UNKNOWN. {problem[0].upper()}{problem[1:]}.")
-        return
-    print(f"  Health: {_VERDICT_TEXT[report.verdict]}")
+        print(f"  Health: {_VERDICT_TEXT[report.verdict]}. {problem[0].upper()}{problem[1:]}.")
+    else:
+        print(f"  Health: {_VERDICT_TEXT[report.verdict]}")
     for fact in report.facts:
         print(f"  {fact}")
     if report.self_test_running is not None:
@@ -6923,6 +7279,115 @@ def _update_drives(settings, drives, list_for, state):
     state["dirty"] = True
 
 
+def _coverage_settings():
+    from findphotodates_coverage import CoverageSettings
+
+    return CoverageSettings.from_config(load_config())
+
+
+def _save_coverage_settings(settings):
+    save_config(settings.to_config(load_config()))
+
+
+def remember_connected_drives(lists):
+    """Record today as the last day each listed drive was seen connected
+    (used for the Backblaze reminder in the coverage report)."""
+    from findphotodates_coverage import record_connected
+
+    try:
+        settings = _coverage_settings()
+        if record_connected(settings, lists):
+            _save_coverage_settings(settings)
+    except Exception:
+        pass  # a reminder date is never worth interrupting the user for
+
+
+def coverage_for(lists=None, list_dir=None, progress=None):
+    """(drives, settings) for every file list; connected drives are matched first."""
+    from findphotodates_coverage import build_coverage
+
+    if lists is None:
+        lists = find_file_lists(list_dir or default_inventory_dir())
+        match_lists_to_drives(lists, detect_drives())
+        remember_connected_drives(lists)
+    settings = _coverage_settings()
+    drives = build_coverage(lists, settings, read_health_log(list_dir), progress=progress)
+    return drives, settings
+
+
+def print_coverage_report(history_days=None, report=True, lists=None, list_dir=None):
+    from findphotodates_coverage import BACKBLAZE_HISTORY_CHOICES, format_report
+
+    if history_days is not None:
+        settings = _coverage_settings()
+        settings.backblaze_history_days = history_days
+        _save_coverage_settings(settings)
+        print(f"Backblaze version history set to {BACKBLAZE_HISTORY_CHOICES[history_days]}.")
+    if not report:
+        return None
+    print("Comparing every file list (this reads the lists, not the drives)...")
+    drives, settings = coverage_for(lists, list_dir)
+    print()
+    print(format_report(drives, settings))
+    return drives
+
+
+def _interactive_coverage(state):
+    from findphotodates_coverage import (
+        BACKBLAZE_HISTORY_CHOICES, ROLE_AUTO, ROLE_GONE, ROLE_KEEP, ROLE_LABELS, ROLE_WEAK,
+        list_display_name,
+    )
+
+    print()
+    print(_wrap(
+        "The coverage report compares all your file lists. A photo or video counts as "
+        "having a copy when another drive has a file with the same name and size (and the "
+        "same date taken, when both have one). Drives you mark as weak (failing, or about "
+        "to be retired) don't count as safe copies.", indent=""))
+    print_coverage_report(lists=state["lists"], list_dir=state["list_dir"])
+    lists = state["lists"]
+    while True:
+        settings = _coverage_settings()
+        print("Settings:")
+        print(f"  b) Backblaze version history: "
+              f"{BACKBLAZE_HISTORY_CHOICES[settings.backblaze_history_days]}")
+        print("  Drives (role / backed up by Backblaze):")
+        for n, fl in enumerate(lists, 1):
+            s = settings.drive(fl.path.name)
+            print(f"  {n:>2}) {list_display_name(fl)}: {ROLE_LABELS[s.role]}, "
+                  f"Backblaze {'yes' if s.backblaze else 'no'}")
+        print("  r) Show the report again   q) Back")
+        choice = _ask("Choose a setting or drive number: ").lower()
+        if choice in ("q", ""):
+            return
+        if choice == "r":
+            print_coverage_report(lists=lists, list_dir=state["list_dir"])
+        elif choice == "b":
+            print("Backblaze version history:")
+            picked = _pick("Choose: ", [(label, days) for days, label
+                                        in BACKBLAZE_HISTORY_CHOICES.items()])
+            if picked is not None:
+                settings.backblaze_history_days = picked
+                _save_coverage_settings(settings)
+        elif choice.isdigit() and 1 <= int(choice) <= len(lists):
+            fl = lists[int(choice) - 1]
+            s = settings.drive(fl.path.name)
+            print(f"What is {list_display_name(fl)}? (now: {ROLE_LABELS[s.role]})")
+            picked = _pick("Choose (Enter keeps it): ", [
+                ("Automatic: keep it unless its health check shows it failing", ROLE_AUTO),
+                ("Keep: a drive you rely on", ROLE_KEEP),
+                ("Weak: failing or about to be retired; copies here don't count as safe",
+                 ROLE_WEAK),
+                ("Gone: wiped or lost; ignore its file list", ROLE_GONE),
+            ])
+            if picked is not None:
+                s.role = picked
+            s.backblaze = _confirm("Does Backblaze back up this drive?", default=s.backblaze)
+            _save_coverage_settings(settings)
+        else:
+            print("Please choose one of the options shown.")
+
+
 def interactive_main():
     """Menu-driven mode used when the program is started with no arguments."""
     print(f"\nfindphotodates {__version__}: lists of the files on your drives\n")
@@ -6951,6 +7416,7 @@ def interactive_main():
                 match_lists_to_drives(state["lists"], state["drives"])
                 state["list_for"] = {fl.drive.mount: fl for fl in state["lists"] if fl.drive}
                 state["dirty"] = False
+                remember_connected_drives(state["lists"])
             drives, list_for = state["drives"], state["list_for"]
             _print_drive_menu(drives, list_for, state["list_dir"], state["lists"])
             choice = _ask("\nChoose: ").lower()
@@ -6961,6 +7427,8 @@ def interactive_main():
             elif choice == "h":
                 _interactive_health()
                 print()
+            elif choice == "c":
+                _interactive_coverage(state)
             elif choice == "l":
                 _show_all_lists(state["lists"])
             elif choice == "a":
@@ -7058,6 +7526,9 @@ Options:
   --interactive      Open the menu (the default when run with no options).
   --health [quick|extended|history]  Check drive health (all drives, or the one holding
                      --directory), or show the health log kept next to the file lists.
+  --coverage         Show which photos/videos have a copy on another drive, which drives
+                     are safe to retire, and which need connecting for Backblaze.
+  --backblaze-history {30,365}  Your Backblaze version history in days (saved).
   --directory DIR    The directory to search (default: current directory).
   --output FILE      The output TSV file to save results (default: photo.dates.tsv).
   --only-media       Index only media files (photos + videos).
@@ -7074,6 +7545,7 @@ Options:
   --min-image-size BYTES  Skip ExifTool for tiny JPG/JPEG/PNG/WebP images (default: 100,000; 0 disables).
   --retry-blank-exif      Re-query ExifTool-eligible cached rows with blank date_taken.
   --no-reuse-other-lists  Don't reuse dates from other inventories in the output's folder.
+  --archives {off,zip,all}  List files inside .zip archives (default zip), also .tar/.tgz (all).
   --add-hashes             Fill in missing hashes for an existing inventory file.
   --old-format       Write legacy line-based output (./path: YYYY:MM:DD HH:MM:SS) without hashes.
   --save             Save the current scan configuration for later use.
@@ -7113,6 +7585,19 @@ For more details on a specific option, you can also use:
         "data; 'extended' (hours) also runs the drive's full-surface self-test. Checks every "
         "drive, or only the one holding --directory if given. Results are added to "
         f"'{HEALTH_LOG_NAME}' next to the file lists; 'history' shows that log.",
+    )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Show which photos and videos on each drive have a copy on another drive, "
+        "which drives are safe to retire, and which need connecting so Backblaze keeps "
+        "their backup. Uses the file lists only; no drive is read.",
+    )
+    parser.add_argument(
+        "--backblaze-history",
+        choices=["30", "365"],
+        help="Your Backblaze version history in days (30 = the standard plan, 365 = 1 year). "
+        "Saved for later coverage reports.",
     )
     parser.add_argument("-q", "--quiet", action="store_true", help="Run quietly.")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode.")
@@ -7230,6 +7715,13 @@ For more details on a specific option, you can also use:
         help="Read every new photo with ExifTool instead of reusing dates from other inventories in the output's folder.",
     )
     parser.add_argument(
+        "--archives",
+        choices=ARCHIVE_MODES,
+        default=DEFAULT_ARCHIVE_MODE,
+        help="List the files inside archives too: 'zip' (default; reads only each .zip's "
+        "table of contents), 'all' (also .tar/.tgz, which must be read in full), or 'off'.",
+    )
+    parser.add_argument(
         "--linux",
         action="store_const",
         dest="path_style",
@@ -7276,6 +7768,12 @@ For more details on a specific option, you can also use:
 
     if args.health == "history":
         print_health_history()
+        return
+    if args.coverage or args.backblaze_history:
+        print_coverage_report(
+            history_days=int(args.backblaze_history) if args.backblaze_history else None,
+            report=args.coverage,
+        )
         return
     if args.health:
         directory = None if args.directory == "." else _expand_path(args.directory)
@@ -7361,6 +7859,7 @@ For more details on a specific option, you can also use:
             "min_image_size": _clamp_min_image_size(args.min_image_size),
             "retry_blank_exif": args.retry_blank_exif,
             "reuse_other_lists": args.reuse_other_lists,
+            "archives": args.archives,
         }
 
         config = load_config()
@@ -7431,6 +7930,7 @@ For more details on a specific option, you can also use:
                 min_image_size=args.min_image_size,
                 retry_blank_exif=args.retry_blank_exif,
                 reuse_other_lists=args.reuse_other_lists,
+                archives=args.archives,
             )
             if scan_perf and (
                 # Print a performance summary if the run takes more than 1000 seconds
@@ -7498,6 +7998,7 @@ For more details on a specific option, you can also use:
                     ),
                     retry_blank_exif=flags.get("retry_blank_exif", False),
                     reuse_other_lists=flags.get("reuse_other_lists", True),
+                    archives=flags.get("archives", DEFAULT_ARCHIVE_MODE),
                 )
                 if ok is False:
                     any_scan_failed = True
@@ -7549,6 +8050,7 @@ For more details on a specific option, you can also use:
         min_image_size=args.min_image_size,
         retry_blank_exif=args.retry_blank_exif,
         reuse_other_lists=args.reuse_other_lists,
+        archives=args.archives,
     )
     if scan_perf and (args.debugperformance or scan_perf.get("wall_total", 0) >= 1000):
         _print_perf_summary(directory_abs, scan_perf)

@@ -24,6 +24,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min-image-size", type=int, default=fp.MIN_EXIFTOOL_IMAGE_BYTES)
     parser.add_argument("--path-style", choices=("auto", "linux", "windows"), default="auto")
+    parser.add_argument("--archives", choices=fp.ARCHIVE_MODES, default=fp.DEFAULT_ARCHIVE_MODE)
     parser.add_argument("--extended", action="store_true")
     args = parser.parse_args(argv)
 
@@ -43,6 +44,7 @@ def main(argv=None):
         settings.workers = fp._clamp_worker_count(args.workers)
         settings.min_image_size = fp._clamp_min_image_size(args.min_image_size)
         settings.path_style = args.path_style
+        settings.archives = args.archives
         drive = fp.identify_drive(args.directory) if args.whole_drive else None
         ok = fp._run_interactive_scan(settings, args.directory, args.output, drive=drive)
         if ok and drive and args.list_dir:

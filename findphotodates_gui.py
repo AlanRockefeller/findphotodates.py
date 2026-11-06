@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import datetime as _datetime
 import os
 import queue
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -15,7 +17,9 @@ from pathlib import Path
 from findphotodates_gui_startup import dependency_message
 
 try:
-    from tkinter import TclError, filedialog, messagebox
+    from tkinter import TclError, filedialog, messagebox, ttk
+    from tkinter import font as tkfont
+
     import customtkinter as ctk
 except (ImportError, OSError) as exc:
     if __name__ == "__main__":
@@ -33,9 +37,25 @@ except (ImportError, OSError) as exc:
     raise
 
 import findphotodates as fp
-
+import findphotodates_coverage as coverage
+from findphotodates_search import (
+    InventorySearchIndex,
+    SearchQueryError,
+    normalize_photo_day,
+)
 
 APP_TITLE = f"Find Photo Dates {fp.__version__}"
+GUI_SCALE_CHOICES = {
+    "Text: 100%": 1.0,
+    "Text: 125%": 1.25,
+    "Text: 150%": 1.5,
+    "Text: 175%": 1.75,
+    "Text: 200%": 2.0,
+}
+
+
+def _closest_scale_label(scale):
+    return min(GUI_SCALE_CHOICES, key=lambda label: abs(GUI_SCALE_CHOICES[label] - scale))
 
 
 def worker_command(arguments):
@@ -50,7 +70,7 @@ def scan_arguments(settings, directory, output, list_dir, *, whole_drive=False):
     args = ["scan", "--directory", str(directory), "--output", str(output),
             "--list-dir", str(list_dir), "--hash", settings.hash_mode,
             "--workers", str(settings.workers), "--min-image-size", str(settings.min_image_size),
-            "--path-style", settings.path_style]
+            "--path-style", settings.path_style, "--archives", settings.archives]
     if settings.only_media:
         args.append("--only-media")
     if settings.locate:
@@ -134,13 +154,972 @@ class HoverHelp:
             self.popup = None
 
 
+class FileSearchDialog(ctk.CTkToplevel):
+    """Responsive search window backed by a persistent inventory index."""
+
+    RESULT_LIMIT = 500
+
+    def __init__(self, parent, file_lists):
+        super().__init__(parent)
+        self.parent = parent
+        self.file_lists = list(file_lists)
+        self.index = InventorySearchIndex(fp.DEFAULT_CACHE_DIR / "inventory_search.sqlite3")
+        self.events = queue.Queue()
+        self.results = {}
+        self.generation = 0
+        self.index_ready = False
+        self.pending_search = False
+        self.offset = 0
+        self._after_id = None
+        self._closed = False
+
+        self.title("Search file lists")
+        self.geometry("1120x690")
+        self.minsize(760, 480)
+        self.transient(parent)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build_controls()
+        self._build_results()
+        self._build_details()
+        self._after_id = self.after(75, self._drain_events)
+        self._start_index()
+
+    def _build_controls(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(15, 5))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Search every file list", anchor="w",
+                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(head, text="Search help", width=100, fg_color="transparent",
+                      border_width=1, command=self._show_help).grid(row=0, column=1, padx=(8, 0))
+
+        controls = ctk.CTkFrame(self, corner_radius=8)
+        controls.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 8))
+        controls.grid_columnconfigure(0, weight=1)
+        self.query_var = ctk.StringVar()
+        self.query_entry = ctk.CTkEntry(
+            controls, textvariable=self.query_var, height=38,
+            placeholder_text='Optional: filename, folder, place, or filters such as ext:jpg size>10MB',
+        )
+        self.query_entry.grid(row=0, column=0, sticky="ew", padx=(10, 7), pady=(10, 5))
+        self.query_entry.bind("<Return>", self._search)
+        self.query_entry.bind("<KeyRelease>", self._schedule_search)
+        self.search_btn = ctk.CTkButton(controls, text="Search", width=92, height=38,
+                                        command=self._search, state="disabled")
+        self.search_btn.grid(row=0, column=1, padx=(0, 7), pady=(10, 5))
+
+        labels = ["All lists"]
+        self.list_choices = {"All lists": None}
+        for file_list in self.file_lists:
+            label = file_list.path.name
+            if label in self.list_choices:
+                label = str(file_list.path)
+            labels.append(label)
+            self.list_choices[label] = file_list.path
+        self.list_var = ctk.StringVar(value="All lists")
+        self.list_menu = ctk.CTkOptionMenu(controls, variable=self.list_var, values=labels,
+                                           width=220, command=lambda _value: self._search())
+        self.list_menu.grid(row=1, column=2, padx=(0, 10), pady=(5, 5))
+
+        date_row = ctk.CTkFrame(controls, fg_color="transparent")
+        date_row.grid(row=1, column=0, columnspan=2, sticky="w", padx=11, pady=(5, 5))
+        ctk.CTkLabel(date_row, text="Photos taken on:",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=(0, 7))
+        self.date_var = ctk.StringVar()
+        self.date_entry = ctk.CTkEntry(date_row, textvariable=self.date_var, width=150,
+                                       placeholder_text="YYYY-MM-DD")
+        self.date_entry.grid(row=0, column=1)
+        self.date_entry.bind("<Return>", self._search)
+        self.date_entry.bind("<KeyRelease>", self._schedule_search)
+        self.parent._text_button(date_row, "Today", self._use_today).grid(row=0, column=2, padx=(7, 0))
+        self.parent._text_button(date_row, "Clear", self._clear_date).grid(row=0, column=3, padx=(3, 0))
+        self.status_var = ctk.StringVar(value="Preparing the search index…")
+        ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
+                     text_color=("gray35", "gray72"))\
+            .grid(row=2, column=0, columnspan=3, sticky="ew", padx=11, pady=(0, 8))
+
+    def _build_results(self):
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        self.tree_style = ttk.Style(self)
+        dark = ctk.get_appearance_mode() == "Dark"
+        self.tree_style.configure("FileSearch.Treeview",
+                                  background="#242424" if dark else "#ffffff",
+                                  fieldbackground="#242424" if dark else "#ffffff",
+                                  foreground="#f2f2f2" if dark else "#202020")
+        self.tree_style.map("FileSearch.Treeview",
+                            background=[("selected", "#1f6aa5")],
+                            foreground=[("selected", "#ffffff")])
+        columns = ("path", "date", "size", "modified", "location", "list")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings",
+                                 style="FileSearch.Treeview", selectmode="browse")
+        self.tree_columns = (("path", "File path", 390), ("date", "Photo date", 145),
+                             ("size", "Size", 85), ("modified", "Modified", 145),
+                             ("location", "Place", 170), ("list", "File list", 170))
+        for column, title, width in self.tree_columns:
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, minwidth=60, stretch=column in ("path", "location"))
+        self.tree_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.tree_heading_font = tkfont.nametofont("TkHeadingFont").copy()
+        self.apply_scale(self.parent.gui_scale)
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview,
+                                 style="FileSearch.Vertical.TScrollbar")
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview,
+                                   style="FileSearch.Horizontal.TScrollbar")
+        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(8, 0))
+        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=(8, 0))
+        horizontal.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed)
+        self.tree.bind("<Double-1>", self._open_containing_folder)
+
+    def _build_details(self):
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        footer.grid_columnconfigure(0, weight=1)
+        self.detail_var = ctk.StringVar(value="Select a result to see its GPS coordinates and content hash.")
+        ctk.CTkLabel(footer, textvariable=self.detail_var, anchor="w", justify="left",
+                     wraplength=720).grid(row=0, column=0, sticky="ew")
+        self.more_btn = ctk.CTkButton(footer, text="Load more", width=90,
+                                      fg_color="transparent", border_width=1,
+                                      command=self._load_more)
+        self.more_btn.grid(row=0, column=1, padx=(8, 0))
+        self.more_btn.grid_remove()
+        self.copy_btn = ctk.CTkButton(footer, text="Copy path", width=90,
+                                      fg_color="transparent", border_width=1,
+                                      command=self._copy_path, state="disabled")
+        self.copy_btn.grid(row=0, column=2, padx=(8, 0))
+        self.open_btn = ctk.CTkButton(footer, text="Open folder", width=100,
+                                      command=self._open_containing_folder, state="disabled")
+        self.open_btn.grid(row=0, column=3, padx=(8, 0))
+
+    def _show_help(self):
+        messagebox.showinfo(
+            "Search file lists",
+            "To find photos from one day, enter it in Photos taken on using YYYY-MM-DD. "
+            "You can combine the date with a filename, folder, place, or another filter.\n\n"
+            "Type ordinary words to search paths, dates, GPS, places, hashes, and list names. "
+            "Words are combined with AND. Put phrases in quotes.\n\n"
+            "Field filters:\n"
+            "  path:vacation   name:IMG_1234   ext:jpg|png\n"
+            "  date:2024-06-30   date>=2020-01-01   date:missing\n"
+            "  size>10MB   modified<2024-06-30\n"
+            "  lat>35   lon<-120   location:\"New York\"\n"
+            "  hash:abc123   list:Archive\n\n"
+            "Use : for contains, = for an exact value, * and ? as wildcards, | for alternatives, "
+            "and a leading - to exclude a word or filter (for example -ext:tmp). "
+            "Use missing or present to test empty fields.",
+            parent=self,
+        )
+
+    def _start_index(self):
+        paths = [file_list.path for file_list in self.file_lists]
+
+        def progress(number, total, name, rows):
+            self.events.put(("progress", number, total, name, rows))
+
+        def work():
+            try:
+                changed, total = self.index.refresh(paths, progress=progress)
+                self.events.put(("ready", changed, total, list(self.index.skipped)))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _schedule_search(self, event=None):
+        if event and event.keysym in ("Return", "Up", "Down", "Left", "Right", "Shift_L", "Shift_R"):
+            return
+        self.generation += 1
+        generation = self.generation
+
+        def later():
+            if generation == self.generation and (self.query_var.get().strip()
+                                                   or self.date_var.get().strip()):
+                self._search()
+        self.after(350, later)
+
+    def _search(self, _event=None, *, append=False):
+        query = self.query_var.get().strip()
+        raw_day = self.date_var.get().strip()
+        if raw_day:
+            try:
+                day = normalize_photo_day(raw_day)
+            except SearchQueryError as exc:
+                self.status_var.set(str(exc))
+                return
+            if day != raw_day:
+                self.date_var.set(day)
+            query = f"{query} date:{day}".strip()
+        if not self.index_ready:
+            self.pending_search = True
+            return
+        self.generation += 1
+        generation = self.generation
+        if not append:
+            self.offset = 0
+        selected = self.list_choices.get(self.list_var.get())
+        sources = [selected] if selected else None
+        self.search_btn.configure(state="disabled")
+        self.more_btn.configure(state="disabled")
+        self.status_var.set("Searching…")
+
+        def work():
+            try:
+                rows, more = self.index.search(query, source_paths=sources,
+                                               limit=self.RESULT_LIMIT, offset=self.offset)
+                self.events.put(("results", generation, query, append, rows, more))
+            except (SearchQueryError, sqlite3.Error) as exc:
+                self.events.put(("search_error", generation, str(exc)))
+            except Exception as exc:
+                self.events.put(("search_error", generation, f"Search failed: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _use_today(self):
+        self.date_var.set(_datetime.date.today().isoformat())
+        self._search()
+
+    def _clear_date(self):
+        self.date_var.set("")
+        self._search()
+
+    def apply_scale(self, scale):
+        """Scale the native ttk result table along with CustomTkinter widgets."""
+        if not hasattr(self, "tree"):
+            return
+        self.tree_font.configure(size=max(10, round(11 * scale)))
+        self.tree_heading_font.configure(size=max(10, round(11 * scale)), weight="bold")
+        self.tree_style.configure("FileSearch.Treeview", rowheight=round(27 * scale),
+                                  font=self.tree_font)
+        self.tree_style.configure("FileSearch.Treeview.Heading", font=self.tree_heading_font)
+        scrollbar_size = round(15 * scale)
+        self.tree_style.configure("FileSearch.Vertical.TScrollbar", width=scrollbar_size,
+                                  arrowsize=scrollbar_size)
+        self.tree_style.configure("FileSearch.Horizontal.TScrollbar", width=scrollbar_size,
+                                  arrowsize=scrollbar_size)
+        for column, _title, width in self.tree_columns:
+            self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale))
+
+    def _load_more(self):
+        self.offset = len(self.results)
+        self._search(append=True)
+
+    @staticmethod
+    def _human_size(size):
+        return fp._human_size(size) or "0 B"
+
+    @staticmethod
+    def _modified(value):
+        if not value:
+            return ""
+        try:
+            return _datetime.datetime.fromtimestamp(value / 1_000_000_000).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            return ""
+
+    def _show_results(self, query, append, rows, more):
+        if not append:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.results.clear()
+            self.copy_btn.configure(state="disabled")
+            self.open_btn.configure(state="disabled")
+            self.detail_var.set("Select a result to see its GPS coordinates and content hash.")
+        for result in rows:
+            item = self.tree.insert("", "end", values=(
+                result.filepath, result.date_taken, self._human_size(result.size_bytes),
+                self._modified(result.mtime_ns), result.location, Path(result.source_path).name,
+            ))
+            self.results[item] = result
+        count = len(self.results)
+        suffix = " — more matches available" if more else ""
+        label = "all indexed files" if not query else "your search"
+        self.status_var.set(f"{count:,} result{'s' if count != 1 else ''} for {label}{suffix}")
+        (self.more_btn.grid if more else self.more_btn.grid_remove)()
+        self.more_btn.configure(state="normal")
+        self.search_btn.configure(state="normal")
+
+    def _selected_result(self):
+        selected = self.tree.selection()
+        return self.results.get(selected[0]) if selected else None
+
+    def _selection_changed(self, _event=None):
+        result = self._selected_result()
+        if not result:
+            return
+        gps = ", ".join(part for part in (result.gps_lat, result.gps_lon) if part) or "none"
+        content_hash = result.content_hash or "none"
+        self.detail_var.set(f"GPS: {gps}    Hash: {content_hash}")
+        self.copy_btn.configure(state="normal")
+        self.open_btn.configure(state="normal")
+
+    def _resolved_path(self, result):
+        local = Path(fp._resolve_local_inventory_path(result.filepath))
+        if local.exists():
+            return local
+        file_list = next((item for item in self.file_lists
+                          if str(item.path.resolve()) == result.source_path), None)
+        if file_list and file_list.drive and file_list.root:
+            key = fp._normalize_cache_key(result.filepath)
+            prefix = fp._root_cache_prefix(file_list.root)
+            if key.startswith(prefix):
+                return Path(file_list.drive.mount, *key[len(prefix):].split("/"))
+        return local if local.is_absolute() else None
+
+    def _copy_path(self):
+        result = self._selected_result()
+        if result:
+            self.clipboard_clear()
+            self.clipboard_append(result.filepath)
+            self.status_var.set("Path copied to the clipboard.")
+
+    def _open_containing_folder(self, _event=None):
+        result = self._selected_result()
+        if not result:
+            return
+        path = self._resolved_path(result)
+        if path is None:
+            messagebox.showinfo("Drive not connected",
+                                "The file is in the list, but its containing folder is not available right now.\n\n"
+                                + result.filepath, parent=self)
+            return
+        folder = path if path.is_dir() else path.parent
+        if not folder.is_dir():
+            messagebox.showinfo("Drive not connected",
+                                "The file is in the list, but its containing folder is not available right now.\n\n"
+                                + result.filepath, parent=self)
+            return
+        try:
+            open_folder(folder)
+        except Exception as exc:
+            messagebox.showerror("Open folder", str(exc), parent=self)
+
+    def _drain_events(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    _, number, total, name, rows = event
+                    detail = f" — {rows:,} files" if rows is not None else ""
+                    self.status_var.set(f"Indexing {name} ({number}/{total}){detail}")
+                elif kind == "ready":
+                    _, changed, total, skipped = event
+                    self.index_ready = True
+                    self.search_btn.configure(state="normal")
+                    action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
+                    problem = (" Couldn't read " + ", ".join(name for name, _ in skipped) + "."
+                               if skipped else "")
+                    self.status_var.set(f"{action}{total:,} files ready to search.{problem}")
+                    if (self.pending_search or self.query_var.get().strip()
+                            or self.date_var.get().strip()):
+                        self.pending_search = False
+                        self._search()
+                elif kind == "error":
+                    self.status_var.set("Could not build the search index: " + event[1])
+                elif kind == "results":
+                    _, generation, query, append, rows, more = event
+                    if generation == self.generation:
+                        self._show_results(query, append, rows, more)
+                elif kind == "search_error":
+                    _, generation, error = event
+                    if generation == self.generation:
+                        self.status_var.set(error)
+                        self.more_btn.configure(state="normal")
+                        self.search_btn.configure(state="normal")
+        except queue.Empty:
+            pass
+        self._after_id = self.after(75, self._drain_events)
+
+    def _close(self):
+        self._closed = True
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        if getattr(self.parent, "search_dialog", None) is self:
+            self.parent.search_dialog = None
+        self.destroy()
+
+
+class CoverageDialog(ctk.CTkToplevel):
+    """Which photos and videos have a second copy, drive by drive."""
+
+    COLUMNS = (("drive", "Drive", 190), ("connected", "Connected", 90),
+               ("role", "Role", 150), ("backblaze", "Backblaze", 125),
+               ("total", "Photos & videos", 130), ("only", "Only copy", 120),
+               ("weak", "Only on weak drives", 150), ("verdict", "Summary", 330))
+
+    def __init__(self, parent, file_lists):
+        super().__init__(parent)
+        self.parent = parent
+        self.file_lists = list(file_lists)
+        self.events = queue.Queue()
+        self.drives = []
+        self.settings = fp._coverage_settings()
+        self.generation = 0
+        self._after_id = None
+        self._closed = False
+
+        self.title("Coverage")
+        self.geometry("1180x720")
+        self.minsize(820, 520)
+        self.transient(parent)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._build_controls()
+        self._build_table()
+        self._build_details()
+        self._after_id = self.after(75, self._drain_events)
+        self._calculate()
+
+    def _build_controls(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(15, 5))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Do your photos and videos have a second copy?", anchor="w",
+                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(head, text="Help", width=80, fg_color="transparent", border_width=1,
+                      command=self._show_help).grid(row=0, column=1, padx=(8, 0))
+        controls = ctk.CTkFrame(self, corner_radius=8)
+        controls.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 8))
+        controls.grid_columnconfigure(3, weight=1)
+        ctk.CTkLabel(controls, text="Backblaze version history:",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=(12, 7), pady=10)
+        self.history_var = ctk.StringVar(
+            value=coverage.BACKBLAZE_HISTORY_CHOICES[self.settings.backblaze_history_days])
+        ctk.CTkOptionMenu(controls, variable=self.history_var, width=110,
+                          values=list(coverage.BACKBLAZE_HISTORY_CHOICES.values()),
+                          command=self._set_history).grid(row=0, column=1, pady=10)
+        self.recalc_btn = ctk.CTkButton(controls, text="Recalculate", width=110,
+                                        fg_color="transparent", border_width=1,
+                                        command=self._calculate)
+        self.recalc_btn.grid(row=0, column=2, padx=(12, 0), pady=10)
+        self.status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
+                     text_color=("gray35", "gray72")).grid(row=0, column=3, sticky="ew", padx=12)
+        self.progress = ctk.CTkProgressBar(controls, width=160)
+        self.progress.grid(row=0, column=4, padx=(0, 12))
+        self.progress.set(0)
+
+    def _build_table(self):
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        style = ttk.Style(self)
+        dark = ctk.get_appearance_mode() == "Dark"
+        scale = self.parent.gui_scale
+        self.tree_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.tree_font.configure(size=max(10, round(11 * scale)))
+        heading_font = tkfont.nametofont("TkHeadingFont").copy()
+        heading_font.configure(size=max(10, round(11 * scale)), weight="bold")
+        style.configure("Coverage.Treeview", rowheight=round(27 * scale), font=self.tree_font,
+                        background="#242424" if dark else "#ffffff",
+                        fieldbackground="#242424" if dark else "#ffffff",
+                        foreground="#f2f2f2" if dark else "#202020")
+        style.configure("Coverage.Treeview.Heading", font=heading_font,
+                        background="#333333" if dark else "#e6e6e6",
+                        foreground="#f2f2f2" if dark else "#202020")
+        style.map("Coverage.Treeview", background=[("selected", "#1f6aa5")],
+                  foreground=[("selected", "#ffffff")])
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLUMNS], show="headings",
+                                 style="Coverage.Treeview", selectmode="browse")
+        for column, title, width in self.COLUMNS:
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale),
+                             stretch=column == "verdict")
+        self.tree.tag_configure("risk", foreground="#e0603a" if dark else "#b3381a")
+        self.tree.tag_configure("gone", foreground="gray55")
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vertical.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed)
+
+    def _build_details(self):
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        frame.grid_columnconfigure(0, weight=1)
+        self.detail = ctk.CTkTextbox(frame, height=190, wrap="none",
+                                     font=ctk.CTkFont(family="Courier", size=14))
+        self.detail.grid(row=0, column=0, rowspan=4, sticky="nsew", padx=(10, 8), pady=10)
+        self.detail.insert("1.0", "Select a drive to see where its only copies are.")
+        self.detail.configure(state="disabled")
+        side = ctk.CTkFrame(frame, fg_color="transparent")
+        side.grid(row=0, column=1, sticky="n", padx=(0, 12), pady=10)
+        ctk.CTkLabel(side, text="This drive is:", anchor="w",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w")
+        self.role_var = ctk.StringVar(value="")
+        self.role_menu = ctk.CTkOptionMenu(
+            side, variable=self.role_var, width=200,
+            values=[coverage.ROLE_LABELS[r] for r in coverage.ROLES],
+            command=self._set_role, state="disabled")
+        self.role_menu.grid(row=1, column=0, sticky="w", pady=(3, 8))
+        self.backblaze_var = ctk.BooleanVar(value=False)
+        self.backblaze_box = ctk.CTkCheckBox(side, text="Backed up by Backblaze",
+                                             variable=self.backblaze_var,
+                                             command=self._set_backblaze, state="disabled")
+        self.backblaze_box.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.cleanup_btn = ctk.CTkButton(side, text="Clean up duplicates…", width=200,
+                                         state="disabled", command=self._open_cleanup)
+        self.cleanup_btn.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        ctk.CTkButton(side, text="Copy report", width=200, fg_color="transparent",
+                      border_width=1, command=self._copy_report).grid(row=4, column=0, sticky="w")
+
+    def _show_help(self):
+        messagebox.showinfo(
+            "Coverage",
+            "This compares all your file lists, including lists of drives that aren't "
+            "connected. A photo or video has a copy when another drive has a file with the "
+            "same name and size, and the same date taken when both have one. Lightroom's "
+            "date prefix (YYYYMMDD-) is ignored.\n\n"
+            "Roles:\n"
+            "  Automatic: kept, unless its last health check found bad sectors or read "
+            "errors.\n"
+            "  Keep: a drive you rely on.\n"
+            "  Weak: failing or about to be retired. Copies on it don't count as safe.\n"
+            "  Gone: wiped or lost. Its list is ignored.\n\n"
+            "Backblaze keeps a disconnected drive's backup for about as long as your "
+            "version history (30 days, or 1 year with the upgrade). Connect each external "
+            "drive before then so Backblaze keeps its backup.\n\n"
+            "Placeholders, such as phone photos shown by Windows Phone Link, aren't really "
+            "stored on the drive and never count as copies.",
+            parent=self,
+        )
+
+    def _calculate(self):
+        self.generation += 1
+        generation = self.generation
+        self.recalc_btn.configure(state="disabled")
+        self.status_var.set("Comparing every file list…")
+        self.progress.set(0)
+        settings = fp._coverage_settings()
+        health = fp.read_health_log(self.parent.list_dir)
+        lists = self.file_lists
+
+        def progress(step, total, name):
+            self.events.put(("progress", generation, step / total, name))
+
+        def work():
+            try:
+                drives = coverage.build_coverage(lists, settings, health, progress=progress)
+                self.events.put(("done", generation, drives, settings))
+            except Exception as exc:
+                self.events.put(("error", generation, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render(self):
+        selected = self._selected()
+        selected_path = selected.list_path if selected else None
+        self.tree.delete(*self.tree.get_children())
+        for number, drive in enumerate(self.drives):
+            if drive.role == coverage.ROLE_GONE:
+                tags = ("gone",)
+            elif (drive.at_risk.files and drive.role == coverage.ROLE_WEAK) or \
+                    drive.backblaze_status in ("expired", "unprotected", "soon"):
+                tags = ("risk",)
+            else:
+                tags = ()
+            gone = drive.role == coverage.ROLE_GONE
+            values = (
+                drive.name,
+                "Yes" if drive.connected else "No",
+                coverage.ROLE_LABELS[drive.role],
+                {"ok": "OK", "soon": "Connect soon", "expired": "Expired",
+                 "unprotected": "Not backed up"}.get(drive.backblaze_status,
+                                                     "Yes" if drive.setting.backblaze else "No"),
+                "" if gone else f"{drive.total.files:,}",
+                "" if gone else coverage.human_size(drive.only_copy.bytes) if drive.only_copy.files else "",
+                "" if gone else coverage.human_size(drive.weak_only.bytes) if drive.weak_only.files else "",
+                coverage.verdict(drive),
+            )
+            self.tree.insert("", "end", iid=str(number), values=values, tags=tags)
+            if drive.list_path == selected_path:
+                self.tree.selection_set(str(number))
+
+    def _selected(self):
+        selection = self.tree.selection()
+        if not selection or int(selection[0]) >= len(self.drives):
+            return None
+        return self.drives[int(selection[0])]
+
+    def _selection_changed(self, _event=None):
+        drive = self._selected()
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        if drive is None:
+            self.role_menu.configure(state="disabled")
+            self.backblaze_box.configure(state="disabled")
+            self.cleanup_btn.configure(state="disabled")
+            self.detail.configure(state="disabled")
+            return
+        self.detail.insert("1.0", coverage.format_drive(drive, folders=20))
+        self.detail.configure(state="disabled")
+        self.role_var.set(coverage.ROLE_LABELS[drive.setting.role])
+        self.backblaze_var.set(drive.setting.backblaze)
+        self.role_menu.configure(state="normal")
+        self.backblaze_box.configure(state="normal")
+        can_clean = drive.connected and drive.role != coverage.ROLE_GONE
+        self.cleanup_btn.configure(state="normal" if can_clean else "disabled")
+
+    def _save_settings(self):
+        fp._save_coverage_settings(self.settings)
+
+    def _refresh_backblaze(self):
+        today = _datetime.date.today()
+        for drive in self.drives:
+            drive.backblaze_status = drive.backblaze_message = ""
+            coverage.backblaze_status(drive, self.settings.backblaze_history_days, today)
+        self._render()
+        self._selection_changed()
+
+    def _set_history(self, label):
+        days = next(d for d, text in coverage.BACKBLAZE_HISTORY_CHOICES.items() if text == label)
+        self.settings.backblaze_history_days = days
+        self._save_settings()
+        self._refresh_backblaze()
+
+    def _set_role(self, label):
+        drive = self._selected()
+        if drive is None:
+            return
+        role = next(r for r, text in coverage.ROLE_LABELS.items() if text == label)
+        self.settings.drive(drive.list_path.name).role = role
+        self._save_settings()
+        self._calculate()  # which copies count as safe depends on every drive's role
+
+    def _set_backblaze(self):
+        drive = self._selected()
+        if drive is None:
+            return
+        setting = self.settings.drive(drive.list_path.name)
+        setting.backblaze = bool(self.backblaze_var.get())
+        drive.setting = setting
+        self._save_settings()
+        self._refresh_backblaze()
+
+    def _open_cleanup(self):
+        drive = self._selected()
+        if drive is None or not drive.connected:
+            return
+        CleanupDialog(self.parent, self, self.file_lists, drive)
+
+    def _copy_report(self):
+        if not self.drives:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(coverage.format_report(self.drives, self.settings, 20))
+        self.status_var.set("Report copied.")
+
+    def _drain_events(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind, generation = event[0], event[1]
+                if generation != self.generation:
+                    continue
+                if kind == "progress":
+                    _, _, fraction, name = event
+                    self.progress.set(fraction)
+                    self.status_var.set(f"Reading {name}…")
+                elif kind == "done":
+                    _, _, self.drives, self.settings = event
+                    self.progress.set(1)
+                    self.recalc_btn.configure(state="normal")
+                    retire = [d.name for d in self.drives
+                              if d.role == coverage.ROLE_WEAK and d.can_retire]
+                    attention = [d for d in self.drives if d.backblaze_status in
+                                 ("soon", "expired", "unprotected")]
+                    parts = [f"{len(self.drives)} drives compared."]
+                    if retire:
+                        parts.append("Safe to retire: " + ", ".join(retire) + ".")
+                    if attention:
+                        parts.append(f"{len(attention)} need attention for Backblaze.")
+                    self.status_var.set(" ".join(parts))
+                    self._render()
+                    self._selection_changed()
+                elif kind == "error":
+                    self.recalc_btn.configure(state="normal")
+                    self.status_var.set("Couldn't compare the lists: " + event[2])
+        except queue.Empty:
+            pass
+        self._after_id = self.after(100, self._drain_events)
+
+    def _close(self):
+        self._closed = True
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        if getattr(self.parent, "coverage_dialog", None) is self:
+            self.parent.coverage_dialog = None
+        self.destroy()
+
+
+class CleanupDialog(ctk.CTkToplevel):
+    """Find and delete photos and videos already kept on another drive."""
+
+    def __init__(self, parent, coverage_dialog, file_lists, target):
+        super().__init__(parent)
+        self.parent = parent
+        self.coverage_dialog = coverage_dialog
+        self.file_lists = list(file_lists)
+        self.target = target  # DriveCoverage of the drive to clean
+        self.events = queue.Queue()
+        self.plan = None
+        self.stop_event = threading.Event()
+        self.busy = False
+        self.log_path = None
+        self._after_id = None
+        self._closed = False
+        self.settings = fp._coverage_settings()
+
+        self.title(f"Clean up duplicates on {target.name}")
+        self.geometry("980x600")
+        self.minsize(720, 520)
+        self.transient(parent)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._build()
+        self._after_id = self.after(100, self._drain_events)
+
+    def _build(self):
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(15, 5))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text=f"Clean up duplicates on {self.target.name}", anchor="w",
+                     font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            head, anchor="w", justify="left", wraplength=920,
+            text=("Finds photos and videos on this drive that already have a copy in a keep "
+                  "folder on another drive you keep (same name, size and date taken). Files "
+                  "in keep folders on this drive are never deleted. Nothing is deleted until "
+                  "you confirm, and every deletion is logged."),
+            text_color=("gray35", "gray72")).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        options = ctk.CTkFrame(self, corner_radius=8)
+        options.grid(row=1, column=0, sticky="ew", padx=16, pady=(6, 8))
+        options.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(options, text="Keep folders:", font=ctk.CTkFont(weight="bold"))\
+            .grid(row=0, column=0, sticky="w", padx=(12, 7), pady=(10, 4))
+        self.folders_var = ctk.StringVar(value=", ".join(self.settings.keep_folders))
+        ctk.CTkEntry(options, textvariable=self.folders_var,
+                     placeholder_text="Top-level folders, separated by commas")\
+            .grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(10, 4))
+        self.library_var = ctk.BooleanVar(value=self.settings.keep_library_days)
+        ctk.CTkCheckBox(options, text="Library day folders (YYYY/YYYY-MM-DD) are keep folders too",
+                        variable=self.library_var)\
+            .grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=4)
+        self.trust_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options, variable=self.trust_var,
+                        text="Trust the file lists for drives that aren't connected "
+                             "(otherwise those duplicates are kept)")\
+            .grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 10))
+
+        frame = ctk.CTkFrame(self, corner_radius=8)
+        frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(frame, columns=("folder", "files", "size"), show="headings",
+                                 style="Coverage.Treeview", selectmode="none")
+        scale = self.parent.gui_scale
+        for column, title, width in (("folder", "Folder", 560), ("files", "Files", 110),
+                                     ("size", "Size", 120)):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=round(width * scale), stretch=column == "folder")
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vertical.set)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
+        footer.grid_columnconfigure(0, weight=1)
+        self.status_var = ctk.StringVar(value="Choose Find duplicates to see what can be deleted.")
+        ctk.CTkLabel(footer, textvariable=self.status_var, anchor="w", justify="left",
+                     wraplength=900).grid(row=0, column=0, columnspan=5, sticky="ew",
+                                          pady=(0, 8))
+        self.progress = ctk.CTkProgressBar(footer)
+        self.progress.grid(row=1, column=0, sticky="ew")
+        self.progress.set(0)
+        self.find_btn = ctk.CTkButton(footer, text="Find duplicates", width=130,
+                                      command=self._find)
+        self.find_btn.grid(row=1, column=2, padx=(8, 0))
+        self.delete_btn = ctk.CTkButton(footer, text="Delete", width=150, state="disabled",
+                                        fg_color=("#b3381a", "#a33a20"),
+                                        hover_color=("#8f2c14", "#7f2d18"),
+                                        command=self._delete)
+        self.delete_btn.grid(row=1, column=3, padx=(8, 0))
+        self.log_btn = ctk.CTkButton(footer, text="Open log", width=90, fg_color="transparent",
+                                     border_width=1, command=self._open_log)
+        self.log_btn.grid(row=1, column=4, padx=(8, 0))
+        self.log_btn.grid_remove()
+
+    def _keep_folders(self):
+        return [f.strip() for f in self.folders_var.get().split(",") if f.strip()]
+
+    def _find(self):
+        self.settings.keep_folders = self._keep_folders()
+        self.settings.keep_library_days = bool(self.library_var.get())
+        fp._save_coverage_settings(self.settings)
+        self.busy = True
+        self.plan = None
+        self.find_btn.configure(state="disabled")
+        self.delete_btn.configure(state="disabled", text="Delete")
+        self.tree.delete(*self.tree.get_children())
+        self.status_var.set("Reading the file lists…")
+        self.progress.set(0)
+        settings = self.settings
+        health = fp.read_health_log(self.parent.list_dir)
+
+        def progress(step, total, name):
+            self.events.put(("progress", step / total, f"Reading {name}…"))
+
+        def work():
+            try:
+                plan = coverage.plan_cleanup(
+                    self.file_lists, settings, self.target.list_path,
+                    settings.keep_folders, settings.keep_library_days, health, progress)
+                self.events.put(("plan", plan))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_plan(self, plan):
+        self.plan = plan
+        for folder, size in plan.folders.most_common():
+            self.tree.insert("", "end", values=(folder, f"{plan.folder_files[folder]:,}",
+                                                coverage.human_size(size)))
+        count = len(plan.items)
+        if not count:
+            self.status_var.set("No duplicates found. Every photo and video here is either in "
+                                "a keep folder or has no kept copy elsewhere.")
+            return
+        offline = sum(1 for item in plan.items if not any(c for _, c in item.kept))
+        note = (f" {offline:,} of them have their kept copy on a drive that isn't connected."
+                if offline else "")
+        self.status_var.set(
+            f"{count:,} duplicates ({coverage.human_size(plan.total_bytes)}) can be deleted. "
+            f"{plan.kept_without_copy:,} photos and videos have no kept copy and stay.{note}")
+        self.delete_btn.configure(state="normal", text=f"Delete {count:,} files")
+
+    def _delete(self):
+        plan = self.plan
+        if not plan or not plan.items:
+            return
+        trust = bool(self.trust_var.get())
+        if not messagebox.askyesno(
+                "Delete duplicates",
+                f"Permanently delete {len(plan.items):,} files "
+                f"({coverage.human_size(plan.total_bytes)}) from {self.target.name}?\n\n"
+                "Each one's kept copy is checked on disk first when its drive is connected"
+                + ("; for drives that aren't connected, the file lists are trusted."
+                   if trust else "; duplicates whose kept copy's drive isn't connected are kept.")
+                + " Deleted files don't go to the trash.",
+                icon="warning", parent=self):
+            return
+        stamp = _datetime.date.today().isoformat()
+        name = re.sub(r'[<>:"/\\|?*]', "_", self.target.name)
+        self.log_path = (Path(self.parent.list_dir) / "Cleanup logs"
+                         / f"{name} duplicates - delete log {stamp}.tsv")
+        self.busy = True
+        self.stop_event.clear()
+        self.find_btn.configure(state="disabled")
+        self.delete_btn.configure(text="Stop", command=self.stop_event.set)
+        self.status_var.set("Deleting…")
+
+        def progress(done, total, freed):
+            self.events.put(("progress", done / total,
+                             f"Deleted {done:,} of {total:,} — {coverage.human_size(freed)} freed"))
+
+        def work():
+            try:
+                counts, freed = coverage.run_cleanup(plan, self.log_path, trust, progress,
+                                                     self.stop_event)
+                self.events.put(("deleted", counts, freed))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_log(self):
+        if self.log_path:
+            self.parent._open_path(self.log_path.parent)
+
+    def _drain_events(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    self.progress.set(event[1])
+                    self.status_var.set(event[2])
+                elif kind == "plan":
+                    self.busy = False
+                    self.progress.set(1)
+                    self.find_btn.configure(state="normal")
+                    self._show_plan(event[1])
+                elif kind == "deleted":
+                    _, counts, freed = event
+                    self.busy = False
+                    self.plan = None
+                    self.find_btn.configure(state="normal")
+                    self.delete_btn.configure(state="disabled", text="Delete",
+                                              command=self._delete)
+                    parts = [f"{v:,} {k}" for k, v in counts.most_common()]
+                    stopped = " Stopped before the end." if self.stop_event.is_set() else ""
+                    self.status_var.set(f"Done: {coverage.human_size(freed)} freed. "
+                                        + "; ".join(parts) + "." + stopped
+                                        + " Update this drive's file list to keep it current.")
+                    self.log_btn.grid()
+                elif kind == "error":
+                    self.busy = False
+                    self.find_btn.configure(state="normal")
+                    self.delete_btn.configure(state="disabled", text="Delete",
+                                              command=self._delete)
+                    self.status_var.set("Problem: " + event[1])
+        except queue.Empty:
+            pass
+        self._after_id = self.after(100, self._drain_events)
+
+    def _close(self):
+        if self.busy and self.plan is not None:
+            if not messagebox.askyesno("Stop deleting?", "Stop deleting and close?", parent=self):
+                return
+        self.stop_event.set()
+        self._closed = True
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        self.destroy()
+
+
 class FindPhotoDatesGUI(ctk.CTk):
     def __init__(self):
-        # CustomTkinter detects display DPI on macOS and Windows, but Linux
-        # needs an application-level boost on dense screens.
-        if sys.platform.startswith("linux"):
-            ctk.set_widget_scaling(1.2)
         super().__init__()
+        config = fp.load_config()
+        if sys.platform.startswith("linux"):
+            screen_height = self.winfo_screenheight()
+            default_scale = 1.75 if screen_height >= 1800 else (1.5 if screen_height >= 1200 else 1.25)
+        else:
+            # CustomTkinter already follows native DPI scaling on macOS and Windows.
+            default_scale = 1.0
+        try:
+            requested_scale = float(config.get("gui_scale", default_scale))
+        except (TypeError, ValueError):
+            requested_scale = default_scale
+        self.gui_scale_label = _closest_scale_label(requested_scale)
+        self.gui_scale = GUI_SCALE_CHOICES[self.gui_scale_label]
+        ctk.set_widget_scaling(self.gui_scale)
+        ctk.set_window_scaling(self.gui_scale)
         self.title(APP_TITLE)
         self.geometry("820x560")
         self.minsize(700, 480)
@@ -167,6 +1146,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._advanced_auto_height = None
         self._compact_height = None
         self._hover_help = []
+        self.search_dialog = None
+        self.coverage_dialog = None
 
         self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.body.grid(row=0, column=0, sticky="nsew")
@@ -200,20 +1181,36 @@ class FindPhotoDatesGUI(ctk.CTk):
                      font=ctk.CTkFont(size=27, weight="bold")).grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(frame, text=APP_TITLE, text_color=("gray45", "gray62"),
                      font=ctk.CTkFont(size=14)).grid(row=0, column=1, sticky="e")
+        self.scale_var = ctk.StringVar(value=self.gui_scale_label)
+        ctk.CTkOptionMenu(frame, variable=self.scale_var, values=list(GUI_SCALE_CHOICES),
+                          width=125, command=self._set_gui_scale).grid(row=0, column=2,
+                                                                       sticky="e", padx=(10, 0))
         ctk.CTkLabel(frame, text="Choose a connected drive to make or update its file list. "
                      "Later scans read only new or changed files. Lists stay in Documents so you "
                      "can see what is on drives even while they are unplugged.",
                      wraplength=740, anchor="w", justify="left",
                      font=ctk.CTkFont(size=14),
-                     text_color=("gray35", "gray70")).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+                     text_color=("gray35", "gray70")).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
         self.exif_var = ctk.StringVar(value="Checking ExifTool…")
         exif_row = ctk.CTkFrame(frame, fg_color="transparent")
-        exif_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        exif_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         exif_row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(exif_row, textvariable=self.exif_var, anchor="w",
                      text_color=("gray35", "gray72"), font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="ew")
         self._text_button(exif_row, "Get ExifTool", lambda: __import__("webbrowser").open("https://exiftool.org/"))\
             .grid(row=0, column=1, sticky="e")
+
+    def _set_gui_scale(self, label):
+        scale = GUI_SCALE_CHOICES[label]
+        self.gui_scale_label = label
+        self.gui_scale = scale
+        ctk.set_widget_scaling(scale)
+        ctk.set_window_scaling(scale)
+        if self.search_dialog is not None and self.search_dialog.winfo_exists():
+            self.search_dialog.apply_scale(scale)
+        config = fp.load_config()
+        config["gui_scale"] = scale
+        fp.save_config(config)
 
     def _build_drives(self):
         outer = ctk.CTkFrame(self.body, corner_radius=10)
@@ -240,7 +1237,9 @@ class FindPhotoDatesGUI(ctk.CTk):
                      text_color=("gray35", "gray72"), wraplength=530,
                      font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="ew")
         self._text_button(footer, "Open folder", lambda: self._open_path(self.list_dir)).grid(row=0, column=1)
-        self._text_button(footer, "Show all lists", self._show_lists).grid(row=0, column=2)
+        self._text_button(footer, "Search files", self._show_search).grid(row=0, column=2)
+        self._text_button(footer, "Coverage", self._show_coverage).grid(row=0, column=3)
+        self._text_button(footer, "Show all lists", self._show_lists).grid(row=0, column=4)
 
     def _build_actions(self):
         frame = ctk.CTkFrame(self.body, fg_color="transparent")
@@ -298,6 +1297,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.workers_var = ctk.StringVar(value="4")
         self.min_var = ctk.StringVar(value=str(fp.MIN_EXIFTOOL_IMAGE_BYTES // 1000))
         self.path_var = ctk.StringVar(value="Automatic")
+        self.archives_var = ctk.StringVar(value=fp._ARCHIVE_LABELS[fp.DEFAULT_ARCHIVE_MODE])
         options = ctk.CTkFrame(self.advanced, fg_color="transparent")
         options.grid(row=1, column=0, sticky="ew", padx=16)
         options.grid_columnconfigure(1, weight=1)
@@ -315,8 +1315,10 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._help(options, "retry", 2)
         self._option_row(options, 3, "File fingerprints", self.hash_var, ("Off", "Quick", "Full"), "hash")
         self._option_row(options, 4, "Path style", self.path_var, ("Automatic", "Linux style", "Windows style"), "path_style")
-        self._entry_row(options, 5, "Photos read at the same time (1–32)", self.workers_var, "workers")
-        self._entry_row(options, 6, "Skip images smaller than (KB; 0 = off)", self.min_var, "min_size")
+        self._option_row(options, 5, "Look inside archives", self.archives_var,
+                         tuple(fp._ARCHIVE_LABELS.values()), "archives")
+        self._entry_row(options, 6, "Photos read at the same time (1–32)", self.workers_var, "workers")
+        self._entry_row(options, 7, "Skip images smaller than (KB; 0 = off)", self.min_var, "min_size")
         ctk.CTkLabel(self.advanced, text="Other tasks", anchor="w",
                      font=ctk.CTkFont(size=16, weight="bold")).grid(row=2, column=0, sticky="ew", padx=16, pady=(16, 5))
         tasks = ctk.CTkFrame(self.advanced, fg_color="transparent")
@@ -401,6 +1403,7 @@ class FindPhotoDatesGUI(ctk.CTk):
                 drives = fp.detect_drives()
                 lists = fp.find_file_lists(self.list_dir)
                 fp.match_lists_to_drives(lists, drives)
+                fp.remember_connected_drives(lists)
                 self.events.put(("refresh", drives, lists, None))
             except Exception as exc:
                 self.events.put(("refresh", [], [], str(exc)))
@@ -479,6 +1482,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.settings.retry_blank_exif = self.retry_var.get()
         self.settings.hash_mode = {"Off": "off", "Quick": "sample", "Full": "full"}[self.hash_var.get()]
         self.settings.path_style = {"Automatic": "auto", "Linux style": "linux", "Windows style": "windows"}[self.path_var.get()]
+        self.settings.archives = next(mode for mode, label in fp._ARCHIVE_LABELS.items()
+                                      if label == self.archives_var.get())
         self.settings.workers = workers
         self.settings.min_image_size = minimum * 1000
         return True
@@ -818,6 +1823,28 @@ class FindPhotoDatesGUI(ctk.CTk):
         box.pack(fill="both", expand=True, padx=15, pady=15)
         box.insert("1.0", "\n\n".join(lines))
         box.configure(state="disabled")
+
+    def _show_search(self):
+        if not self.lists:
+            messagebox.showinfo("Search file lists", "Make at least one file list first.")
+            return
+        if self.search_dialog is not None and self.search_dialog.winfo_exists():
+            self.search_dialog.deiconify()
+            self.search_dialog.lift()
+            self.search_dialog.date_entry.focus_set()
+            return
+        self.search_dialog = FileSearchDialog(self, self.lists)
+        self.search_dialog.date_entry.focus_set()
+
+    def _show_coverage(self):
+        if not self.lists:
+            messagebox.showinfo("Coverage", "Make at least one file list first.")
+            return
+        if self.coverage_dialog is not None and self.coverage_dialog.winfo_exists():
+            self.coverage_dialog.deiconify()
+            self.coverage_dialog.lift()
+            return
+        self.coverage_dialog = CoverageDialog(self, self.lists)
 
     def _open_path(self, path):
         try:

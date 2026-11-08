@@ -79,6 +79,7 @@ def test_scan_lists_placeholders_without_reading_them(tmp_path, monkeypatch):
 def test_downloaded_placeholder_is_read_on_the_next_scan(tmp_path, monkeypatch):
     root = tmp_path / "drive"
     root.mkdir()
+    (root / "real.txt").write_bytes(b"stored here")  # the drive reports data blocks
     photo = root / "cloud.jpg"
     with open(photo, "wb") as handle:
         handle.truncate(2_000_000)
@@ -132,6 +133,7 @@ def test_add_hashes_skips_flagged_rows(tmp_path, monkeypatch):
 def test_placeholders_found_when_scan_folder_is_relative(tmp_path, monkeypatch):
     root = tmp_path / "drive"
     root.mkdir()
+    (root / "real.txt").write_bytes(b"stored here")  # shows the drive reports data blocks
     with open(root / "cloud.zip", "wb") as handle:
         handle.truncate(2_000_000)
     if os.stat(root / "cloud.zip").st_blocks != 0:
@@ -165,3 +167,30 @@ def test_lists_without_flags_column_are_still_reused(tmp_path, monkeypatch):
                         min_image_size=0, reuse_other_lists=False)
     assert queried == []
     assert _rows(output)["a.jpg"]["date_taken"] == "2020:05:05 05:05:05"
+
+
+def _stat(dev, blocks, size=1_000_000):
+    return SimpleNamespace(st_dev=dev, st_blocks=blocks, st_size=size)
+
+
+def _resolve(items, limit=1000):
+    found = set()
+    order = [p for p, *_ in fpd._resolve_placeholders(
+        ((p, False, 1, 1, st) for p, st in items), found, hold_limit=limit)]
+    return order, found
+
+
+def test_block_less_files_are_placeholders_only_where_blocks_are_reported():
+    # Drive 1 reports blocks (b has some), so a and c are cloud-only.
+    order, found = _resolve([("a", _stat(1, 0)), ("b", _stat(1, 8)), ("c", _stat(1, 0))])
+    assert sorted(order) == ["a", "b", "c"] and found == {"a", "c"}
+    # Drive 2 never reports blocks (a network drive, say): nothing is a placeholder.
+    order, found = _resolve([("x", _stat(2, 0)), ("y", _stat(2, 0))])
+    assert order == ["x", "y"] and found == set()
+
+
+def test_held_files_are_released_once_the_drive_looks_block_less():
+    items = [(f"f{i}", _stat(3, 0)) for i in range(5)] + [("late", _stat(3, 8))]
+    order, found = _resolve(items, limit=3)
+    assert order[:4] == ["f0", "f1", "f2", "f3"]  # released after the limit, unflagged
+    assert found == set()

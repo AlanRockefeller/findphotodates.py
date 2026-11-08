@@ -5,9 +5,7 @@
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
 from pathlib import Path
-import hashlib
 import os
-import stat
 import sys
 import subprocess
 import argparse
@@ -22,7 +20,7 @@ import urllib.request
 import urllib.error
 import json
 import contextlib
-import errno
+import itertools
 import platform
 import posixpath
 import queue
@@ -30,18 +28,171 @@ import signal
 import string
 import threading
 import types
-import unicodedata
 
 __version__ = "1.7.0"
 
-# Optional fast hash (prefer over stdlib when available)
-try:
-    import blake3
 
-    _BLAKE3_AVAILABLE = True
-except ImportError:
-    blake3 = None
-    _BLAKE3_AVAILABLE = False
+if __name__ == "__main__":
+    # Run as a script: let `import findphotodates` in the companion modules
+    # find this module instead of loading a second copy of it.
+    sys.modules.setdefault("findphotodates", sys.modules[__name__])
+
+# The companion modules hold the shared helpers, drive detection, drive health
+# and the coverage report. Their names are available from this module too, so
+# code (the GUI, the worker, scripts) can keep using findphotodates.<name>.
+from findphotodates_common import (  # noqa: E402,F401
+    _ANSI_OK,
+    _ask,
+    _BLAKE3_AVAILABLE,
+    _clear_progress_line,
+    _CONFIG_LOCK,
+    _confirm,
+    _detect_ansi_support,
+    _expand_path,
+    _find_files,
+    _format_duration,
+    _host_path_style,
+    _human_size,
+    _INVALID_FILENAME_CHARS,
+    _IO_ERRNOS,
+    _IO_WINERRORS,
+    _is_io_error,
+    _IS_TTY,
+    _is_windows_reparse_point_dir,
+    _is_wsl,
+    _MACOS_SF_DATALESS,
+    _mount_root,
+    _normalize_cache_key,
+    _PLACEHOLDER_HOLD_LIMIT,
+    _PLACEHOLDER_MIN_BYTES,
+    _placeholder_verdict,
+    _print_status_line,
+    _QUOTE_TABLE,
+    _resolve_local_inventory_path,
+    _resolve_placeholders,
+    _root_cache_prefix,
+    _run_quiet,
+    _safe_filename,
+    _unused_path,
+    _WIN_DRIVE_RE,
+    _WINDOWS_PLACEHOLDER_ATTRIBUTES,
+    _wrap,
+    _WSL_MOUNT_RE,
+    blake3,
+    compute_fullhash,
+    compute_samplehash_v1,
+    CONFIG_FILE,
+    find_files,
+    format_path_style,
+    is_placeholder_stat,
+    is_supported_file,
+    load_config,
+    save_config,
+    split_list_lines,
+    update_config,
+)
+from findphotodates_drives import (  # noqa: E402,F401
+    _content_match_score,
+    _count_rows,
+    _disk_total,
+    _id_shape,
+    _last_updated_label,
+    _LEGACY_LIST_GLOBS,
+    _legacy_list_name,
+    _linux_documents_dir,
+    _linux_drives,
+    _lsblk_by_mountpoint,
+    _macos_drives,
+    _normalize_volume_id,
+    _platform_documents_dir,
+    _PSEUDO_FSTYPES,
+    _sample_inventory_rows,
+    _unescape_mount_path,
+    _volume_header_lines,
+    _windows_documents_dir,
+    _windows_drives,
+    _wsl_documents_dir,
+    _wsl_windows_volumes,
+    canonical_list_name,
+    default_inventory_dir,
+    detect_drives,
+    DriveInfo,
+    FileList,
+    find_file_lists,
+    find_legacy_lists,
+    identify_drive,
+    import_file_lists,
+    INVENTORY_DIR_NAME,
+    list_belongs_to_other_drive,
+    match_lists_to_drives,
+    read_inventory_header,
+)
+from findphotodates_health import (  # noqa: E402,F401
+    _add_usb_findings,
+    _as_number,
+    _ATA_ATTRIBUTE_METRICS,
+    _ATA_WARNING_ATTRIBUTES,
+    _basic_health,
+    _detect_health_targets,
+    _format_hours,
+    _health_drive_key,
+    _HEALTH_LOG_COLUMNS,
+    _health_report_path,
+    _HEALTH_TREND_METRICS,
+    _is_admin,
+    _kernel_log,
+    _linux_health_targets,
+    _macos_whole_disk,
+    _package_manager_install,
+    _previous_log_row,
+    _print_health_warning,
+    _print_read_check_result,
+    _read_smart,
+    _read_sys,
+    _run_smartctl,
+    _self_test_progress,
+    _smartctl_messages,
+    _troubling_health_record,
+    _UAS_ERROR_RE,
+    _upgrade_health_log_columns,
+    _usb3_capable,
+    _VERDICT_TEXT,
+    append_health_log,
+    detect_health_targets,
+    ensure_sudo_for_health,
+    health_changes,
+    HEALTH_FAILING,
+    HEALTH_GOOD,
+    HEALTH_LOG_NAME,
+    health_log_path,
+    HEALTH_NOTE,
+    health_targets_for,
+    health_tool_advice,
+    HEALTH_UNKNOWN,
+    HEALTH_WARNING,
+    HealthReport,
+    HealthTarget,
+    interpret_smart,
+    latest_health_by_drive,
+    log_and_compare,
+    print_health_history,
+    print_health_report,
+    print_unconnected_health,
+    quick_health_check,
+    read_every_file,
+    read_health_log,
+    run_health_check,
+    start_extended_self_test,
+    usb_connection_findings,
+    watch_self_tests,
+)
+from findphotodates_coverage import (  # noqa: E402,F401
+    _coverage_settings,
+    coverage_for,
+    print_coverage_report,
+    remember_connected_drives,
+    update_coverage_settings,
+)
 
 # Define supported photo file extensions (original set)
 PHOTO_EXTENSIONS = {"jpg", "jpeg", "nef", "orf"}
@@ -149,61 +300,6 @@ LOCATION_CACHE_PRECISION = 2
 WORKER_SHUTDOWN_TIMEOUT_SECONDS = 60
 EXIFTOOL_DRAIN_NO_PROGRESS_TIMEOUT_SECONDS = 30 * 60
 _sqlite_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Cross-platform cache-key normalization (WSL ↔ Windows)
-# ---------------------------------------------------------------------------
-# WSL mount paths like /mnt/f/Photos and Windows paths like F:\Photos refer
-# to the same file.  We normalize both forms to a lowercase-drive forward-slash
-# canonical key so that inventories created under one environment get cache
-# hits when re-read under the other.
-#
-# Canonical form:  /mnt/<drive>/<rest-with-forward-slashes>
-#   /mnt/f/Documents/file.jpg  →  /mnt/f/Documents/file.jpg   (unchanged)
-#   F:\Documents\file.jpg      →  /mnt/f/Documents/file.jpg
-#
-# Non-drive paths (Linux home dirs, UNC paths, etc.) pass through unchanged
-# after backslash → forward-slash conversion.
-
-_IS_TTY = sys.stdout.isatty()
-
-
-# Alan 5/4/26 - Cosmetic: detect whether the current terminal can render ANSI
-# escape sequences. POSIX TTYs always can; Windows is conservative — older
-# PowerShell 5 / cmd.exe will print raw "ESC[2K" garbage if we send it
-# unconditionally, so we only enable ANSI when the host advertises it
-# (Windows Terminal, ConEmu, ANSICON, or a real TERM).
-def _detect_ansi_support():
-    if not _IS_TTY:
-        return False
-    if os.name != "nt":
-        return True
-    if os.environ.get("WT_SESSION"):
-        return True  # Windows Terminal
-    if os.environ.get("ConEmuANSI", "").upper() == "ON":
-        return True
-    if "ANSICON" in os.environ:
-        return True
-    term = os.environ.get("TERM", "")
-    if term and term.lower() != "dumb":
-        return True
-    return False
-
-
-_ANSI_OK = _detect_ansi_support()
-
-
-def _clear_progress_line():
-    """Clear the carriage-return progress line before printing a summary.
-
-    On ANSI-capable terminals: emit "\\r\\x1b[2K" to wipe the line in place.
-    Otherwise: emit a newline so the next print starts cleanly without
-    leaking raw escape codes onto the screen.
-    """
-    if _ANSI_OK:
-        print("\r\033[2K", end="")
-    else:
-        print()
 
 
 class _StatusOutputPauseController:
@@ -346,104 +442,6 @@ class _StatusOutputPauseController:
                     time.sleep(0.2)
             except Exception:
                 break
-
-
-_WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
-_WIN_DRIVE_RE = re.compile(r"^([a-zA-Z]):[/\\]")
-
-_QUOTE_TABLE = str.maketrans(
-    {
-        "\u2018": "'",  # Left single quotation mark
-        "\u2019": "'",  # Right single quotation mark
-        "\u2032": "'",  # Prime
-        "\u201a": "'",  # Single low-9 quote
-        "\u0060": "'",  # Backtick
-        "\uf027": "'",  # WSL private-use single quote
-        "\u201c": '"',  # Left double quotation mark
-        "\u201d": '"',  # Right double quotation mark
-        "\u2033": '"',  # Double prime
-        "\u201e": '"',  # Double low-9 quote
-        "\u00ab": '"',  # Guillemet left
-        "\u00bb": '"',  # Guillemet right
-        "\uf022": '"',  # WSL private-use double quote mapping
-    }
-)
-# Fallback sweep: strip any other codepoints in the Private Use Area range U+F000 to U+F0FF
-for _cp in range(0xF000, 0xF100):
-    if _cp not in _QUOTE_TABLE:
-        _QUOTE_TABLE[_cp] = None
-
-
-def _normalize_cache_key(path):
-    """Normalize a filepath into a cross-platform canonical cache key.
-
-    Maps Windows drive paths (F:\\...) and WSL mount paths (/mnt/f/...) to a
-    shared canonical form so the same physical file gets the same key regardless
-    of whether the inventory was created under WSL or native Windows.
-    """
-    # 1. Normalize Unicode composition
-    p = unicodedata.normalize("NFC", path)
-
-    # 2. Map known problematic quote variants and strip undefined GUI/PUA glyphs
-    p = p.translate(_QUOTE_TABLE)
-
-    # 3. Normalize backslashes to forward slashes first
-    p = p.replace("\\", "/")
-
-    # Windows drive letter  →  /mnt/<lower-drive>/rest
-    m = _WIN_DRIVE_RE.match(p)
-    if m:
-        drive = m.group(1).lower()
-        rest = p[3:]  # skip  X:/
-        return f"/mnt/{drive}/{rest}"
-
-    # WSL mount  →  ensure lowercase drive letter
-    m = _WSL_MOUNT_RE.match(p)
-    if m:
-        drive = m.group(1).lower()
-        return f"/mnt/{drive}/{p[len(m.group(0)) :]}"
-
-    return p
-
-
-def format_path_style(path, style):
-    """Convert paths to the specified style (linux or windows)."""
-    if style == "linux":
-        path = path.replace("\\", "/")
-        m = _WIN_DRIVE_RE.match(path)
-        if m:
-            drive = m.group(1).lower()
-            rest = path[3:]
-            path = f"/mnt/{drive}" + (f"/{rest}" if rest else "")
-    elif style == "windows":
-        m = _WSL_MOUNT_RE.match(path)
-        if m:
-            drive = m.group(1).upper()
-            rest = path[len(m.group(0)) :]
-            path = f"{drive}:\\" + rest if rest else f"{drive}:\\"
-        elif (
-            path.startswith("/mnt/")
-            and len(path) == 6
-            and path[5].isalpha()
-            and path[4] == "/"
-        ):
-            path = f"{path[5].upper()}:\\"
-        path = path.replace("/", "\\")
-    return path
-
-
-def _host_path_style():
-    """Return the current platform's natural path style."""
-    if platform.system() == "Windows":
-        return "windows"
-    return "linux"
-
-
-def _resolve_local_inventory_path(path):
-    """Convert a stored inventory filepath into a host-resolvable local path."""
-    if not path:
-        return path
-    return os.path.abspath(format_path_style(path, _host_path_style()))
 
 
 def migrate_default_hash_cache(quiet=False, debug=False):
@@ -639,91 +637,6 @@ def parse_location_args(location_cache_path=None, no_location_cache=False):
         location_cache_path=path,
         precision=LOCATION_CACHE_PRECISION,
     )
-
-
-def compute_samplehash_v1(path, chunk_bytes, num_chunks, algo="blake3"):
-    """Compute a fast sample fingerprint from path (size + \0 + chunks).
-
-    For small files (size <= num_chunks * chunk_bytes), hashes the whole file.
-    Supports blake3, blake2b(digest_size=16), or sha256.
-    Returns hex digest string or None on error.
-    """
-    try:
-        st = os.stat(path)
-        size = st.st_size
-    except OSError:
-        return None
-
-    if algo == "blake3" and _BLAKE3_AVAILABLE:
-        h = blake3.blake3()
-    elif algo == "sha256":
-        h = hashlib.sha256()
-    else:
-        h = hashlib.blake2b(digest_size=16)
-
-    h.update(str(size).encode("ascii"))
-    h.update(b"\0")
-
-    total_sample_bytes = num_chunks * chunk_bytes
-    small_file = size <= total_sample_bytes or size == 0
-
-    try:
-        with open(path, "rb") as f:
-            if small_file:
-                # Stream the entire file in chunks to avoid memory blow-up
-                for data in iter(lambda: f.read(65536), b""):
-                    h.update(data)
-            else:
-                # Distribute offsets: first 0, last size-chunk_bytes, middle ones spread evenly
-                chunks_to_read = []
-                end_offset = max(0, size - chunk_bytes)
-                for i in range(num_chunks):
-                    if i == 0:
-                        offset = 0
-                    elif i == num_chunks - 1:
-                        offset = end_offset
-                    else:
-                        offset = (
-                            (i * end_offset) // (num_chunks - 1)
-                            if num_chunks > 1
-                            else 0
-                        )
-                    offset = max(0, min(offset, end_offset))
-                    chunks_to_read.append(offset)
-
-                # Deduplicate and sort offsets
-                for offset in sorted(set(chunks_to_read)):
-                    f.seek(offset)
-                    data = f.read(chunk_bytes)
-                    if data:
-                        h.update(data)
-        return h.hexdigest()
-    except OSError:
-        return None
-
-
-def compute_fullhash(path, algo="blake3"):
-    """Compute full-file hash. algo is 'blake3', 'blake2b', or 'sha256'. Returns hex digest or None."""
-    try:
-        if algo == "blake3" and _BLAKE3_AVAILABLE:
-            h = blake3.blake3()
-        elif algo == "blake2b":
-            h = hashlib.blake2b()
-        elif algo in ("sha256", "blake3"):
-            # blake3 requested but not available — fall back to sha256
-            h = hashlib.sha256()
-        else:
-            print(
-                f"WARNING: Unknown full-hash algo {algo!r}, falling back to sha256",
-                file=sys.stderr,
-            )
-            h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
 
 
 def open_sqlite_cache(cache_path, debug=False):
@@ -980,46 +893,6 @@ def get_content_hash(
         return digest or ""
 
 
-def is_supported_file(filename, extensions):
-    """Check if a file has a supported extension. If extensions is None, all files match."""
-    if extensions is None:
-        return True
-    return any(filename.lower().endswith(f".{ext}") for ext in extensions)
-
-
-_IO_ERRNOS = {errno.EIO, errno.ENXIO, errno.ETIMEDOUT, errno.ENODEV}
-# Windows: CRC error, not ready, hardware error, I/O device error, device not connected.
-_IO_WINERRORS = {21, 23, 483, 1117, 1167}
-
-
-def _is_io_error(exc):
-    """True when an OSError means the drive couldn't read the data (a failing
-    or disconnected drive), as opposed to a missing file or a permission problem."""
-    return exc.errno in _IO_ERRNOS or getattr(exc, "winerror", None) in _IO_WINERRORS
-
-
-def _is_windows_reparse_point_dir(entry):
-    """Return True if this DirEntry is a Windows directory reparse point
-    (junction, directory symlink, or other directory-like reparse target).
-
-    Callers should already have confirmed the entry is a directory
-    (entry.is_dir(follow_symlinks=False) == True) before invoking this — we
-    only need to decide whether that directory is a reparse point we must
-    refuse to recurse into.
-
-    Always False on non-Windows platforms, where st_file_attributes is absent.
-    """
-    try:
-        st = entry.stat(follow_symlinks=False)
-    except (PermissionError, OSError):
-        return False
-    attrs = getattr(st, "st_file_attributes", None)
-    if attrs is None:
-        return False
-    reparse_bit = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return bool(attrs & reparse_bit)
-
-
 # Alan 11/1/26 - Files inside archives (.zip exports from Facebook or Google,
 # old backups) are listed too, so their photos count as copies. A .zip keeps
 # its table of contents at the end, so listing one reads very little; a .tar
@@ -1070,88 +943,6 @@ def list_archive(path, kind):
                 if member.isfile():
                     name = member.name[2:] if member.name.startswith("./") else member.name
                     yield name.lstrip("/"), member.size, int(member.mtime) * 1_000_000_000
-
-
-# Windows file attributes of cloud files whose data isn't stored locally
-# (OneDrive "online-only", Phone Link): RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, OFFLINE.
-_WINDOWS_PLACEHOLDER_ATTRIBUTES = 0x400000 | 0x40000 | 0x1000
-_MACOS_SF_DATALESS = 0x40000000  # iCloud files evicted from the Mac
-_PLACEHOLDER_MIN_BYTES = 4096  # tiny files can live inside the directory entry
-
-
-def is_placeholder_stat(st):
-    """True when a file's data isn't actually stored on the drive: a cloud
-    placeholder (OneDrive, Phone Link, iCloud) or a file with no data blocks."""
-    attributes = getattr(st, "st_file_attributes", None)
-    if attributes is not None:
-        return bool(attributes & _WINDOWS_PLACEHOLDER_ATTRIBUTES)
-    if getattr(st, "st_flags", 0) & _MACOS_SF_DATALESS:
-        return True
-    blocks = getattr(st, "st_blocks", None)
-    return blocks == 0 and st.st_size > _PLACEHOLDER_MIN_BYTES
-
-
-def find_files(directory, extensions, debug=False, errors=None, placeholders=None):
-    """Recursively find all files with the specified extensions using os.scandir().
-
-    Yields (filepath, is_symlink, size_bytes, mtime_ns) tuples.
-    For non-symlink files, size_bytes and mtime_ns come from the DirEntry stat
-    cache (no extra syscall on Linux).  For symlinks, they are None so the
-    consumer stats the resolved target itself.
-
-    Symlinked directories are NOT recursed into (avoids duplicate traversal and
-    infinite loops from symlink cycles).  Symlinked files are still yielded.
-    Folders and files that can't be read are skipped; if *errors* is a list,
-    (kind, path, is_io_error, message) tuples are appended to it for each one.
-    If *placeholders* is a set, paths of files whose data isn't on the drive
-    (see is_placeholder_stat) are added to it before they are yielded.
-    """
-    try:
-        scan_it = os.scandir(directory)
-    except (PermissionError, OSError) as e:
-        if errors is not None:
-            errors.append(("folder", directory, _is_io_error(e), e.strerror or str(e)))
-        return
-    with scan_it:
-        for entry in scan_it:
-            try:
-                is_link = entry.is_symlink()
-                is_dir_no_follow = entry.is_dir(follow_symlinks=False)
-                if is_dir_no_follow:
-                    # Alan 5/3/26 - Skip Windows reparse-point *directories*
-                    # (NTFS junctions and directory symlinks) to avoid
-                    # traversal loops such as
-                    # C:\ProgramData\Application Data -> C:\ProgramData.
-                    # Only checked for directories so ordinary reparse-point
-                    # files (e.g. OneDrive cloud placeholders, file symlinks)
-                    # are still indexed normally.
-                    if _is_windows_reparse_point_dir(entry):
-                        if debug:
-                            print(
-                                f"Debug: Skipping reparse-point directory: {entry.path}",
-                                file=sys.stderr,
-                            )
-                        continue
-                    # Real directory — recurse
-                    yield from find_files(entry.path, extensions, debug=debug, errors=errors,
-                                          placeholders=placeholders)
-                elif is_link and entry.is_dir(follow_symlinks=True):
-                    # Symlinked directory — skip recursion to avoid
-                    # duplicate traversal and symlink loops
-                    pass
-                elif entry.is_file(follow_symlinks=True):
-                    if is_supported_file(entry.name, extensions):
-                        if is_link:
-                            yield entry.path, True, None, None
-                        else:
-                            st = entry.stat(follow_symlinks=True)
-                            if placeholders is not None and is_placeholder_stat(st):
-                                placeholders.add(entry.path)
-                            yield entry.path, False, st.st_size, st.st_mtime_ns
-            except (PermissionError, OSError) as e:
-                if errors is not None:
-                    errors.append(("file", entry.path, _is_io_error(e), e.strerror or str(e)))
-                continue
 
 
 def _is_read_error_message(message):
@@ -1644,7 +1435,7 @@ def geolocate(lat, lon, location_conn=None, pending_counter=None):
             req = urllib.request.Request(url)
             req.add_header(
                 "User-Agent",
-                "findphotodates.py/1.5 (https://github.com/alanrockefeller/findphotodates.py)",
+                f"findphotodates.py/{__version__} (https://github.com/alanrockefeller/findphotodates.py)",
             )
 
             # Make the request
@@ -1735,11 +1526,6 @@ def _normalize_exif_date(value):
     if date_part.startswith("0000:") or date_part[:4] < "1900":
         return None
     return date_part
-
-
-def _root_cache_prefix(root):
-    """Normalized cache-key prefix (with trailing slash) for an inventory root."""
-    return _normalize_cache_key(root.rstrip("/\\") + "/")
 
 
 def _root_still_present(root):
@@ -2150,52 +1936,6 @@ def report_read_problems(problems, output, kept_rows, quiet=False):
     return report_path
 
 
-def _troubling_health_record(directory, volume_info=None):
-    """The latest health-log entry for the drive holding *directory*, if that
-    check found signs of failure (bad sectors, read errors or FAILING)."""
-    rows = read_health_log()
-    if not rows:
-        return None
-    drive = volume_info
-    if drive is None:
-        try:
-            drive = identify_drive(_mount_root(directory))
-        except Exception:
-            drive = None
-    if drive is None:
-        return None
-    latest = None
-    for row in rows:
-        ids = [i for i in (row.get("volume_ids") or "").split(",") if i]
-        names = [n.strip() for n in (row.get("drive") or "").split(",")]
-        if (drive.volume_id and drive.volume_id in ids) or (
-            not ids and drive.label and drive.label in names
-        ):
-            latest = row
-    if latest is None:
-        return None
-    if latest.get("health") == "FAILING":
-        return latest
-    for key in ("pending_sectors", "uncorrectable_sectors", "read_errors", "ssd_media_errors"):
-        value = _as_number(latest.get(key))
-        if value:
-            return latest
-    if latest.get("check") == "file read" and latest.get("health") == "WARNING":
-        return latest
-    return None
-
-
-def _print_health_warning(row):
-    notes = row.get("notes") or ""
-    print()
-    print(_wrap(
-        f"Warning: in its last health check ({row.get('date', '')[:10]}), this drive was rated "
-        f"{row.get('health', 'WARNING')}" + (f": {notes}." if notes and notes != "No warning signs" else ".")
-        + " Reading every file on a failing drive adds wear and can be very slow. If it holds "
-        "the only copy of anything, copy your files off it first. If you scan it anyway, "
-        "files will be read one at a time to go easier on it.", indent=""))
-
-
 def _build_moved_index(cache):
     """Index previous-list entries for photos/videos by (name, size, mtime).
 
@@ -2245,8 +1985,7 @@ def _build_other_lists_index(output, quiet=False):
     for fl in lists:
         try:
             with open(fl.path, "r", encoding="utf-8", newline="") as f:
-                reader = csv.reader((line for line in f if not line.startswith("#")),
-                                    delimiter="\t")
+                reader = split_list_lines(f)
                 header = next(reader, None)
                 if not header or not set(TSV_COLUMNS[:7]) <= set(header):
                     continue
@@ -2372,12 +2111,6 @@ def print_change_report(inventory_root, new_files, changed_files, removed, filte
     if still_removed:
         title = "Removed (deleted, or left out by the file-type filter)" if filtered else "Removed (no longer found)"
         _print_change_group(title, [_relative_display(k, inventory_root) for k in still_removed])
-
-
-# Path expansion helper
-def _expand_path(p: str) -> str:
-    """Expand user home directory and convert to absolute path."""
-    return os.path.abspath(os.path.expanduser(p))
 
 
 # Alan 5/3/26 - Preflight helpers: catch predictable setup mistakes (bad
@@ -2568,7 +2301,7 @@ def _safe_write_inventory(
 def _resolve_extensions(args):
     """Resolve file extension filter from CLI args. Returns a set or None (all files)."""
     if args.extension:
-        return {args.extension.lower()}
+        return {args.extension.lower().lstrip(".")}
     if args.video:
         return VIDEO_EXTENSIONS
     if args.only_photos:
@@ -2576,62 +2309,6 @@ def _resolve_extensions(args):
     if args.only_media:
         return MEDIA_EXTENSIONS
     return None  # all files
-
-
-# Config file handling
-CONFIG_FILE = Path.home() / ".findphotodates.config.json"
-
-
-def load_config():
-    """Load configuration from JSON file."""
-    if not CONFIG_FILE.exists():
-        return {
-            "_comment": "Saved scan configurations for findphotodates.py. Edit cautiously; JSON comments are stored here.",
-            "saved_scans": [],
-        }
-
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        # Ensure required structure
-        if "saved_scans" not in config:
-            config["saved_scans"] = []
-        return config
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in config file {CONFIG_FILE}: {e}")
-        print("Please fix or remove the config file and try again.")
-        exit(1)
-    except Exception as e:
-        print(f"Error: Failed to read config file {CONFIG_FILE}: {e}")
-        exit(1)
-
-
-def save_config(config):
-    """Save configuration to JSON file atomically."""
-    try:
-        # Ensure directory exists
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-        # Create temp file in same directory
-        fd, temp_file = tempfile.mkstemp(
-            dir=CONFIG_FILE.parent, suffix=".json", prefix=".findphotodates_"
-        )
-
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False, sort_keys=True)
-
-            # Atomically replace
-            os.replace(temp_file, CONFIG_FILE)
-        except Exception:
-            try:
-                os.unlink(temp_file)
-            except Exception:
-                pass
-            raise
-    except Exception as e:
-        print(f"Error: Failed to write config file {CONFIG_FILE}: {e}")
-        exit(1)
 
 
 def detect_drive_root(directory_abs):
@@ -2783,20 +2460,6 @@ def resolve_saved_directory(entry):
     return entry.get("directory_abs")
 
 
-def _format_duration(seconds):
-    """Format seconds into a human-readable duration string."""
-    if seconds > 3600:
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        return f"{hours}h {minutes}m"
-    elif seconds > 60:
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m {secs}s"
-    else:
-        return f"{seconds:.1f}s"
-
-
 def _check_drive_disconnect(
     error,
     output,
@@ -2814,16 +2477,12 @@ def _check_drive_disconnect(
         for err in ["no such file", "input/output error", "stale file handle"]
     ):
         print("\n\nWARNING: Drive may be disconnected! Saving progress...")
-        write_dates_to_file_atomic(
-            output,
-            photo_data,
-            inventory_root=inventory_root,
-            hash_options=hash_options,
-            old_format=old_format,
-            path_style=path_style,
-            extra_headers=extra_headers,
-        )
-        print(f"Saved {len(photo_data)} files to '{output}'")
+        # The list may be on the drive that just went away, so a failed save is
+        # reported rather than raised.
+        if _safe_write_inventory(output, photo_data, inventory_root, hash_options, old_format,
+                                 path_style, context="save after disconnect",
+                                 extra_headers=extra_headers):
+            print(f"Saved {len(photo_data)} files to '{output}'")
         print("Reconnect drive and run again to resume.")
         cleanup_fn()
         return True
@@ -3008,6 +2667,36 @@ def _clamp_min_image_size(min_image_size):
         return max(0, int(min_image_size))
     except (TypeError, ValueError):
         return MIN_EXIFTOOL_IMAGE_BYTES
+
+
+class _ScanWarningLog:
+    """The per-scan warnings file (ExifTool worker failures, unreadable files).
+    Deleted at the end if nothing was written; otherwise its location is printed
+    so the warnings aren't lost in the temp folder."""
+
+    def __init__(self, path, quiet=False):
+        self.path = path
+        self.quiet = quiet
+        self.handle = None
+
+    def __enter__(self):
+        self.handle = open(self.path, "w", encoding="utf-8")
+        return self.handle
+
+    def __exit__(self, *exc):
+        try:
+            written = self.handle.tell() > 0
+        except (OSError, ValueError):
+            written = True
+        self.handle.close()
+        if not written:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+        elif not self.quiet:
+            print(f"Scan warnings were written to: {self.path}")
+        return False
 
 
 def _log_worker_error(error_log, error_log_lock, message):
@@ -3452,6 +3141,7 @@ def run_scan(
     moved_index = None  # (name_lower, size, mtime_ns) -> cached entry, built on first need
     moved_reused_count = 0
     archives_found = []  # (out_path, fs_path, key_path, archive_type, unchanged since last list)
+    archive_only_count = 0  # archives found only so their contents can be listed (no row)
     # Alan 9/28/26 - Copies of photos already listed for another drive in the
     # same folder reuse that list's dates too.
     other_index = None  # (name_lower, size, mtime_ns) -> (date, lat, lon, location)
@@ -3571,7 +3261,7 @@ def run_scan(
 
     with (
         _StatusOutputPauseController(enabled=(not quiet and _IS_TTY)) as status_pause,
-        open(error_log_path, "w", encoding="utf-8") as error_log,
+        _ScanWarningLog(error_log_path, quiet) as error_log,
     ):
         start_time = time.time()
         last_save_time = start_time
@@ -3791,12 +3481,13 @@ def run_scan(
                 if problem_count:
                     exiftool_part += f" — {problem_count:,} unreadable"
 
-                if discovery_complete and total_files > 0:
-                    pct = total_seen / total_files * 100
-                    eta_str = _format_eta(total_files - total_seen, rate)
+                listed_total = total_files - archive_only_count
+                if discovery_complete and listed_total > 0:
+                    pct = total_seen / listed_total * 100
+                    eta_str = _format_eta(listed_total - total_seen, rate)
                     eta_part = f" — ETA: {eta_str}" if eta_str else ""
                     _print_progress_line(
-                        f"{activity}... {total_seen:,} / {total_files:,} ({pct:.1f}%) — "
+                        f"{activity}... {total_seen:,} / {listed_total:,} ({pct:.1f}%) — "
                         f"{cached_count:,} cached{exiftool_part} — "
                         f"{rate_str}{eta_part} [{_format_duration(elapsed)}]"
                     )
@@ -4107,6 +3798,7 @@ def run_scan(
                             (out_path, fs_path, key_path, archive_type, bool(cache_valid)))
                         if (extensions is not None and not old_format
                                 and not is_supported_file(basename, extensions)):
+                            archive_only_count += 1
                             continue  # found only so the files inside it can be listed
                     if cached_entry is None:
                         if had_previous_list:
@@ -4647,30 +4339,34 @@ def add_hashes_to_inventory(
     try:
         with open(tsv_path, "r", encoding="utf-8", newline="") as f:
             for line in f:
-                line = line.rstrip("\n\r")
-                if not line:
+                stripped = line.rstrip("\n\r")
+                if not stripped:
                     continue
-                if line.startswith("#"):
-                    comment_lines.append(line)
+                if stripped.startswith("#"):
+                    comment_lines.append(stripped)
                     continue
-                if header_line is None:
-                    header_line = line
-                    # Validate that this looks like the expected TSV header
-                    header_fields = header_line.split("\t")
-                    if header_fields[0] != "filepath":
-                        print(
-                            f"Error: Expected TSV header starting with 'filepath', got: {header_fields[0]!r}"
-                        )
-                        print(
-                            f"  File '{tsv_path}' does not appear to be a valid findphotodates inventory."
-                        )
-                        return False
+                header_line = line
+                break
+            if header_line is None:
+                rows_in = iter(())
+            else:
+                # The shared reader handles quoted names, including names with
+                # tabs, quotes or line breaks in them.
+                rows_in = split_list_lines(itertools.chain([header_line], f))
+                header_fields = next(rows_in)
+                if header_fields[0] != "filepath":
+                    print(
+                        f"Error: Expected TSV header starting with 'filepath', got: {header_fields[0]!r}"
+                    )
+                    print(
+                        f"  File '{tsv_path}' does not appear to be a valid findphotodates inventory."
+                    )
+                    return False
+            for parts in rows_in:
+                if not any(parts):
                     continue
-                # Data row — use csv.reader to handle quoted fields containing
-                # tabs (the writer uses csv.writer with QUOTE_MINIMAL).
                 # Pad with empty strings if row has fewer fields than
                 # TSV_COLUMNS (e.g. older inventories without content_hash).
-                parts = next(csv.reader([line], delimiter="\t"))
                 if len(parts) > len(TSV_COLUMNS):
                     if not quiet:
                         print(
@@ -4685,7 +4381,7 @@ def add_hashes_to_inventory(
                     )
                 )
                 rows.append(row)
-    except (IOError, UnicodeDecodeError) as e:
+    except (IOError, UnicodeDecodeError, csv.Error) as e:
         print(f"Error reading '{tsv_path}': {e}")
         return False
 
@@ -4920,2552 +4616,6 @@ def add_hashes_to_inventory(
     return True
 
 
-# ---------------------------------------------------------------------------
-# Interactive mode: file-list folder, drive detection, and menus
-# ---------------------------------------------------------------------------
-# Alan 9/28/26 - Running with no arguments in a terminal opens a menu that
-# finds connected drives and their file lists, so the common case (update a
-# drive's list, or make one for a new drive) needs no command-line flags.
-
-INVENTORY_DIR_NAME = "findphotodates"
-_LEGACY_LIST_GLOBS = (
-    "*:photo.taken.dates.txt",
-    "*_photo.taken.dates.txt",
-    "*:photo.taken.dates.tsv",
-    "*_photo.taken.dates.tsv",
-)
-_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_PSEUDO_FSTYPES = {"tmpfs", "autofs", "overlay", "squashfs", "proc", "sysfs"}
-
-
-def _is_wsl():
-    if platform.system() != "Linux":
-        return False
-    try:
-        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as f:
-            return "microsoft" in f.read().lower()
-    except OSError:
-        return False
-
-
-def _run_quiet(cmd, timeout=30):
-    """Run a helper command and return its stdout, or None on any failure."""
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout if result.returncode == 0 else None
-
-
-def _linux_documents_dir():
-    """The XDG Documents folder (honours ~/.config/user-dirs.dirs)."""
-    value = os.environ.get("XDG_DOCUMENTS_DIR")
-    if not value:
-        config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-        try:
-            with open(os.path.join(config_home, "user-dirs.dirs"), encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("XDG_DOCUMENTS_DIR="):
-                        value = line.split("=", 1)[1].strip().strip('"')
-                        break
-        except OSError:
-            pass
-    if value:
-        path = Path(value.replace("$HOME", str(Path.home())))
-        # user-dirs uses "$HOME/" to mean "disabled"; fall back in that case
-        if path.is_absolute() and path != Path.home():
-            return path
-    return Path.home() / "Documents"
-
-
-def _windows_documents_dir():
-    """The real Documents folder, following OneDrive/folder redirection."""
-    try:
-        import ctypes
-
-        buf = ctypes.create_unicode_buffer(1024)
-        # CSIDL_PERSONAL (5) is "My Documents"; SHGFP_TYPE_CURRENT (0)
-        if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:
-            return Path(buf.value)
-    except Exception:
-        pass
-    return Path(os.environ.get("USERPROFILE") or Path.home()) / "Documents"
-
-
-def _wsl_documents_dir():
-    """The Windows user's Documents folder as a WSL path, so lists are shared."""
-    out = _run_quiet(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Environment]::GetFolderPath('MyDocuments')",
-        ]
-    )
-    if out and out.strip():
-        converted = _run_quiet(["wslpath", "-u", out.strip()])
-        if converted and converted.strip():
-            return Path(converted.strip())
-    return None
-
-
-def _platform_documents_dir():
-    system = platform.system()
-    if system == "Windows":
-        return _windows_documents_dir()
-    if system == "Darwin":
-        return Path.home() / "Documents"
-    if _is_wsl():
-        return _wsl_documents_dir() or _linux_documents_dir()
-    return _linux_documents_dir()
-
-
-def default_inventory_dir():
-    """Folder where file lists are kept: <Documents>/findphotodates, unless
-    the user picked a different folder (saved as "inventory_dir" in the config)."""
-    custom = load_config().get("inventory_dir")
-    if custom:
-        return Path(custom).expanduser()
-    return _platform_documents_dir() / INVENTORY_DIR_NAME
-
-
-class DriveInfo:
-    """A mounted drive (volume) that can be scanned."""
-
-    __slots__ = ("mount", "label", "volume_id", "fstype", "size_bytes")
-
-    def __init__(self, mount, label="", volume_id="", fstype="", size_bytes=0):
-        self.mount = mount
-        self.label = (label or "").strip()
-        self.volume_id = _normalize_volume_id(volume_id)
-        self.fstype = fstype or ""
-        self.size_bytes = int(size_bytes or 0)
-
-    @property
-    def display_name(self):
-        if self.label:
-            return self.label
-        m = re.fullmatch(r"([A-Za-z]):\\?", self.mount) or re.fullmatch(
-            r"/mnt/([A-Za-z])", self.mount
-        )
-        if m:
-            return f"Drive {m.group(1).upper()}"
-        return os.path.basename(self.mount.rstrip("/\\")) or self.mount
-
-
-def _normalize_volume_id(raw):
-    """Put a volume serial/UUID into one form shared by every OS.
-
-    exFAT/FAT serials look like "1A2B-3C4D" everywhere.  Linux shows an NTFS
-    serial as 16 hex digits; Windows shows only the low 32 bits, so keep those.
-    """
-    if not raw:
-        return ""
-    text = str(raw).strip().upper()
-    compact = text.replace("-", "")
-    if re.fullmatch(r"[0-9A-F]{16}", compact):
-        compact = compact[-8:]
-    if re.fullmatch(r"[0-9A-F]{8}", compact):
-        return f"{compact[:4]}-{compact[4:]}"
-    return text
-
-
-def _human_size(num_bytes):
-    if not num_bytes:
-        return ""
-    value = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1000 or unit == "TB":
-            return f"{value:.0f} {unit}" if value >= 100 or unit == "B" else f"{value:.1f} {unit}"
-        value /= 1000
-    return ""
-
-
-def _disk_total(path):
-    try:
-        return shutil.disk_usage(path).total
-    except OSError:
-        return 0
-
-
-def _unescape_mount_path(text):
-    """Decode the octal escapes (\\040 for space etc.) used in /proc/self/mounts."""
-    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
-
-
-def _linux_drives(wsl=False):
-    mounts = []
-    seen = set()
-    try:
-        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                mount = _unescape_mount_path(parts[1])
-                if wsl:
-                    if not re.fullmatch(r"/mnt/[a-zA-Z]", mount):
-                        continue
-                elif not mount.startswith(("/run/media/", "/media/", "/mnt/")):
-                    continue
-                if parts[2] in _PSEUDO_FSTYPES or mount in seen:
-                    continue
-                seen.add(mount)
-                mounts.append((mount, parts[2]))
-    except OSError:
-        return []
-
-    details = _wsl_windows_volumes() if wsl else _lsblk_by_mountpoint()
-    drives = []
-    for mount, fstype in mounts:
-        if wsl:
-            info = details.get(mount[-1].lower(), {})
-            drives.append(
-                DriveInfo(
-                    mount,
-                    info.get("VolumeName") or "",
-                    info.get("VolumeSerialNumber") or "",
-                    info.get("FileSystem") or fstype,
-                    info.get("Size") or _disk_total(mount),
-                )
-            )
-        else:
-            info = details.get(mount, {})
-            drives.append(
-                DriveInfo(
-                    mount,
-                    info.get("label") or "",
-                    info.get("uuid") or "",
-                    info.get("fstype") or fstype,
-                    info.get("size") or _disk_total(mount),
-                )
-            )
-    return drives
-
-
-def _lsblk_by_mountpoint():
-    out = _run_quiet(["lsblk", "-J", "-b", "-o", "UUID,LABEL,FSTYPE,SIZE,MOUNTPOINT"])
-    if not out:
-        return {}
-    try:
-        stack = list(json.loads(out).get("blockdevices", []))
-    except ValueError:
-        return {}
-    by_mount = {}
-    while stack:
-        dev = stack.pop()
-        stack.extend(dev.get("children") or [])
-        if dev.get("mountpoint"):
-            by_mount[dev["mountpoint"]] = dev
-    return by_mount
-
-
-def _wsl_windows_volumes():
-    out = _run_quiet(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,VolumeName,"
-            "VolumeSerialNumber,FileSystem,Size | ConvertTo-Json -Compress",
-        ]
-    )
-    if not out or not out.strip():
-        return {}
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return {}
-    if isinstance(data, dict):
-        data = [data]
-    return {
-        d["DeviceID"][0].lower(): d
-        for d in data
-        if isinstance(d, dict) and d.get("DeviceID")
-    }
-
-
-def _windows_drives():
-    try:
-        import ctypes
-    except ImportError:
-        return []
-    kernel32 = ctypes.windll.kernel32
-    # Don't pop up "insert a disk" dialogs for empty card readers.
-    kernel32.SetErrorMode(1)  # SEM_FAILCRITICALERRORS
-    mask = kernel32.GetLogicalDrives()
-    drives = []
-    for i, letter in enumerate(string.ascii_uppercase):
-        if not mask & (1 << i):
-            continue
-        root = f"{letter}:\\"
-        # 2 = removable, 3 = fixed, 4 = network
-        if kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)) not in (2, 3, 4):
-            continue
-        label = ctypes.create_unicode_buffer(261)
-        fs_name = ctypes.create_unicode_buffer(261)
-        serial = ctypes.c_uint32(0)
-        ok = kernel32.GetVolumeInformationW(
-            ctypes.c_wchar_p(root),
-            label,
-            261,
-            ctypes.byref(serial),
-            None,
-            None,
-            fs_name,
-            261,
-        )
-        if not ok:
-            continue
-        drives.append(
-            DriveInfo(root, label.value, f"{serial.value:08X}", fs_name.value, _disk_total(root))
-        )
-    return drives
-
-
-def _macos_drives():
-    import plistlib
-
-    try:
-        root_dev = os.stat("/").st_dev
-        entries = list(os.scandir("/Volumes"))
-    except OSError:
-        return []
-    drives = []
-    for entry in entries:
-        try:
-            # Skip the startup disk ("Macintosh HD" is a link to /)
-            if os.stat(entry.path).st_dev == root_dev:
-                continue
-        except OSError:
-            continue
-        info = {}
-        out = _run_quiet(["diskutil", "info", "-plist", entry.path])
-        if out:
-            try:
-                info = plistlib.loads(out.encode("utf-8"))
-            except Exception:
-                info = {}
-        drives.append(
-            DriveInfo(
-                entry.path,
-                info.get("VolumeName") or entry.name,
-                info.get("VolumeUUID") or info.get("DiskUUID") or "",
-                info.get("FilesystemType") or info.get("FilesystemName") or "",
-                info.get("TotalSize") or _disk_total(entry.path),
-            )
-        )
-    return drives
-
-
-def detect_drives():
-    """Return the mounted drives a person would want to scan, sorted by mount."""
-    system = platform.system()
-    if system == "Windows":
-        drives = _windows_drives()
-    elif system == "Darwin":
-        drives = _macos_drives()
-    elif system == "Linux":
-        drives = _linux_drives(wsl=_is_wsl())
-    else:
-        drives = []
-    return sorted(drives, key=lambda d: d.mount.lower())
-
-
-def identify_drive(directory):
-    """Return the DriveInfo whose mount point is *directory*, else None."""
-    want = _root_cache_prefix(os.path.abspath(directory))
-    for drive in detect_drives():
-        if _root_cache_prefix(drive.mount) == want:
-            return drive
-    return None
-
-
-def read_inventory_header(path, max_lines=64):
-    """Return ({key: value} from "# key=value" header lines, is_tsv_inventory)."""
-    info = {}
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for _ in range(max_lines):
-                line = f.readline()
-                if not line:
-                    break
-                line = line.rstrip("\r\n")
-                if line.startswith("#"):
-                    key, sep, value = line.lstrip("# ").partition("=")
-                    if sep and key and " " not in key:
-                        info[key] = value
-                    continue
-                return info, line.startswith("filepath\t")
-    except OSError:
-        pass
-    return info, False
-
-
-def _volume_header_lines(output, directory, volume_info=None):
-    """Header lines naming the drive a whole-drive inventory belongs to.
-
-    Only whole-drive scans get them; a list of one folder must not be offered
-    as the list for its entire drive.
-    """
-    if volume_info is None:
-        try:
-            if not os.path.ismount(directory):
-                return []
-        except OSError:
-            return []
-        volume_info = identify_drive(directory)
-        if volume_info is None:
-            return []
-    existing = read_inventory_header(output)[0] if os.path.exists(output) else {}
-    ids = [i for i in existing.get("volume_ids", "").split(",") if i]
-    same_drive = (
-        not ids
-        or volume_info.volume_id in ids
-        or (volume_info.label and existing.get("volume_label") == volume_info.label)
-    )
-    if not same_drive:
-        ids = []
-    # Keep IDs seen on other systems (macOS reports exFAT IDs differently).
-    if volume_info.volume_id and volume_info.volume_id not in ids:
-        ids.insert(0, volume_info.volume_id)
-    lines = []
-    if volume_info.label:
-        lines.append(f"volume_label={volume_info.label}")
-    if ids:
-        lines.append(f"volume_ids={','.join(ids)}")
-    return lines
-
-
-class FileList:
-    """An inventory file plus what is known about which drive it describes."""
-
-    __slots__ = ("path", "root", "label", "volume_ids", "drive", "matched_by")
-
-    def __init__(self, path, header):
-        self.path = Path(path)
-        self.root = header.get("inventory_root", "")
-        self.label = header.get("volume_label", "")
-        self.volume_ids = [i for i in header.get("volume_ids", "").split(",") if i]
-        self.drive = None
-        self.matched_by = ""
-
-
-def find_file_lists(folder):
-    """All findphotodates TSV inventories directly inside *folder*."""
-    lists = []
-    try:
-        candidates = sorted(Path(folder).glob("*.tsv"), key=lambda p: p.name.lower())
-    except OSError:
-        return lists
-    for path in candidates:
-        header, is_inventory = read_inventory_header(path)
-        if is_inventory:
-            lists.append(FileList(path, header))
-    return lists
-
-
-def _sample_inventory_rows(path, samples=40):
-    """(filepath, size) pairs spread evenly through an inventory, read by seeking."""
-    rows = []
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            for i in range(samples):
-                f.seek(int(size * (i + 0.5) / samples))
-                f.readline()  # skip the partial line we landed in
-                parts = f.readline().decode("utf-8", "replace").rstrip("\r\n").split("\t")
-                if len(parts) < 4 or parts[0].startswith(("#", '"')) or parts[0] == "filepath":
-                    continue
-                try:
-                    rows.append((parts[0], int(parts[2])))
-                except ValueError:
-                    continue
-    except OSError:
-        pass
-    # Small lists land on the same row repeatedly; count each file once.
-    return list(dict.fromkeys(rows))
-
-
-def _content_match_score(rows, recorded_root, mount):
-    """How many sampled files exist on *mount* at the same place with the same size."""
-    old_prefix = _root_cache_prefix(recorded_root)
-    hits = checked = 0
-    for filepath, size in rows:
-        key = _normalize_cache_key(filepath)
-        if not key.startswith(old_prefix):
-            continue
-        checked += 1
-        try:
-            if os.stat(os.path.join(mount, *key[len(old_prefix):].split("/"))).st_size == size:
-                hits += 1
-        except (OSError, ValueError):
-            pass
-        if checked >= 10 and hits == 0:
-            break  # clearly a different drive; don't keep seeking a slow disk
-    return hits, checked
-
-
-def _id_shape(volume_id):
-    """Rough format of a volume ID, e.g. "XXXX-XXXX" serials vs 36-char UUIDs."""
-    return re.sub(r"[0-9A-Fa-f]", "X", volume_id)
-
-
-def list_belongs_to_other_drive(volume_ids, drive):
-    """True if a list's recorded volume IDs show it belongs to a different drive.
-
-    Only IDs in the same format are compared: macOS reports exFAT volumes with
-    a UUID where Linux and Windows use a serial, so a list recorded elsewhere
-    may legitimately carry an ID of another shape.
-    """
-    if not volume_ids or not drive.volume_id or drive.volume_id in volume_ids:
-        return False
-    shape = _id_shape(drive.volume_id)
-    return any(_id_shape(v) == shape for v in volume_ids)
-
-
-def match_lists_to_drives(lists, drives):
-    """Pair file lists with connected drives, most reliable evidence first:
-    recorded volume serial/UUID, then an unchanged mount path, then whether
-    files from the list are actually present on the drive."""
-    taken = set()
-
-    for fl in lists:
-        for vid in fl.volume_ids:
-            candidates = [d for d in drives if d.volume_id == vid and d.mount not in taken]
-            if len(candidates) == 1:
-                fl.drive, fl.matched_by = candidates[0], "drive ID"
-                taken.add(candidates[0].mount)
-                break
-
-    for fl in lists:
-        if fl.drive or fl.volume_ids or not fl.root:
-            continue
-        want = _root_cache_prefix(fl.root)
-        for d in drives:
-            if d.mount not in taken and _root_cache_prefix(d.mount) == want:
-                fl.drive, fl.matched_by = d, "location"
-                taken.add(d.mount)
-                break
-
-    candidates = []
-    for fl in lists:
-        if fl.drive or not fl.root:
-            continue
-        # Alan 9/28/26 - A drive holding copies of another drive's folders
-        # must not take over that drive's list; recorded IDs rule it out.
-        free = [d for d in drives if d.mount not in taken
-                and not list_belongs_to_other_drive(fl.volume_ids, d)]
-        if not free:
-            continue
-        rows = _sample_inventory_rows(fl.path)
-        for d in free:
-            hits, checked = _content_match_score(rows, fl.root, d.mount)
-            if hits >= 5 and hits * 2 >= checked:
-                candidates.append((hits / checked, hits, fl, d))
-    for _, _, fl, d in sorted(candidates, key=lambda c: (c[0], c[1]), reverse=True):
-        if fl.drive is None and d.mount not in taken:
-            fl.drive, fl.matched_by = d, "contents"
-            taken.add(d.mount)
-
-
-def _safe_filename(text):
-    return _INVALID_FILENAME_CHARS.sub("_", text).strip(" .") or "Drive"
-
-
-def canonical_list_name(drive):
-    """File name for a drive's list, e.g. "Sierra Club (1A2B-3C4D).tsv"."""
-    name = _safe_filename(drive.display_name)
-    vid = drive.volume_id
-    if vid:
-        if len(vid) > 9:  # long UUIDs (ext4, APFS): a short prefix is enough
-            vid = vid.replace("-", "")[:8]
-        name += f" ({_safe_filename(vid)})"
-    return name + ".tsv"
-
-
-def _legacy_list_name(fl):
-    """Name for an old list whose drive isn't connected: "Drive F.tsv" etc."""
-    root = (fl.root or "").rstrip("/\\")
-    m = re.fullmatch(r"([A-Za-z]):", root) or re.fullmatch(r"/mnt/([A-Za-z])", root)
-    if m:
-        return f"Drive {m.group(1).upper()}.tsv"
-    if root:
-        return _safe_filename(os.path.basename(root)) + ".tsv"
-    return _safe_filename(fl.path.stem) + ".tsv"
-
-
-def _unused_path(path, taken=()):
-    """*path*, or "name (2).ext" and so on if it exists or is in *taken*."""
-    path = Path(path)
-    if not path.exists() and path not in taken:
-        return path
-    for n in range(2, 1000):
-        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
-        if not candidate.exists() and candidate not in taken:
-            return candidate
-    raise FileExistsError(path)
-
-
-def find_legacy_lists(folder=None):
-    """Lists made by older versions (named like ~/f:photo.taken.dates.txt)."""
-    folder = Path(folder) if folder else Path.home()
-    found = []
-    for pattern in _LEGACY_LIST_GLOBS:
-        for path in sorted(folder.glob(pattern)):
-            if path not in found and read_inventory_header(path)[1]:
-                found.append(path)
-    return found
-
-
-def import_file_lists(paths, list_dir, drives, move=True):
-    """Move (or copy) lists into *list_dir*, named after their drive when known.
-
-    Returns [(old_path, new_path)].
-    """
-    list_dir = Path(list_dir)
-    list_dir.mkdir(parents=True, exist_ok=True)
-    lists = [FileList(p, read_inventory_header(p)[0]) for p in paths]
-    match_lists_to_drives(lists, drives)
-    moved = []
-    for fl in lists:
-        name = canonical_list_name(fl.drive) if fl.drive else _legacy_list_name(fl)
-        dest = _unused_path(list_dir / name)
-        if move:
-            shutil.move(str(fl.path), str(dest))
-        else:
-            shutil.copy2(str(fl.path), str(dest))
-        moved.append((fl.path, dest))
-    return moved
-
-
-def _count_rows(path):
-    """Number of file rows in an inventory (fast newline count)."""
-    lines = 0
-    comments = 0
-    try:
-        with open(path, "rb") as f:
-            for line in iter(f.readline, b""):
-                if not line.startswith(b"#"):
-                    break
-                comments += 1
-            f.seek(0)
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                lines += chunk.count(b"\n")
-    except OSError:
-        return 0
-    return max(0, lines - comments - 1)  # minus comments and the column header
-
-
-class _InteractiveSettings:
-    """Advanced options chosen in the menu (they last until you quit)."""
-
-    def __init__(self):
-        self.only_media = False
-        self.hash_mode = "off"
-        self.locate = False
-        self.retry_blank_exif = False
-        self.workers = 4
-        self.min_image_size = MIN_EXIFTOOL_IMAGE_BYTES
-        self.path_style = "auto"
-        self.archives = DEFAULT_ARCHIVE_MODE
-
-    def command_line(self, directory, output):
-        """The equivalent findphotodates.py command for these settings."""
-        args = [os.path.basename(sys.argv[0]) or "findphotodates.py",
-                "--directory", directory, "-o", str(output)]
-        if self.only_media:
-            args.append("--only-media")
-        if self.hash_mode != "off":
-            args += ["--hash", self.hash_mode]
-        if self.locate:
-            args.append("--locate")
-        if self.retry_blank_exif:
-            args.append("--retry-blank-exif")
-        if self.workers != 4:
-            args += ["--workers", str(self.workers)]
-        if self.min_image_size != MIN_EXIFTOOL_IMAGE_BYTES:
-            args += ["--min-image-size", str(self.min_image_size)]
-        if self.path_style != "auto":
-            args.append(f"--{self.path_style}")
-        if self.archives != DEFAULT_ARCHIVE_MODE:
-            args += ["--archives", self.archives]
-        if platform.system() == "Windows":
-            return "python " + subprocess.list2cmdline(args)
-        import shlex
-
-        return " ".join(shlex.quote(a) for a in args)
-
-
-def _wrap(text, indent="     "):
-    import textwrap
-
-    width = max(40, min(shutil.get_terminal_size((88, 20)).columns, 100) - 2)
-    return "\n".join(
-        textwrap.fill(p, width=width, initial_indent=indent, subsequent_indent=indent)
-        for p in text.split("\n")
-    )
-
-
-def _ask(prompt):
-    try:
-        return input(prompt).strip()
-    except EOFError:
-        raise KeyboardInterrupt from None
-
-
-def _confirm(prompt, default=True):
-    answer = _ask(prompt + (" [Y/n] " if default else " [y/N] ")).lower()
-    if not answer:
-        return default
-    return answer in ("y", "yes")
-
-
-def _ask_folder(prompt):
-    answer = _ask(prompt)
-    if not answer:
-        return None
-    path = _expand_path(answer.strip().strip('"').strip("'"))
-    if not os.path.isdir(path):
-        print(f"  '{path}' is not a folder.")
-        return None
-    return path
-
-
-def _exiftool_install_hint():
-    system = platform.system()
-    if system == "Windows":
-        return ("Download the Windows executable from https://exiftool.org, rename "
-                "'exiftool(-k).exe' to 'exiftool.exe', and put it in a folder on your PATH.")
-    if system == "Darwin":
-        return "Install it with Homebrew:  brew install exiftool"
-    return ("Install it with your package manager, e.g.  sudo apt install "
-            "libimage-exiftool-perl  (Debian/Ubuntu)  or  sudo pacman -S perl-image-exiftool  (Arch).")
-
-
-def _exiftool_available():
-    try:
-        return subprocess.run(["exiftool", "-ver"], capture_output=True, timeout=10).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-_ADVANCED_HELP = {
-    "include": (
-        "What to include",
-        "\"All files\" lists every file on the drive: photos, videos, documents, music, "
-        "everything. Choose this if you want to be able to check that anything on the "
-        "drive is backed up.\n"
-        "\"Photos and videos only\" makes smaller lists and slightly faster scans, but "
-        "other files won't be listed, so the backup checker can't vouch for them.",
-    ),
-    "hash": (
-        "File fingerprints",
-        "A fingerprint is a short code calculated from a file's contents. Two files with "
-        "the same fingerprint are almost certainly identical, even if one was renamed or "
-        "its date changed. The backup checker uses fingerprints for its most trustworthy "
-        "\"verified\" matches, which is what you want before deleting the only other copy "
-        "of a photo.\n"
-        "Off: fastest; matches rely on name, size and date only.\n"
-        "Quick: reads three small pieces of each file. Adds a little time and is what "
-        "most people should use if they want fingerprints.\n"
-        "Full: reads every byte of every file. The most certain, but on a large drive "
-        "this can take many hours.\n"
-        "Fingerprints are remembered, so later updates only fingerprint new or changed files.",
-    ),
-    "locate": (
-        "Place names from GPS",
-        "Phones and many cameras record where a photo was taken as GPS coordinates. "
-        "Turning this on looks up a place name (like \"Point Reyes Station, California\") "
-        "for each location using the free OpenStreetMap service and adds it to the list.\n"
-        "It needs an internet connection and is limited to about one lookup per second, "
-        "so the first run on a big collection can be slow. Place names are remembered, "
-        "so photos taken near each other and later scans reuse earlier lookups.",
-    ),
-    "retry": (
-        "Re-check files with no photo date",
-        "Normally a photo or video that had no date last time is not read again as long "
-        "as it hasn't changed. Turn this on if an earlier scan was interrupted, if "
-        "ExifTool had a problem, or if you installed a newer ExifTool that understands "
-        "more file types. Only those undated files are re-read, so it is slower than a "
-        "normal update but much faster than starting over.",
-    ),
-    "workers": (
-        "Photos read at the same time",
-        "How many photos and videos are read at once. On a single USB hard drive, more "
-        "doesn't help because the disk can only read one place at a time (in testing, 1 "
-        "and 4 were the same speed). On an SSD or a fast network drive, 4 to 8 can be "
-        "faster. The default is 4.",
-    ),
-    "min_size": (
-        "Skip tiny images",
-        "JPEG, PNG and WebP images smaller than this (100 KB by default) are almost "
-        "always icons, thumbnails or web graphics with no camera date, so they are "
-        "listed without being opened. Set it to 0 to open every image, which is useful "
-        "if you have genuinely small photos, such as pictures from very old phones.",
-    ),
-    "path_style": (
-        "Path style in file lists",
-        "Controls how locations are written in the list: Linux style (/mnt/c/Photos/a.jpg) "
-        "or Windows style (C:\\Photos\\a.jpg). Automatic keeps whatever style the list "
-        "already uses. The lists work on any computer either way; only change this if "
-        "another program needs one particular style.",
-    ),
-    "archives": (
-        "Look inside archives",
-        "Files inside archives are listed too, so a photo kept only in a .zip (for example "
-        "a Facebook or Google Photos export) counts as a copy. Their location is the "
-        "archive's location followed by the path inside it. Nothing is extracted.\n"
-        ".zip only (default): reads just each .zip's table of contents, which is quick.\n"
-        "All archives: also .tar and .tgz, which have to be read from start to finish; "
-        "slow for large ones, and hard work for a failing drive. Unchanged archives are "
-        "not read again on later scans.\n"
-        "Off: list archives as single files.",
-    ),
-    "folder_scan": (
-        "Make or update a list for one folder",
-        "Lists a single folder instead of a whole drive, for example your Pictures "
-        "folder, a folder on your computer's internal drive, or a network share. The "
-        "list is saved in your file lists folder under a name you choose. Choosing the "
-        "same name again updates that list.",
-    ),
-    "check": (
-        "Check which files are backed up",
-        "Pick a folder, such as a camera card or an old laptop's Pictures folder. The "
-        "checker compares every photo and video in it against all of your file lists and "
-        "reports which ones already exist on your backup drives and which don't. It "
-        "writes its reports, including a list of folders that are safe to delete, to a "
-        "new folder inside your file lists folder. It never deletes anything itself.",
-    ),
-    "import": (
-        "Import file lists",
-        "Moves file lists made by earlier versions (for example ~/f:photo.taken.dates.txt) "
-        "or kept somewhere else into your file lists folder. Each one is renamed after its "
-        "drive if that drive is connected, or \"Drive F\" and so on if it isn't; it gets "
-        "its proper name the next time you update it with the drive connected.",
-    ),
-    "list_dir": (
-        "Where file lists are kept",
-        "File lists are the only record of what's on drives that are usually unplugged, "
-        "so keep them somewhere that is backed up. The default is a findphotodates "
-        "folder inside Documents.",
-    ),
-    "command": (
-        "Show the equivalent command",
-        "Prints the command that does the same scan with the current settings, which you "
-        "can use in scripts or scheduled tasks.",
-    ),
-}
-
-
-def _hash_label(mode):
-    return {"off": "Off", "sample": "Quick", "full": "Full"}[mode]
-
-
-def _run_interactive_scan(settings, directory, output, drive=None):
-    if drive is not None and os.path.exists(output):
-        header, _ = read_inventory_header(output)
-        recorded = [i for i in header.get("volume_ids", "").split(",") if i]
-        if list_belongs_to_other_drive(recorded, drive):
-            owner = header.get("volume_label") or "another drive"
-            print(f"\nNot scanning: '{Path(output).name}' is the file list for {owner} "
-                  f"(drive ID {', '.join(recorded)}), but {drive.display_name} has drive ID "
-                  f"{drive.volume_id}. Its list would have been overwritten.")
-            return False
-    Path(output).parent.mkdir(parents=True, exist_ok=True)
-    print()
-    ok = run_scan(
-        directory,
-        str(output),
-        MEDIA_EXTENSIONS if settings.only_media else None,
-        settings.locate,
-        False,
-        False,
-        hash_options=parse_hash_args(hash_mode=settings.hash_mode),
-        location_options=parse_location_args(),
-        path_style=settings.path_style,
-        workers=settings.workers,
-        min_image_size=settings.min_image_size,
-        retry_blank_exif=settings.retry_blank_exif,
-        volume_info=drive,
-        archives=settings.archives,
-    )
-    if ok is False:
-        print("\nThe scan did not finish. Anything already saved is kept; choose the "
-              "same drive again to continue where it left off.")
-    print()  # with the menu's own leading newline: two blank lines before the menu
-    return ok is not False
-
-
-def _update_drive(settings, drive, fl, list_dir):
-    """Scan *drive* into its existing list *fl* (or a new list if fl is None)."""
-    if fl is None:
-        output = _unused_path(Path(list_dir) / canonical_list_name(drive))
-    else:
-        output = fl.path
-    if not _run_interactive_scan(settings, drive.mount, output, drive=drive):
-        return False
-    # Give lists imported from older versions their drive-based name.
-    wanted = Path(list_dir) / canonical_list_name(drive)
-    if Path(output).parent == Path(list_dir) and Path(output).name != wanted.name and not wanted.exists():
-        try:
-            os.replace(output, wanted)
-            print(f"Renamed the file list to '{wanted.name}'.")
-        except OSError:
-            pass
-    return True
-
-
-def _last_updated_label(timestamp, now=None):
-    """A friendly local-time label shared by the menu and desktop GUI."""
-    updated = datetime.fromtimestamp(timestamp)
-    current = now or datetime.now()
-    if updated.date() == current.date():
-        return updated.strftime("Today %H:%M")
-    return updated.strftime("%Y-%m-%d")
-
-
-def _drive_table_row(values, widths):
-    """Return wrapped ASCII rows, keeping every value visible."""
-    import textwrap
-
-    cells = [textwrap.wrap(str(value), width=width, break_long_words=True,
-                           break_on_hyphens=False) or [""]
-             for value, width in zip(values, widths)]
-    height = max(map(len, cells))
-    return ["| " + " | ".join((cell[line] if line < len(cell) else "").ljust(width)
-                              for cell, width in zip(cells, widths)) + " |"
-            for line in range(height)]
-
-
-def _print_drive_menu(drives, list_for, list_dir, lists):
-    import textwrap
-
-    print(f"\nFile lists are kept in: {list_dir}  ({len(lists)} list{'s' if len(lists) != 1 else ''})")
-    if not drives:
-        print("\nNo drives found. Plug in a drive and choose r to look again, or use the")
-        print("advanced menu to list a specific folder.")
-    else:
-        print("\nConnected drives:")
-        widths = (3, 20, 9, 10, 17)
-        rule = "+-" + "-+-".join("-" * width for width in widths) + "-+"
-        detail_width = len(rule) - 4
-        print(rule)
-        for line in _drive_table_row(("#", "Drive", "Size", "Filesystem", "Updated"), widths):
-            print(line)
-        print(rule)
-        for n, drive in enumerate(drives, 1):
-            fl = list_for.get(drive.mount)
-            updated = _last_updated_label(fl.path.stat().st_mtime) if fl else "Never"
-            values = (n, drive.display_name, _human_size(drive.size_bytes) or "—",
-                      drive.fstype or "—", updated)
-            for line in _drive_table_row(values, widths):
-                print(line)
-            for label, value in (("Location", drive.mount),
-                                 ("File list", fl.path.name if fl else
-                                  f"New: {canonical_list_name(drive)}")):
-                for line in textwrap.wrap(f"{label}: {value}", width=detail_width - 2,
-                                          subsequent_indent="  ", break_long_words=True,
-                                          break_on_hyphens=False):
-                    print("| " + line.ljust(detail_width) + " |")
-            print(rule)
-    print()
-    if len(drives) > 1:
-        print("  To do several drives in a row, type their numbers, e.g. 1 3 or 2-4")
-        print()
-    if any(d.mount in list_for for d in drives):
-        print("  u) Update every connected drive that has a file list")
-    print("  h) Check drive health")
-    print("  c) Coverage report: which photos and videos have a second copy")
-    print("  l) Show all file lists, including drives that aren't connected")
-    print("  r) Look for drives again (after plugging one in)")
-    print("  a) Advanced options")
-    print("  q) Quit")
-
-
-def _show_all_lists(lists):
-    if not lists:
-        print("\nNo file lists yet.")
-        return
-    print()
-    for fl in lists:
-        stat_info = fl.path.stat()
-        updated = _last_updated_label(stat_info.st_mtime)
-        if fl.drive:
-            where = f"drive connected at {fl.drive.mount}"
-        elif not fl.volume_ids and fl.root and os.path.isdir(fl.root):
-            where = "folder list"
-        else:
-            where = "drive not connected"
-        print(f"  {fl.path.name}")
-        print(f"      {_count_rows(fl.path):,} files, updated {updated}, "
-              f"scanned from {fl.root or 'unknown'}; {where}")
-
-
-def _advanced_menu(settings, state):
-    while True:
-        s = settings
-        items = [
-            ("include", "All files" if not s.only_media else "Photos and videos only"),
-            ("hash", _hash_label(s.hash_mode)),
-            ("locate", "On" if s.locate else "Off"),
-            ("retry", "On" if s.retry_blank_exif else "Off"),
-            ("workers", str(s.workers)),
-            ("min_size", f"{s.min_image_size:,} bytes" if s.min_image_size else "Off (open every image)"),
-            ("path_style", {"auto": "Automatic", "linux": "Linux style", "windows": "Windows style"}[s.path_style]),
-            ("archives", _ARCHIVE_LABELS[s.archives]),
-            ("folder_scan", ""),
-            ("check", ""),
-            ("import", ""),
-            ("list_dir", str(state["list_dir"])),
-            ("command", ""),
-        ]
-        print("\nAdvanced options (settings last until you quit):\n")
-        for n, (key, value) in enumerate(items, 1):
-            title = _ADVANCED_HELP[key][0]
-            print(f"  {n:>2}) {title}" + (f": {value}" if value else ""))
-        print("\n   b) Back to the main menu")
-        choice = _ask("\nChoose an option (type ? and a number, e.g. ?2, to read about it first): ").lower()
-        if choice in ("b", ""):
-            return
-        explain_only = choice.startswith("?")
-        choice = choice.lstrip("?").strip()
-        if not choice.isdigit() or not 1 <= int(choice) <= len(items):
-            print("  Please choose one of the numbers shown, or b.")
-            continue
-        key = items[int(choice) - 1][0]
-        title, text = _ADVANCED_HELP[key]
-        print(f"\n  {title}\n")
-        print(_wrap(text))
-        if explain_only:
-            continue
-        print()
-        _change_advanced_setting(key, settings, state)
-
-
-def _pick(prompt, options):
-    """Ask the user to pick one of [(label, value)]; returns value or None."""
-    for n, (label, _) in enumerate(options, 1):
-        print(f"     {n}) {label}")
-    answer = _ask(prompt)
-    if answer.isdigit() and 1 <= int(answer) <= len(options):
-        return options[int(answer) - 1][1]
-    return None
-
-
-def _change_advanced_setting(key, s, state):
-    list_dir = state["list_dir"]
-    if key == "include":
-        value = _pick("  Choose 1 or 2 (Enter to keep): ",
-                      [("All files", False), ("Photos and videos only", True)])
-        if value is not None:
-            s.only_media = value
-    elif key == "hash":
-        value = _pick("  Choose 1-3 (Enter to keep): ",
-                      [("Off", "off"), ("Quick", "sample"), ("Full", "full")])
-        if value is not None:
-            s.hash_mode = value
-    elif key == "locate":
-        s.locate = _confirm("  Look up place names?", default=s.locate)
-    elif key == "retry":
-        s.retry_blank_exif = _confirm("  Re-check undated files on the next scan?", default=s.retry_blank_exif)
-    elif key == "workers":
-        answer = _ask(f"  How many at once, 1-32 (Enter to keep {s.workers}): ")
-        if answer.isdigit():
-            s.workers = _clamp_worker_count(int(answer))
-    elif key == "min_size":
-        answer = _ask(f"  Size in KB, 0 to open every image (Enter to keep {s.min_image_size // 1000}): ")
-        if answer.isdigit():
-            s.min_image_size = _clamp_min_image_size(int(answer) * 1000)
-    elif key == "path_style":
-        value = _pick("  Choose 1-3 (Enter to keep): ",
-                      [("Automatic", "auto"), ("Linux style", "linux"), ("Windows style", "windows")])
-        if value is not None:
-            s.path_style = value
-    elif key == "archives":
-        value = _pick("  Choose 1-3 (Enter to keep): ",
-                      [(label, mode) for mode, label in _ARCHIVE_LABELS.items()])
-        if value is not None:
-            s.archives = value
-    elif key == "folder_scan":
-        folder = _ask_folder("  Folder to list: ")
-        if folder:
-            default_name = _safe_filename(os.path.basename(folder.rstrip("/\\")) or "Folder")
-            name = _ask(f"  Name for this list (Enter for '{default_name}'): ") or default_name
-            output = Path(list_dir) / (_safe_filename(name) + ".tsv")
-            if not output.exists() or _confirm(f"  '{output.name}' exists. Update it?"):
-                _run_interactive_scan(s, folder, output)
-                state["dirty"] = True
-    elif key == "check":
-        _run_backup_check(state)
-    elif key == "import":
-        _interactive_import(state)
-    elif key == "list_dir":
-        answer = _ask("  New folder for file lists (Enter to keep the current one): ")
-        if answer:
-            new_dir = Path(_expand_path(answer.strip('"').strip("'")))
-            old_lists = find_file_lists(list_dir)
-            new_dir.mkdir(parents=True, exist_ok=True)
-            config = load_config()
-            config["inventory_dir"] = str(new_dir)
-            save_config(config)
-            if old_lists and _confirm(f"  Move the {len(old_lists)} existing file lists there too?"):
-                for fl in old_lists:
-                    shutil.move(str(fl.path), str(_unused_path(new_dir / fl.path.name)))
-            state["list_dir"] = new_dir
-            state["dirty"] = True
-            print(f"  File lists will now be kept in {new_dir}")
-    elif key == "command":
-        drive = state["drives"][0] if state["drives"] else None
-        directory = drive.mount if drive else "/path/to/drive"
-        output = state["list_for"].get(drive.mount).path if drive and drive.mount in state["list_for"] \
-            else Path(list_dir) / (canonical_list_name(drive) if drive else "My Drive.tsv")
-        print("  " + s.command_line(directory, output))
-
-
-def _interactive_import(state):
-    list_dir = state["list_dir"]
-    folder = _ask_folder("  Folder to import from (Enter for your home folder): ") or str(Path.home())
-    paths = find_legacy_lists(folder)
-    if not paths:
-        paths = [fl.path for fl in find_file_lists(folder) if Path(folder) != Path(list_dir)]
-    if not paths:
-        print("  No file lists found there.")
-        return
-    print(f"  Found {len(paths)} file list(s):")
-    for p in paths:
-        print(f"     {p.name}")
-    if not _confirm(f"  Move them into {list_dir}?"):
-        return
-    for old, new in import_file_lists(paths, list_dir, state["drives"]):
-        print(f"     {old.name}  ->  {new.name}")
-    state["dirty"] = True
-
-
-def _run_backup_check(state):
-    checker = Path(__file__).with_name("check_photo_backups.py")
-    if not checker.exists():
-        print(f"  The backup checker (check_photo_backups.py) should be next to this program "
-              f"in {checker.parent}, but it isn't there.")
-        return
-    lists = find_file_lists(state["list_dir"])
-    if not lists:
-        print("  You need at least one file list first.")
-        return
-    target = _ask_folder("  Folder to check: ")
-    if not target:
-        return
-    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
-    target_name = os.path.basename(target.rstrip("/\\")) or "drive"
-    report_dir = _unused_path(Path(state["list_dir"]) / "Backup checks" / _safe_filename(
-        f"{stamp} {target_name}"))
-    report_dir.mkdir(parents=True)
-    outputs = {
-        "--out-csv": "report.csv",
-        "--missing-list": "not backed up.txt",
-        "--safe-list": "safe to delete.txt",
-        "--needs-hash-list": "matched without fingerprint.txt",
-        "--no-verified-match-list": "no verified match.txt",
-        "--hash-config-mismatch-list": "fingerprint settings differ.txt",
-    }
-    cmd = [sys.executable, str(checker), "--target", target,
-           "--inventories", ",".join(str(fl.path) for fl in lists)]
-    for flag, name in outputs.items():
-        cmd += [flag, str(report_dir / name)]
-    print(f"\n  Comparing {target} against {len(lists)} file list(s)...\n")
-    sys.stdout.flush()
-    try:
-        subprocess.run(cmd, check=False)
-    except KeyboardInterrupt:
-        print("\n  Backup check stopped.")
-    print(f"\n  Reports saved in: {report_dir}")
-    print("  'not backed up.txt' lists files found on none of your drives; "
-          "'safe to delete.txt' lists files with a trustworthy copy elsewhere.")
-
-
-# ---------------------------------------------------------------------------
-# Drive health checks
-# ---------------------------------------------------------------------------
-# Alan 9/28/26 - Quick check: read the drive's own SMART health data via
-# smartctl (smartmontools).  Extended check: start the drive's full-surface
-# self-test, or, for drives without SMART (SD cards, many USB sticks), read
-# every file and report any that can't be read.
-
-HEALTH_GOOD = "good"
-HEALTH_WARNING = "warning"
-HEALTH_FAILING = "failing"
-HEALTH_UNKNOWN = "unknown"
-HEALTH_NOTE = "note"  # worth mentioning, but not a reason for concern
-
-# ATA SMART attributes worth explaining when their raw value is above zero.
-# Health-log column for each ATA attribute we record.
-_ATA_ATTRIBUTE_METRICS = {
-    5: "reallocated_sectors",
-    197: "pending_sectors",
-    198: "uncorrectable_sectors",
-    187: "read_errors",
-    199: "connection_errors",
-}
-
-_ATA_WARNING_ATTRIBUTES = {
-    5: ("{n:,} bad sector(s) have been replaced with spares",
-        "The drive found spots it couldn't use reliably and swapped in spare space. "
-        "A handful is common on old drives; a number that keeps growing means the "
-        "drive is wearing out."),
-    196: ("{n:,} sector replacement event(s)",
-          "The drive has had to move data away from damaged spots."),
-    197: ("{n:,} sector(s) are unreadable and waiting to be replaced",
-          "Data in these spots can't currently be read. Files stored there may be "
-          "damaged. Copy anything important off this drive soon."),
-    198: ("{n:,} sector(s) failed the drive's own surface scan",
-          "These spots couldn't be read during the drive's background check. Files "
-          "stored there may be damaged. Copy anything important off this drive soon."),
-    187: ("{n:,} read error(s) the drive couldn't correct",
-          "The drive has returned data it couldn't fix. This usually goes with bad sectors."),
-    10: ("the motor needed extra tries to spin up {n:,} time(s)",
-         "This can mean a failing motor or not enough power (common with USB hubs)."),
-    199: ("{n:,} data error(s) on the cable or USB connection",
-          "This is usually the cable, USB port or enclosure rather than the disk itself. "
-          "If the number grows, try a different cable or port."),
-}
-
-
-class HealthTarget:
-    """A physical drive to check (Linux) or a volume on it (Windows/macOS/WSL)."""
-
-    __slots__ = ("device", "name", "model", "size_bytes", "transport", "rotational", "mounts",
-                 "volume_ids")
-
-    def __init__(self, device, name, model="", size_bytes=0, transport="", rotational=None, mounts=(),
-                 volume_ids=()):
-        self.device = device
-        self.name = name
-        self.model = (model or "").strip()
-        self.size_bytes = int(size_bytes or 0)
-        self.transport = (transport or "").lower()
-        self.rotational = rotational
-        self.mounts = list(mounts)
-        self.volume_ids = [v for v in (_normalize_volume_id(i) for i in volume_ids) if v]
-
-    @property
-    def kind(self):
-        if self.transport == "mmc" or os.path.basename(self.device).startswith("mmcblk"):
-            return "SD card"
-        if self.transport == "nvme" or "nvme" in self.device:
-            return "NVMe SSD"
-        medium = {True: "hard drive", False: "SSD or flash drive"}.get(self.rotational, "drive")
-        if self.transport == "usb":
-            return f"USB {medium}"
-        return medium[0].upper() + medium[1:]
-
-    def description(self):
-        model = self.model if self.model != self.name else ""
-        details = ", ".join(x for x in (model, self.kind, _human_size(self.size_bytes)) if x)
-        return f"{self.name} ({details})" if details else self.name
-
-
-class HealthReport:
-    """The result of a quick health check on one drive."""
-
-    def __init__(self, target):
-        self.target = target
-        self.verdict = HEALTH_UNKNOWN
-        self.findings = []  # (level, headline, explanation)
-        self.facts = []  # plain "label: value" lines
-        self.self_test_minutes = None  # {"short": n, "extended": n} when known
-        self.self_test_running = None  # percent remaining, if a self-test is running
-        self.smart_available = False
-        self.device_type = None  # smartctl -d value that worked, if any
-        self.problem = ""  # why health data couldn't be read
-        self.serial = ""
-        self.metrics = {}  # numbers recorded in the health log (see _HEALTH_LOG_COLUMNS)
-
-    def add(self, level, headline, explanation=""):
-        self.findings.append((level, headline, explanation))
-        order = [HEALTH_UNKNOWN, HEALTH_GOOD, HEALTH_WARNING, HEALTH_FAILING]
-        if level in order and order.index(level) > order.index(self.verdict):
-            self.verdict = level
-
-
-def _package_manager_install(package_names):
-    """An install command for this system's package manager."""
-    system = platform.system()
-    if system == "Darwin":
-        return "brew install " + " ".join(package_names)
-    if system == "Windows":
-        return "winget install smartmontools"
-    for tool, command in (
-        ("pacman", "sudo pacman -S"),
-        ("apt", "sudo apt install"),
-        ("dnf", "sudo dnf install"),
-        ("zypper", "sudo zypper install"),
-    ):
-        if shutil.which(tool):
-            return f"{command} {' '.join(package_names)}"
-    return "install " + " ".join(package_names) + " with your package manager"
-
-
-def health_tool_advice():
-    """Lines recommending tools that would make health checks more complete."""
-    advice = []
-    if _is_wsl():
-        advice.append(
-            "WSL can't see the physical drives. For full health details, install "
-            "smartmontools on Windows (winget install smartmontools) and run this "
-            "program from Windows in a terminal opened with 'Run as administrator'."
-        )
-        return advice
-    if not shutil.which("smartctl"):
-        advice.append(
-            "smartctl (from smartmontools) reads the health data drives keep about "
-            "themselves and runs their built-in self-tests. Without it, only basic "
-            "checks are possible. Install it with:  "
-            + _package_manager_install(["smartmontools"])
-        )
-    if platform.system() == "Darwin" and shutil.which("smartctl"):
-        advice.append(
-            "On a Mac, USB drives often hide their health data unless a SAT SMART "
-            "driver is installed; internal drives work without it."
-        )
-    return advice
-
-
-def _linux_health_targets():
-    out = _run_quiet(["lsblk", "-J", "-b", "-o", "PATH,NAME,TYPE,TRAN,MODEL,SIZE,ROTA,LABEL,UUID,MOUNTPOINT"])
-    if not out:
-        return []
-    try:
-        devices = json.loads(out).get("blockdevices", [])
-    except ValueError:
-        return []
-    targets = []
-    for dev in devices:
-        name = dev.get("name") or ""
-        if dev.get("type") != "disk" or name.startswith(("zram", "loop", "ram", "sr", "fd")):
-            continue
-        labels, mounts, uuids = [], [], []
-        # The disk itself too: a drive formatted without partitions is mounted
-        # straight from /dev/sdX.
-        stack = [dev]
-        while stack:
-            child = stack.pop(0)
-            stack.extend(child.get("children") or [])
-            if child.get("label"):
-                labels.append(child["label"])
-            if child.get("mountpoint"):
-                mounts.append(child["mountpoint"])
-            if child.get("uuid"):
-                uuids.append(child["uuid"])
-        path = dev.get("path") or f"/dev/{name}"
-        rota = dev.get("rota")
-        targets.append(
-            HealthTarget(
-                path,
-                ", ".join(dict.fromkeys(labels)) or (dev.get("model") or "").strip() or path,
-                dev.get("model"),
-                dev.get("size"),
-                dev.get("tran"),
-                None if rota is None else bool(int(rota) if not isinstance(rota, bool) else rota),
-                mounts,
-                uuids,
-            )
-        )
-    return targets
-
-
-def _macos_whole_disk(mount):
-    out = _run_quiet(["diskutil", "info", "-plist", mount])
-    if not out:
-        return {}
-    import plistlib
-
-    try:
-        return plistlib.loads(out.encode("utf-8"))
-    except Exception:
-        return {}
-
-
-def detect_health_targets():
-    """Drives whose health can be checked, ordered like the main menu (by mount point)."""
-    return sorted(_detect_health_targets(),
-                  key=lambda t: (not t.mounts, min((m.lower() for m in t.mounts), default="")))
-
-
-def _detect_health_targets():
-    system = platform.system()
-    if system == "Linux" and not _is_wsl():
-        return _linux_health_targets()
-    targets = []
-    for drive in detect_drives():
-        if system == "Darwin":
-            info = _macos_whole_disk(drive.mount)
-            device = "/dev/" + info["ParentWholeDisk"] if info.get("ParentWholeDisk") else drive.mount
-            targets.append(HealthTarget(device, drive.display_name, info.get("MediaName", ""),
-                                        drive.size_bytes, info.get("BusProtocol", ""),
-                                        None if "SolidState" not in info else not info["SolidState"],
-                                        [drive.mount], [drive.volume_id]))
-        else:  # Windows or WSL: smartctl and PowerShell both accept a drive letter
-            letter = drive.mount[0] if system == "Windows" else drive.mount[-1]
-            targets.append(HealthTarget(f"{letter.upper()}:", drive.display_name, "",
-                                        drive.size_bytes, "", None, [drive.mount], [drive.volume_id]))
-    return targets
-
-
-def _is_admin():
-    if platform.system() == "Windows":
-        try:
-            import ctypes
-
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return False
-    return hasattr(os, "geteuid") and os.geteuid() == 0
-
-
-def ensure_sudo_for_health(interactive=True):
-    """On Linux, get sudo ready so smartctl can read the drives. Returns True if
-    smartctl should be run through sudo."""
-    if platform.system() != "Linux" or _is_wsl() or _is_admin() or not shutil.which("sudo"):
-        return False
-    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-        return True
-    if not interactive and not sys.stdin.isatty():
-        return False
-    print(_wrap(
-        "Reading drive health needs administrator (root) access, so sudo will ask for "
-        "your password. It goes to sudo, not to this program. Press Ctrl-C to skip.",
-        indent=""))
-    try:
-        return subprocess.run(["sudo", "-v"]).returncode == 0
-    except KeyboardInterrupt:
-        print()
-        return False
-
-
-def _run_smartctl(args, device, use_sudo, device_type=None, timeout=120):
-    cmd = (["sudo", "-n"] if use_sudo else []) + ["smartctl", "-j"]
-    if device_type:
-        cmd += ["-d", device_type]
-    cmd += list(args) + [device]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as e:
-        return {"_error": str(e)}
-    try:
-        return json.loads(result.stdout)
-    except ValueError:
-        return {"_error": (result.stderr or result.stdout).strip()[:300]}
-
-
-def _smartctl_messages(data):
-    return " ".join(m.get("string", "") for m in data.get("smartctl", {}).get("messages", []))
-
-
-def _read_smart(target, use_sudo):
-    """Run smartctl -a, retrying with -d sat for USB bridges that need it."""
-    data = _run_smartctl(["-a"], target.device, use_sudo)
-    used_type = None
-    messages = _smartctl_messages(data).lower()
-    if "unknown usb bridge" in messages or "specify device type" in messages or (
-        target.transport == "usb" and not data.get("smart_status") and "_error" not in data
-    ):
-        retry = _run_smartctl(["-a"], target.device, use_sudo, "sat")
-        if retry.get("smart_status") or retry.get("ata_smart_attributes"):
-            data, used_type = retry, "sat"
-    return data, used_type
-
-
-def _format_hours(hours):
-    years = hours / 8766
-    return f"{hours:,} hours (about {years:.1f} years)" if years >= 1 else f"{hours:,} hours"
-
-
-def interpret_smart(target, data):
-    """Turn smartctl -j -a output into a HealthReport with plain-language findings."""
-    report = HealthReport(target)
-    messages = _smartctl_messages(data)
-    if "_error" in data or not (data.get("smart_status") or data.get("ata_smart_attributes")
-                                or data.get("nvme_smart_health_information_log")):
-        low = (messages + " " + data.get("_error", "")).lower()
-        if "permission denied" in low or "operation not permitted" in low or "access is denied" in low:
-            if platform.system() == "Windows":
-                how = "open the terminal with 'Run as administrator' and try again"
-            else:
-                how = "run this in a terminal so sudo can ask for your password"
-            report.problem = f"reading health data needs administrator access; {how}"
-        elif "unsupported" in low or "unknown usb bridge" in low or "not supported" in low:
-            report.problem = "this drive, or its USB enclosure, doesn't report health data"
-        else:
-            report.problem = (messages or data.get("_error") or "no health data returned").strip()
-        return report
-
-    report.smart_available = True
-    report.verdict = HEALTH_GOOD
-    if data.get("model_name"):
-        target.model = target.model or data["model_name"]
-    report.serial = str(data.get("serial_number") or "")
-
-    status = data.get("smart_status", {})
-    if status.get("passed") is False:
-        report.add(HEALTH_FAILING, "The drive reports that it is FAILING",
-                   "Its own health check says failure is likely soon. Copy everything "
-                   "important off it now and replace it.")
-
-    hours = data.get("power_on_time", {}).get("hours")
-    if hours is not None:
-        report.facts.append(f"Powered on for {_format_hours(hours)}")
-        report.metrics["power_on_hours"] = hours
-    temperature = data.get("temperature", {}).get("current")
-
-    for attr in data.get("ata_smart_attributes", {}).get("table", []):
-        attr_id = attr.get("id")
-        raw = attr.get("raw", {}).get("value", 0) or 0
-        if attr.get("when_failed") == "now":
-            report.add(HEALTH_FAILING, f"'{attr.get('name', attr_id)}' is below the manufacturer's failure threshold",
-                       "The drive considers this measurement a sign of failure. Copy "
-                       "important files off it and replace it.")
-        # Seagate drives pack extra counters into raw values of 187/199; the
-        # low 16 bits hold the real count.
-        count = raw & 0xFFFF if raw > 0xFFFF else raw
-        if attr_id in _ATA_ATTRIBUTE_METRICS:
-            # Record zeros too, so a later rise shows up in the health log.
-            report.metrics[_ATA_ATTRIBUTE_METRICS[attr_id]] = count
-        if attr_id in _ATA_WARNING_ATTRIBUTES and count > 0:
-            headline, explanation = _ATA_WARNING_ATTRIBUTES[attr_id]
-            level = HEALTH_WARNING
-            if attr_id == 5 and count < 10:
-                level = HEALTH_NOTE  # a few remapped sectors on an old drive is normal
-            report.add(level, headline.format(n=count), explanation)
-
-    nvme = data.get("nvme_smart_health_information_log")
-    if nvme:
-        if temperature is None:
-            temperature = nvme.get("temperature")
-        if hours is None and nvme.get("power_on_hours") is not None:
-            report.facts.append(f"Powered on for {_format_hours(nvme['power_on_hours'])}")
-            report.metrics["power_on_hours"] = nvme["power_on_hours"]
-        report.metrics["ssd_media_errors"] = nvme.get("media_errors", 0)
-        if nvme.get("critical_warning"):
-            report.add(HEALTH_FAILING, "The SSD has raised a critical warning",
-                       "It reports a serious problem (such as running out of spare space "
-                       "or becoming read-only). Copy important files off it now.")
-        spare, spare_min = nvme.get("available_spare"), nvme.get("available_spare_threshold")
-        if spare is not None and spare_min is not None and spare < spare_min:
-            report.add(HEALTH_FAILING, f"Spare space is down to {spare}%",
-                       "The SSD is running out of replacement space for worn-out cells.")
-        used = nvme.get("percentage_used")
-        if used is not None:
-            report.metrics["ssd_wear_percent"] = used
-            report.facts.append(f"Wear: {used}% of its rated life used")
-            if used >= 90:
-                report.add(HEALTH_WARNING, f"The SSD has used {used}% of its rated life",
-                           "It may keep working for a while, but plan to replace it.")
-        if nvme.get("media_errors"):
-            report.add(HEALTH_WARNING, f"{nvme['media_errors']:,} data error(s) the SSD couldn't correct",
-                       "Some data could not be read back correctly. Check important files "
-                       "and consider replacing the SSD.")
-
-    if temperature is not None:
-        report.metrics["temperature_c"] = temperature
-        report.facts.append(f"Temperature now: {temperature}°C")
-        limit = 70 if nvme else 55
-        if temperature >= limit:
-            report.add(HEALTH_WARNING, f"The drive is hot ({temperature}°C)",
-                       "Heat shortens a drive's life. Give it more airflow.")
-
-    # Self-test results and capability
-    ata_self_test = data.get("ata_smart_data", {}).get("self_test", {})
-    polling = ata_self_test.get("polling_minutes") or {}
-    if polling:
-        report.self_test_minutes = {k: polling[k] for k in ("short", "extended") if k in polling}
-    elif data.get("nvme_self_test_log") is not None or data.get("nvme_optional_admin_commands", {}).get("self_test"):
-        report.self_test_minutes = {}
-    running = ata_self_test.get("status", {})
-    if running.get("remaining_percent") is not None and running.get("value", 0) >> 4 == 15:
-        report.self_test_running = running["remaining_percent"]
-    nvme_current = data.get("nvme_self_test_log", {}).get("current_self_test_operation", {})
-    if nvme_current.get("value"):
-        done = data["nvme_self_test_log"].get("current_self_test_completion_percent", 0)
-        report.self_test_running = 100 - done
-
-    last = None
-    table = data.get("ata_smart_self_test_log", {}).get("standard", {}).get("table") or []
-    if table:
-        entry = table[0]
-        last = (entry.get("type", {}).get("string", "Self-test"), entry.get("status", {}).get("string", ""),
-                entry.get("status", {}).get("passed"), entry.get("lifetime_hours"))
-    nvme_table = data.get("nvme_self_test_log", {}).get("table") or []
-    if nvme_table and last is None:
-        entry = nvme_table[0]
-        result = entry.get("self_test_result", {})
-        last = (entry.get("self_test_code", {}).get("string", "Self-test"), result.get("string", ""),
-                result.get("value") == 0, entry.get("power_on_hours"))
-    if last:
-        kind, outcome, passed, at_hours = last
-        when = f" at {at_hours:,} hours" if isinstance(at_hours, int) else ""
-        report.facts.append(f"Last self-test: {kind.lower()}, {outcome.lower()}{when}")
-        report.metrics["last_self_test"] = f"{kind.lower()}, {outcome.lower()}{when}"
-        if passed is False and "abort" not in outcome.lower() and "interrupt" not in outcome.lower():
-            report.add(HEALTH_WARNING, "The drive's last self-test found a problem",
-                       "Part of the disk couldn't be read during the test. Copy important "
-                       "files off it and consider replacing it.")
-    elif report.self_test_minutes is not None:
-        report.facts.append("No self-test has been run on this drive yet")
-
-    if not any(level in (HEALTH_WARNING, HEALTH_FAILING) for level, _, _ in report.findings):
-        report.findings.insert(0, (HEALTH_GOOD, "No warning signs", ""))
-    return report
-
-
-def _basic_health(target):
-    """Health without smartctl: what the OS itself reports."""
-    report = HealthReport(target)
-    system = platform.system()
-    if system == "Darwin":
-        info = _macos_whole_disk(target.mounts[0]) if target.mounts else {}
-        status = info.get("SMARTStatus", "")
-        if status == "Verified":
-            report.verdict = HEALTH_GOOD
-            report.findings.append((HEALTH_GOOD, "macOS reports the drive's health as Verified", ""))
-        elif status == "Failing":
-            report.add(HEALTH_FAILING, "macOS reports the drive is FAILING",
-                       "Copy everything important off it now.")
-        else:
-            report.problem = "macOS doesn't have health data for this drive"
-        return report
-    if system == "Windows" or _is_wsl():
-        letter = target.device[0]
-        script = (
-            f"$p = Get-Partition -DriveLetter {letter} -ErrorAction Stop | Get-Disk | "
-            "ForEach-Object { $n = $_.Number; Get-PhysicalDisk | Where-Object DeviceId -eq \"$n\" }; "
-            "$r = $p | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue; "
-            "[pscustomobject]@{Health=\"$($p.HealthStatus)\"; Model=$p.FriendlyName; "
-            "Media=\"$($p.MediaType)\"; Temp=$r.Temperature; Wear=$r.Wear; "
-            "ReadErrors=$r.ReadErrorsUncorrected; Hours=$r.PowerOnHours} | ConvertTo-Json -Compress"
-        )
-        exe = "powershell.exe" if _is_wsl() else "powershell"
-        out = _run_quiet([exe, "-NoProfile", "-NonInteractive", "-Command", script], timeout=60)
-        try:
-            info = json.loads(out) if out else {}
-        except ValueError:
-            info = {}
-        if not info:
-            report.problem = "Windows didn't return health data for this drive"
-            return report
-        target.model = target.model or (info.get("Model") or "")
-        health = (info.get("Health") or "").lower()
-        if health == "healthy":
-            report.verdict = HEALTH_GOOD
-            report.findings.append((HEALTH_GOOD, "Windows reports the drive as Healthy", ""))
-        elif health in ("warning", "unhealthy"):
-            report.add(HEALTH_FAILING if health == "unhealthy" else HEALTH_WARNING,
-                       f"Windows reports the drive's health as {info.get('Health')}",
-                       "Copy important files off it and check it with smartctl for details.")
-        else:
-            report.problem = "Windows doesn't know this drive's health"
-        if info.get("Hours"):
-            report.metrics["power_on_hours"] = int(info["Hours"])
-            report.facts.append(f"Powered on for {_format_hours(int(info['Hours']))}")
-        if info.get("Temp"):
-            report.metrics["temperature_c"] = info["Temp"]
-            report.facts.append(f"Temperature now: {info['Temp']}°C")
-        if info.get("Wear") not in (None, 0):
-            report.metrics["ssd_wear_percent"] = info["Wear"]
-            report.facts.append(f"Wear: {info['Wear']}% of its rated life used")
-        if info.get("ReadErrors") is not None:
-            report.metrics["read_errors"] = info["ReadErrors"]
-        if info.get("ReadErrors"):
-            report.add(HEALTH_WARNING, f"{info['ReadErrors']:,} read error(s) the drive couldn't correct",
-                       "Some data could not be read back correctly.")
-        return report
-    report.problem = "smartctl isn't installed, so this drive's health data can't be read"
-    return report
-
-
-# Alan 11/1/26 - Some USB enclosures handle Linux's fast "UAS" protocol badly:
-# commands time out, the connection resets, and it looks like a failing drive.
-# Telling Linux to use plain usb-storage for that one device (the "u" quirk)
-# usually fixes it. Also spot USB 3 drives stuck at USB 2 speed (bad cable).
-_UAS_ERROR_RE = re.compile(r"uas_eh_|uas-tag|uas_zap|uas_.*abort", re.IGNORECASE)
-
-
-def _read_sys(path):
-    try:
-        return Path(path).read_text().strip()
-    except OSError:
-        return ""
-
-
-def _usb3_capable(usb_device):
-    """True when a USB device can run at USB 3 speed. A USB 3 device plugged in
-    over USB 2 reports version 2.10, so its SuperSpeed capability is read from
-    the BOS descriptor; the version is the fallback when that isn't available."""
-    try:
-        bos = Path(usb_device, "bos_descriptors").read_bytes()
-    except OSError:
-        bos = b""
-    position = bos[0] if len(bos) >= 5 and bos[1] == 0x0F else 0
-    while position and position + 3 <= len(bos):
-        length = bos[position]
-        if length < 3:
-            break
-        if bos[position + 1] == 0x10 and bos[position + 2] in (0x03, 0x0A):
-            return True  # SuperSpeed or SuperSpeedPlus device capability
-        position += length
-    version = _read_sys(Path(usb_device, "version"))
-    try:
-        return float(version.split()[0]) >= 3 if version else False
-    except ValueError:
-        return False
-
-
-def _kernel_log():
-    """This boot's kernel messages, or '' if they can't be read."""
-    out = _run_quiet(["journalctl", "-k", "-b", "--no-pager", "-o", "cat"], timeout=30)
-    return out or _run_quiet(["dmesg"], timeout=30) or ""
-
-
-def usb_connection_findings(device, sys_root="/sys", kernel_log=None):
-    """[(level, headline, explanation)] about how a Linux USB drive is connected."""
-    name = os.path.basename(device)
-    try:
-        scsi = Path(os.path.realpath(f"{sys_root}/block/{name}/device"))
-    except OSError:
-        return []
-    interface = usb_device = None
-    for parent in scsi.parents:
-        if interface is None and (parent / "bInterfaceNumber").exists():
-            interface = parent
-        if (parent / "idVendor").exists():
-            usb_device = parent
-            break
-    if interface is None or usb_device is None:
-        return []
-    driver = os.path.basename(os.path.realpath(interface / "driver"))
-    vid, pid = _read_sys(usb_device / "idVendor"), _read_sys(usb_device / "idProduct")
-    findings = []
-
-    if driver == "uas" and vid and pid:
-        log = _kernel_log() if kernel_log is None else kernel_log
-        port = usb_device.name
-        uas_errors = sum(1 for line in log.splitlines()
-                         if f"[{name}]" in line and _UAS_ERROR_RE.search(line))
-        resets = sum(1 for line in log.splitlines()
-                     if f"usb {port}: reset" in line)
-        if uas_errors or resets >= 2:
-            quirk = f"{vid}:{pid}:u"
-            existing = _read_sys(f"{sys_root}/module/usb_storage/parameters/quirks")
-            # Linux uses the first entry for a device, so add "u" to any
-            # flags this device already has rather than a second entry.
-            # IDs are compared as numbers: "bc2" and "0bc2" are the same.
-            def ids(entry):
-                parts = entry.split(":")
-                try:
-                    return int(parts[0], 16), int(parts[1], 16)
-                except (IndexError, ValueError):
-                    return None
-
-            device = ids(quirk)
-            entries, merged = [], False
-            for entry in (q.strip() for q in existing.split(",")):
-                if not entry:
-                    continue
-                if ids(entry) == device:
-                    if merged:
-                        continue  # a later entry for this device would be ignored anyway
-                    flags = entry.split(":")[2] if entry.count(":") == 2 else ""
-                    entry = f"{vid}:{pid}:{flags if 'u' in flags else flags + 'u'}"
-                    merged = True
-                entries.append(entry)
-            value = ",".join(entries if merged else entries + [quirk])
-            seen = ", ".join(x for x in (
-                f"{uas_errors} UAS command error(s)" if uas_errors else "",
-                f"{resets} connection reset(s)" if resets else "") if x)
-            findings.append((
-                HEALTH_WARNING,
-                f"The USB connection is resetting ({seen} since this computer started)",
-                "Linux talks to this drive with the fast UAS method, which some USB "
-                "enclosures handle badly: commands time out and the connection resets. It "
-                "looks like a failing drive and can cause read errors. Telling Linux to use "
-                "the older usb-storage method for this one drive usually fixes it:\n"
-                f"  echo {value} | sudo tee /sys/module/usb_storage/parameters/quirks\n"
-                "then unplug the drive and plug it back in. To keep the setting after a "
-                "restart, put this line in /etc/modprobe.d/usb-storage-quirks.conf:\n"
-                f"  options usb-storage quirks={value}\n"
-                "(and rebuild the initramfs if your system loads usb-storage early), or add "
-                f"usb-storage.quirks={value} to the kernel command line.",
-            ))
-
-    if _read_sys(usb_device / "speed") == "480" and _usb3_capable(usb_device):
-        findings.append((
-            HEALTH_NOTE,
-            "Connected at USB 2 speed, although the drive supports USB 3",
-            "Reading and copying will be about ten times slower than they could be. Try "
-            "the drive's own USB 3 cable and a USB 3 port (often blue, or marked SS).",
-        ))
-    return findings
-
-
-def quick_health_check(target, use_sudo=False):
-    """Read a drive's health. Uses smartctl when installed, else what the OS reports."""
-    if target.kind == "SD card":
-        report = HealthReport(target)
-        report.problem = ("SD cards don't report health data. The extended check can "
-                          "still read every file to find any that are damaged.")
-        return report
-    if shutil.which("smartctl") and not _is_wsl():
-        data, used_type = _read_smart(target, use_sudo)
-        report = interpret_smart(target, data)
-        report.device_type = used_type
-        if report.smart_available or platform.system() == "Linux":
-            _add_usb_findings(report)
-            return report
-    report = _basic_health(target)
-    _add_usb_findings(report)
-    return report
-
-
-def _add_usb_findings(report):
-    target = report.target
-    if platform.system() != "Linux" or _is_wsl() or target.transport != "usb":
-        return
-    try:
-        findings = usb_connection_findings(target.device)
-    except Exception:
-        return  # advice about the connection is never worth failing a health check
-    for level, headline, explanation in findings:
-        report.add(level, headline, explanation)
-
-
-# Alan 9/28/26 - Every health check is appended to a log kept with the file
-# lists, so the health of unplugged drives can be seen and trends tracked.
-HEALTH_LOG_NAME = "Drive health log.tsv"
-_HEALTH_LOG_COLUMNS = [
-    "date", "drive", "model", "serial", "check", "health", "power_on_hours",
-    "temperature_c", "reallocated_sectors", "pending_sectors", "uncorrectable_sectors",
-    "read_errors", "connection_errors", "ssd_wear_percent", "ssd_media_errors",
-    "last_self_test", "notes", "volume_ids",
-]
-# Counters where any increase since the last check is worth pointing out.
-_HEALTH_TREND_METRICS = {
-    "reallocated_sectors": "Replaced bad sectors",
-    "pending_sectors": "Unreadable sectors waiting to be replaced",
-    "uncorrectable_sectors": "Sectors that failed the drive's surface scan",
-    "read_errors": "Uncorrectable read errors",
-    "connection_errors": "Cable/USB connection errors",
-    "ssd_media_errors": "SSD data errors",
-}
-
-
-def health_log_path(list_dir=None):
-    return Path(list_dir or default_inventory_dir()) / HEALTH_LOG_NAME
-
-
-def _health_drive_key(row):
-    """Identify a drive across log entries: serial number, else name + model."""
-    if row.get("serial"):
-        return ("serial", row["serial"])
-    return ("name", row.get("drive", ""), row.get("model", ""))
-
-
-def read_health_log(list_dir=None):
-    path = health_log_path(list_dir)
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            return list(csv.DictReader(f, delimiter="\t"))
-    except OSError:
-        return []
-
-
-def append_health_log(report, check="quick", notes=None, list_dir=None, when=None):
-    """Add one health check to the log. Returns the row written, or None."""
-    if report.verdict == HEALTH_UNKNOWN and not report.metrics and notes is None:
-        return None  # nothing was learned about this drive
-    if notes is None:
-        worrying = [h for level, h, _ in report.findings if level in (HEALTH_WARNING, HEALTH_FAILING)]
-        notes = "; ".join(worrying) or "No warning signs"
-    target = report.target
-    row = {
-        "date": (when or datetime.now()).strftime("%Y-%m-%d %H:%M"),
-        "drive": target.name,
-        "model": target.model,
-        "serial": report.serial,
-        "check": check,
-        "health": _VERDICT_TEXT[report.verdict],
-        "notes": notes,
-        "volume_ids": ",".join(target.volume_ids),
-    }
-    for key, value in report.metrics.items():
-        row[key] = value
-    path = health_log_path(list_dir)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _upgrade_health_log_columns(path)
-        new_file = not path.exists() or path.stat().st_size == 0
-        with open(path, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=_HEALTH_LOG_COLUMNS, delimiter="\t",
-                                    extrasaction="ignore", lineterminator="\n")
-            if new_file:
-                writer.writeheader()
-            writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
-    except OSError as e:
-        print(f"  (Couldn't write the health log {path}: {e})")
-        return None
-    return row
-
-
-def _upgrade_health_log_columns(path):
-    """Rewrite a log made by an earlier version so it has the current columns."""
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            if reader.fieldnames is None or reader.fieldnames == _HEALTH_LOG_COLUMNS:
-                return
-            rows = list(reader)
-    except OSError:
-        return
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=_HEALTH_LOG_COLUMNS, delimiter="\t",
-                                extrasaction="ignore", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-    os.replace(tmp, path)
-
-
-def _as_number(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def health_changes(previous, current):
-    """Plain-language list of counters that went up between two log rows."""
-    changes = []
-    for key, label in _HEALTH_TREND_METRICS.items():
-        before, after = _as_number(previous.get(key)), _as_number(current.get(key))
-        if before is not None and after is not None and after > before:
-            changes.append(f"{label} rose from {before:g} to {after:g}")
-    if previous.get("health") and current.get("health") and previous["health"] != current["health"]:
-        changes.append(f"Health changed from {previous['health']} to {current['health']}")
-    return changes
-
-
-def _previous_log_row(rows, key):
-    for row in reversed(rows):
-        if _health_drive_key(row) == key and row.get("check") != "file read":
-            return row
-    return None
-
-
-def log_and_compare(report, check="quick", list_dir=None):
-    """Write the report to the health log and print what changed since the last check."""
-    rows = read_health_log(list_dir)
-    row = append_health_log(report, check=check, list_dir=list_dir)
-    if row is None:
-        return
-    previous = _previous_log_row(rows, _health_drive_key(row))
-    if previous is None:
-        print("  First check of this drive in the health log.")
-        return
-    changes = health_changes(previous, row)
-    since = previous.get("date", "")[:10]
-    if changes:
-        print(f"  Since the last check on {since}:")
-        for change in changes:
-            print(f"    ! {change}")
-    else:
-        print(f"  No change since the last check on {since}.")
-
-
-def latest_health_by_drive(rows):
-    """Most recent log row for each drive, oldest drive first."""
-    latest = {}
-    for row in rows:
-        latest[_health_drive_key(row)] = row
-    return latest
-
-
-def print_health_history(list_dir=None, max_rows_per_drive=10):
-    rows = read_health_log(list_dir)
-    if not rows:
-        print("\nNo health checks have been logged yet.")
-        return
-    by_drive = {}
-    for row in rows:
-        by_drive.setdefault(_health_drive_key(row), []).append(row)
-    print(f"\nDrive health history (from {health_log_path(list_dir)}):")
-    for entries in by_drive.values():
-        last = entries[-1]
-        ident = ", ".join(x for x in (last.get("model"), f"serial {last['serial']}" if last.get("serial") else "") if x)
-        print(f"\n{last.get('drive', '?')}" + (f" ({ident})" if ident else ""))
-        for row in entries[-max_rows_per_drive:]:
-            numbers = []
-            for key, label in (("power_on_hours", "h on"), ("temperature_c", "°C"),
-                               ("reallocated_sectors", "replaced"), ("pending_sectors", "pending"),
-                               ("uncorrectable_sectors", "uncorrectable"), ("ssd_wear_percent", "% worn")):
-                if row.get(key) not in (None, ""):
-                    numbers.append(f"{row[key]} {label}" if label != "°C" else f"{row[key]}°C")
-            detail = ", ".join(numbers)
-            print(f"  {row.get('date', ''):<16}  {row.get('check', ''):<9} {row.get('health', ''):<8} {detail}")
-            if row.get("notes") and row["notes"] != "No warning signs":
-                print(f"{'':30}{row['notes']}")
-        if len(entries) >= 2:
-            first_trend = health_changes(entries[0], entries[-1])
-            if first_trend:
-                print(f"  Since {entries[0].get('date', '')[:10]}: " + "; ".join(first_trend))
-
-
-def print_unconnected_health(targets, list_dir=None):
-    """Last logged health of drives that aren't connected now."""
-    rows = read_health_log(list_dir)
-    if not rows:
-        return
-    connected_names = {t.name for t in targets}
-    others = [row for key, row in latest_health_by_drive(rows).items()
-              if row.get("drive") not in connected_names]
-    if not others:
-        return
-    print("\nOther drives in the health log (not connected now):")
-    for row in others:
-        print(f"  {row.get('drive', '?'):<28} {row.get('health', ''):<8} last checked {row.get('date', '')[:10]}"
-              + (f"  ({row['notes']})" if row.get("notes") and row["notes"] != "No warning signs" else ""))
-
-
-
-_VERDICT_TEXT = {
-    HEALTH_GOOD: "GOOD",
-    HEALTH_WARNING: "WARNING",
-    HEALTH_FAILING: "FAILING",
-    HEALTH_UNKNOWN: "UNKNOWN",
-}
-
-
-def print_health_report(report):
-    target = report.target
-    print(f"\n{target.description()}")
-    where = ", ".join(target.mounts) if target.mounts else "not mounted"
-    print(f"  Device: {target.device}   Mounted at: {where}")
-    if report.problem and not report.smart_available:
-        # No health data, but USB connection findings may still follow.
-        problem = report.problem.rstrip(".")
-        print(f"  Health: {_VERDICT_TEXT[report.verdict]}. {problem[0].upper()}{problem[1:]}.")
-    else:
-        print(f"  Health: {_VERDICT_TEXT[report.verdict]}")
-    for fact in report.facts:
-        print(f"  {fact}")
-    if report.self_test_running is not None:
-        print(f"  A self-test is running now: {report.self_test_running}% left")
-    for level, headline, explanation in report.findings:
-        marker = {HEALTH_GOOD: "  ok", HEALTH_NOTE: "  - ", HEALTH_WARNING: "  ! ",
-                  HEALTH_FAILING: "  !!"}.get(level, "    ")
-        print(f"{marker} {headline}")
-        if explanation:
-            print(_wrap(explanation, indent="       "))
-
-
-def start_extended_self_test(report, use_sudo=False):
-    """Start the drive's extended (full-surface) self-test. Returns (ok, message)."""
-    data = _run_smartctl(["-t", "long"], report.target.device, use_sudo, report.device_type)
-    messages = _smartctl_messages(data)
-    if "_error" in data:
-        return False, data["_error"]
-    exit_status = data.get("smartctl", {}).get("exit_status", 0)
-    if exit_status & 0b111 and "has begun" not in messages.lower():
-        return False, messages or "the drive refused to start a self-test"
-    return True, messages
-
-
-def _self_test_progress(report, use_sudo=False):
-    """Percent remaining of a running self-test, 0 when finished, None if unknown."""
-    data = _run_smartctl(["-c", "-l", "selftest"], report.target.device, use_sudo, report.device_type)
-    status = data.get("ata_smart_data", {}).get("self_test", {}).get("status", {})
-    if status:
-        return status.get("remaining_percent", 0) if status.get("value", 0) >> 4 == 15 else 0
-    nvme = data.get("nvme_self_test_log", {})
-    if nvme:
-        if nvme.get("current_self_test_operation", {}).get("value"):
-            return 100 - nvme.get("current_self_test_completion_percent", 0)
-        return 0
-    return None
-
-
-def watch_self_tests(reports, use_sudo=False, poll_seconds=60):
-    """Show progress of running self-tests until they finish or Ctrl-C."""
-    print("\nWatching the self-test(s). Press Ctrl-C to stop watching; the drives keep "
-          "testing on their own and you can see the result later with a quick check.")
-    pending = list(reports)
-    try:
-        while pending:
-            parts = []
-            if use_sudo:
-                # Renew sudo's timestamp so hours-long tests can still be polled.
-                subprocess.run(["sudo", "-n", "-v"], capture_output=True)
-            for report in list(pending):
-                remaining = _self_test_progress(report, use_sudo)
-                if remaining == 0:
-                    pending.remove(report)
-                    result = quick_health_check(report.target, use_sudo)
-                    _clear_progress_line()
-                    print(f"\n{report.target.name}: self-test finished.")
-                    print_health_report(result)
-                    log_and_compare(result, check="self-test")
-                else:
-                    label = "?" if remaining is None else f"{100 - remaining}%"
-                    parts.append(f"{report.target.name}: {label} done")
-            if pending:
-                _print_status_line("Self-test running. " + "; ".join(parts) + f"  [{datetime.now():%H:%M}]")
-                time.sleep(poll_seconds)
-    except KeyboardInterrupt:
-        _clear_progress_line()
-        print("\nStopped watching. The self-test continues inside the drive; don't unplug it "
-              "until it's done. Run a quick check later to see the result.")
-
-
-def _print_status_line(message):
-    if _IS_TTY and _ANSI_OK:
-        print(f"\r\033[2K{message}", end="", flush=True)
-    else:
-        print(message, flush=True)
-
-
-def read_every_file(mount, report_path=None):
-    """Read every file under *mount* to find any that can't be read.
-
-    Returns (files_read, bytes_read, errors [(path, message)], finished).
-    """
-    try:
-        expected = shutil.disk_usage(mount).used
-    except OSError:
-        expected = 0
-    buf = bytearray(8 << 20)
-    errors = []
-    files = 0
-    done_bytes = 0
-    start = last = time.time()
-    finished = False
-    try:
-        for path, is_link, _size, _mtime in find_files(mount, None):
-            if is_link:
-                continue
-            try:
-                fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-                try:
-                    if hasattr(os, "posix_fadvise"):
-                        # Drop cached copies so the disk itself is read.
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    with os.fdopen(fd, "rb", buffering=0, closefd=False) as f:
-                        while True:
-                            n = f.readinto(buf)
-                            if not n:
-                                break
-                            done_bytes += n
-                finally:
-                    os.close(fd)
-                files += 1
-            except OSError as e:
-                errors.append((path, e.strerror or str(e)))
-            now = time.time()
-            if now - last >= 2:
-                last = now
-                rate = done_bytes / max(now - start, 1e-6)
-                pct = f" of {_human_size(expected)} ({done_bytes / expected * 100:.0f}%)" if expected else ""
-                eta = ""
-                if expected and rate > 0 and done_bytes < expected:
-                    eta = f", about {_format_duration((expected - done_bytes) / rate)} left"
-                _print_status_line(
-                    f"Read {files:,} files, {_human_size(done_bytes) or '0 B'}{pct} at "
-                    f"{_human_size(rate) or '0 B'}/s{eta}; {len(errors):,} unreadable"
-                )
-        finished = True
-    except KeyboardInterrupt:
-        pass
-    _clear_progress_line()
-    if errors and report_path:
-        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(report_path, "w", encoding="utf-8") as f:
-            for path, message in errors:
-                f.write(f"{path}\t{message}\n")
-    return files, done_bytes, errors, finished
-
-
-def _health_report_path(target):
-    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
-    return _unused_path(default_inventory_dir() / "Health checks" /
-                        _safe_filename(f"{stamp} {target.name} unreadable files.txt"))
-
-
-def _print_read_check_result(target, files, done_bytes, errors, finished, report_path):
-    state = "Finished" if finished else "Stopped early"
-    print(f"\n{target.name}: {state}. Read {files:,} files ({_human_size(done_bytes) or '0 B'}).")
-    if not errors:
-        print("  Every file could be read.")
-        return
-    print(f"  {len(errors):,} file(s) could not be read. These may be damaged:")
-    for path, message in errors[:20]:
-        print(f"    {path}  ({message})")
-    if len(errors) > 20:
-        print(f"    ... and {len(errors) - 20:,} more")
-    print(f"  The full list is in: {report_path}")
-
-
-def run_health_check(targets, extended=False, interactive=True):
-    """Check each target's health; with extended=True also run the long check.
-    Returns False if any drive showed warning signs or is failing."""
-    for line in health_tool_advice():
-        print()
-        print(_wrap(line, indent=""))
-    use_sudo = False
-    if shutil.which("smartctl") and any(t.kind != "SD card" for t in targets):
-        use_sudo = ensure_sudo_for_health(interactive)
-    reports = []
-    for target in targets:
-        report = quick_health_check(target, use_sudo)
-        print_health_report(report)
-        log_and_compare(report, check="quick")
-        reports.append(report)
-    healthy = not any(r.verdict in (HEALTH_WARNING, HEALTH_FAILING) for r in reports)
-    if not extended:
-        return healthy
-
-    self_testable = [r for r in reports if r.smart_available and r.self_test_minutes is not None]
-    readable = [r for r in reports if r not in self_testable and r.target.mounts]
-    started = []
-    for report in self_testable:
-        if report.self_test_running is not None:
-            print(f"\n{report.target.name}: a self-test is already running.")
-            started.append(report)
-            continue
-        minutes = (report.self_test_minutes or {}).get("extended")
-        estimate = f" The drive estimates about {_format_duration(minutes * 60)}." if minutes else ""
-        print(f"\n{report.target.name}: starting the drive's extended self-test.{estimate}")
-        ok, message = start_extended_self_test(report, use_sudo)
-        if ok:
-            started.append(report)
-        else:
-            print(f"  The drive didn't start the self-test ({message.strip() or 'no reason given'}).")
-            if report.target.mounts:
-                readable.append(report)
-    if started:
-        print(_wrap(
-            "The test runs inside the drive, so you can keep using the computer. Keep "
-            "the drive plugged in until it finishes. Some USB enclosures put the drive "
-            "to sleep when it's idle, which stops the test; if that happens, the result "
-            "will say it was interrupted.", indent="  "))
-        if not interactive or _confirm("Wait here and show progress?"):
-            watch_self_tests(started, use_sudo)
-    for report in readable:
-        target = report.target
-        print(f"\n{target.name}: this drive can't test itself, so every file on it will be "
-              "read to find any that can't be read.")
-        print("  This takes about as long as copying the whole drive. Press Ctrl-C to stop.")
-        report_path = _health_report_path(target)
-        files, done_bytes, errors, finished = read_every_file(target.mounts[0], report_path)
-        _print_read_check_result(target, files, done_bytes, errors, finished, report_path)
-        read_report = HealthReport(target)
-        read_report.serial = report.serial
-        read_report.verdict = HEALTH_WARNING if errors else (HEALTH_GOOD if finished else HEALTH_UNKNOWN)
-        state = "finished" if finished else "stopped early"
-        append_health_log(read_report, check="file read", notes=(
-            f"Read {files:,} files ({_human_size(done_bytes) or '0 B'}), {state}; "
-            f"{len(errors):,} unreadable" + (f", listed in {report_path.name}" if errors else "")))
-        healthy = healthy and not errors
-    return healthy
-
-
-def _mount_root(path):
-    """The mount point containing *path*."""
-    path = os.path.abspath(path)
-    while not os.path.ismount(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    return path
-
-
-def health_targets_for(directory=None):
-    """All drives, or just the one holding *directory*."""
-    targets = detect_health_targets()
-    if directory is None:
-        return targets
-    root = _root_cache_prefix(_mount_root(directory))
-    return [t for t in targets if any(_root_cache_prefix(m) == root for m in t.mounts)]
-
-
-def _interactive_health():
-    print("\nLooking for drives...")
-    targets = detect_health_targets()
-    if not targets:
-        print("No drives found to check.")
-        return
-    print("\nDrives connected now:")
-    for n, target in enumerate(targets, 1):
-        where = ", ".join(target.mounts) if target.mounts else "not mounted"
-        print(f"  {n}) {target.description()}   [{where}]")
-    print_unconnected_health(targets)
-    print(f"\nEvery check is added to {health_log_path()}")
-    answer = _ask("\nType a number to check one drive, press Enter to check all of them, "
-                  "or type h to see the health history: ").lower()
-    if answer == "h":
-        print_health_history()
-        return
-    chosen = parse_drive_choices(answer, len(targets))
-    if chosen:
-        targets = [targets[n - 1] for n in chosen]
-    elif answer:
-        print("Please choose one of the numbers shown.")
-        return
-    print()
-    print(_wrap(
-        "Quick check (a few seconds): reads the health information the drive keeps about "
-        "itself, such as bad sectors, errors, temperature and age.\n"
-        "Extended check (hours): does the quick check, then has the drive test its whole "
-        "surface, which finds weak spots in places that are rarely read. Drives that "
-        "can't test themselves, like SD cards, instead have every file read back. Worth "
-        "doing once in a while for drives that hold your only copy of something.",
-        indent="  "))
-    extended = _ask("\nQuick or extended check? [Q/e] ").lower().startswith("e")
-    run_health_check(targets, extended=extended, interactive=True)
-
-
-def parse_drive_choices(text, count):
-    """Numbers typed in the menu, e.g. "3", "3 4", "3,4" or "2-4".
-
-    Returns the list of chosen drive numbers (1-based, in order, no repeats),
-    or [] if the text isn't a valid selection.
-    """
-    chosen = []
-    tokens = text.replace(",", " ").split()
-    if not tokens:
-        return []
-    for token in tokens:
-        m = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
-        if not m:
-            return []
-        first = int(m.group(1))
-        last = int(m.group(2)) if m.group(2) else first
-        if not (1 <= first <= last <= count):
-            return []
-        for n in range(first, last + 1):
-            if n not in chosen:
-                chosen.append(n)
-    return chosen
-
-
-def _update_drives(settings, drives, list_for, state):
-    """Update (or create) the lists for several drives in turn, then summarise."""
-    print(f"\nUpdating {len(drives)} drive(s): " + ", ".join(d.display_name for d in drives))
-    results = []
-    for drive in drives:
-        print(f"\n=== {drive.display_name} ({drive.mount}) ===")
-        results.append((drive, _update_drive(settings, drive, list_for.get(drive.mount), state["list_dir"])))
-    print("Summary:")
-    for drive, ok in results:
-        print(f"  {drive.display_name:<24} {'done' if ok else 'NOT finished'}")
-    print()
-    state["dirty"] = True
-
-
-def _coverage_settings():
-    from findphotodates_coverage import CoverageSettings
-
-    return CoverageSettings.from_config(load_config())
-
-
-def _save_coverage_settings(settings):
-    save_config(settings.to_config(load_config()))
-
-
-def remember_connected_drives(lists):
-    """Record today as the last day each listed drive was seen connected
-    (used for the Backblaze reminder in the coverage report)."""
-    from findphotodates_coverage import record_connected
-
-    try:
-        settings = _coverage_settings()
-        if record_connected(settings, lists):
-            _save_coverage_settings(settings)
-    except Exception:
-        pass  # a reminder date is never worth interrupting the user for
-
-
-def coverage_for(lists=None, list_dir=None, progress=None):
-    """(drives, settings) for every file list; connected drives are matched first."""
-    from findphotodates_coverage import build_coverage
-
-    if lists is None:
-        lists = find_file_lists(list_dir or default_inventory_dir())
-        match_lists_to_drives(lists, detect_drives())
-        remember_connected_drives(lists)
-    settings = _coverage_settings()
-    drives = build_coverage(lists, settings, read_health_log(list_dir), progress=progress)
-    return drives, settings
-
-
-def print_coverage_report(history_days=None, report=True, lists=None, list_dir=None):
-    from findphotodates_coverage import BACKBLAZE_HISTORY_CHOICES, format_report
-
-    if history_days is not None:
-        settings = _coverage_settings()
-        settings.backblaze_history_days = history_days
-        _save_coverage_settings(settings)
-        print(f"Backblaze version history set to {BACKBLAZE_HISTORY_CHOICES[history_days]}.")
-    if not report:
-        return None
-    print("Comparing every file list (this reads the lists, not the drives)...")
-    drives, settings = coverage_for(lists, list_dir)
-    print()
-    print(format_report(drives, settings))
-    return drives
-
-
-def _interactive_coverage(state):
-    from findphotodates_coverage import (
-        BACKBLAZE_HISTORY_CHOICES, ROLE_AUTO, ROLE_GONE, ROLE_KEEP, ROLE_LABELS, ROLE_WEAK,
-        list_display_name,
-    )
-
-    print()
-    print(_wrap(
-        "The coverage report compares all your file lists. A photo or video counts as "
-        "having a copy when another drive has a file with the same name and size (and the "
-        "same date taken, when both have one). Drives you mark as weak (failing, or about "
-        "to be retired) don't count as safe copies.", indent=""))
-    print_coverage_report(lists=state["lists"], list_dir=state["list_dir"])
-    lists = state["lists"]
-    while True:
-        settings = _coverage_settings()
-        print("Settings:")
-        print(f"  b) Backblaze version history: "
-              f"{BACKBLAZE_HISTORY_CHOICES[settings.backblaze_history_days]}")
-        print("  Drives (role / backed up by Backblaze):")
-        for n, fl in enumerate(lists, 1):
-            s = settings.drive(fl.path.name)
-            print(f"  {n:>2}) {list_display_name(fl)}: {ROLE_LABELS[s.role]}, "
-                  f"Backblaze {'yes' if s.backblaze else 'no'}")
-        print("  r) Show the report again   q) Back")
-        choice = _ask("Choose a setting or drive number: ").lower()
-        if choice in ("q", ""):
-            return
-        if choice == "r":
-            print_coverage_report(lists=lists, list_dir=state["list_dir"])
-        elif choice == "b":
-            print("Backblaze version history:")
-            picked = _pick("Choose: ", [(label, days) for days, label
-                                        in BACKBLAZE_HISTORY_CHOICES.items()])
-            if picked is not None:
-                settings.backblaze_history_days = picked
-                _save_coverage_settings(settings)
-        elif choice.isdigit() and 1 <= int(choice) <= len(lists):
-            fl = lists[int(choice) - 1]
-            s = settings.drive(fl.path.name)
-            print(f"What is {list_display_name(fl)}? (now: {ROLE_LABELS[s.role]})")
-            picked = _pick("Choose (Enter keeps it): ", [
-                ("Automatic: keep it unless its health check shows it failing", ROLE_AUTO),
-                ("Keep: a drive you rely on", ROLE_KEEP),
-                ("Weak: failing or about to be retired; copies here don't count as safe",
-                 ROLE_WEAK),
-                ("Gone: wiped or lost; ignore its file list", ROLE_GONE),
-            ])
-            if picked is not None:
-                s.role = picked
-            s.backblaze = _confirm("Does Backblaze back up this drive?", default=s.backblaze)
-            _save_coverage_settings(settings)
-        else:
-            print("Please choose one of the options shown.")
-
-
-def interactive_main():
-    """Menu-driven mode used when the program is started with no arguments."""
-    print(f"\nfindphotodates {__version__}: lists of the files on your drives\n")
-    if not _exiftool_available():
-        print("ExifTool is needed to read the dates inside photos and videos, but it isn't installed.")
-        print(_wrap(_exiftool_install_hint(), indent="  "))
-        return
-    migrate_default_hash_cache(quiet=True)
-    settings = _InteractiveSettings()
-    state = {"list_dir": default_inventory_dir(), "dirty": True}
-
-    try:
-        legacy = [p for p in find_legacy_lists() if p.parent != state["list_dir"]]
-        if legacy:
-            print(f"Found {len(legacy)} file list(s) from an earlier version in {Path.home()}.")
-            if _confirm(f"Move them into {state['list_dir']} and name them after their drives?"):
-                print("Matching them to connected drives...")
-                for old, new in import_file_lists(legacy, state["list_dir"], detect_drives()):
-                    print(f"  {old.name}  ->  {new.name}")
-
-        while True:
-            if state["dirty"]:
-                print("Looking for drives and file lists...")
-                state["drives"] = detect_drives()
-                state["lists"] = find_file_lists(state["list_dir"])
-                match_lists_to_drives(state["lists"], state["drives"])
-                state["list_for"] = {fl.drive.mount: fl for fl in state["lists"] if fl.drive}
-                state["dirty"] = False
-                remember_connected_drives(state["lists"])
-            drives, list_for = state["drives"], state["list_for"]
-            _print_drive_menu(drives, list_for, state["list_dir"], state["lists"])
-            choice = _ask("\nChoose: ").lower()
-            if choice in ("q", "quit", "exit"):
-                return
-            if choice == "r":
-                state["dirty"] = True
-            elif choice == "h":
-                _interactive_health()
-                print()
-            elif choice == "c":
-                _interactive_coverage(state)
-            elif choice == "l":
-                _show_all_lists(state["lists"])
-            elif choice == "a":
-                _advanced_menu(settings, state)
-            elif choice == "u" and list_for:
-                _update_drives(settings, [d for d in drives if d.mount in list_for], list_for, state)
-            elif parse_drive_choices(choice, len(drives)):
-                chosen = [drives[n - 1] for n in parse_drive_choices(choice, len(drives))]
-                if len(chosen) == 1:
-                    drive = chosen[0]
-                    fl = list_for.get(drive.mount)
-                    if fl:
-                        question = f"Update the file list for {drive.display_name}? Only new or changed files are read."
-                    else:
-                        print(_wrap(
-                            f"This makes a new file list for {drive.display_name} named "
-                            f"'{canonical_list_name(drive)}'. It records every file's name, size and "
-                            "date, plus the date and GPS location inside photos and videos. The "
-                            "first scan of a large drive can take a few hours; later updates only "
-                            "read new or changed files and are much faster.", indent=""))
-                        question = "Make the file list now?"
-                    if _confirm(question):
-                        _update_drive(settings, drive, fl, state["list_dir"])
-                        state["dirty"] = True
-                else:
-                    print()
-                    for drive in chosen:
-                        action = "update its file list" if drive.mount in list_for else "make a new file list"
-                        print(f"  {drive.display_name}: {action}")
-                    if _confirm(f"Go ahead with these {len(chosen)} drives, one after another?"):
-                        _update_drives(settings, chosen, list_for, state)
-            else:
-                print("Please choose one of the options shown.")
-    except KeyboardInterrupt:
-        print("\nBye.")
-
-
 def _sigterm_handler(signum, frame):
     """Convert SIGTERM into KeyboardInterrupt so graceful shutdown paths are used."""
     raise KeyboardInterrupt
@@ -7564,7 +4714,7 @@ For more details on a specific option, you can also use:
     )
     parser.add_argument(
         "--directory",
-        default=".",
+        default=None,
         help="The directory to search (default: current directory).",
     )
     parser.add_argument(
@@ -7738,6 +4888,10 @@ For more details on a specific option, you can also use:
     )
 
     args = parser.parse_args()
+    # --health checks every drive unless --directory names one (even ".").
+    directory_given = args.directory is not None
+    if args.directory is None:
+        args.directory = "."
     output = args.output
     if output is None:
         output = "photo.dates.txt" if args.old_format else "photo.dates.tsv"
@@ -7776,7 +4930,7 @@ For more details on a specific option, you can also use:
         )
         return
     if args.health:
-        directory = None if args.directory == "." else _expand_path(args.directory)
+        directory = _expand_path(args.directory) if directory_given else None
         targets = health_targets_for(directory)
         if not targets:
             where = f" holding '{directory}'" if directory else ""
@@ -7826,7 +4980,7 @@ For more details on a specific option, you can also use:
         drive_hint_value = get_drive_hint(drive_root)
 
         if args.extension:
-            extensions_list = [args.extension.lower()]
+            extensions_list = [args.extension.lower().lstrip(".")]
         elif args.video:
             extensions_list = sorted(list(VIDEO_EXTENSIONS))
         elif args.only_photos:
@@ -8100,6 +5254,48 @@ def test_date_parsing():
     assert date_counter["2025-12-31"] == 2
     assert date_counter["2025-12-30"] == 1
     print("✓ All date parsing tests passed!")
+
+
+
+# The interactive menu lives in findphotodates_menu, which imports this module;
+# its names are looked up there on first use.
+_MENU_NAMES = frozenset({
+    "_InteractiveSettings",
+    "_ask_folder",
+    "_exiftool_install_hint",
+    "_exiftool_available",
+    "_ADVANCED_HELP",
+    "_hash_label",
+    "_run_interactive_scan",
+    "_update_drive",
+    "_drive_table_row",
+    "_print_drive_menu",
+    "_show_all_lists",
+    "_advanced_menu",
+    "_pick",
+    "_change_advanced_setting",
+    "_interactive_import",
+    "_run_backup_check",
+    "_interactive_health",
+    "parse_drive_choices",
+    "_update_drives",
+    "_interactive_coverage",
+    "interactive_main",
+})
+
+
+def __getattr__(name):
+    if name in _MENU_NAMES:
+        import findphotodates_menu
+
+        return getattr(findphotodates_menu, name)
+    raise AttributeError(f"module 'findphotodates' has no attribute {name!r}")
+
+
+def interactive_main():
+    import findphotodates_menu
+
+    return findphotodates_menu.interactive_main()
 
 
 if __name__ == "__main__":

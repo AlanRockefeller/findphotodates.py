@@ -211,18 +211,11 @@ class FileSearchDialog(ctk.CTkToplevel):
                                         command=self._search, state="disabled")
         self.search_btn.grid(row=0, column=1, padx=(0, 7), pady=(10, 5))
 
-        labels = ["All lists"]
-        self.list_choices = {"All lists": None}
-        for file_list in self.file_lists:
-            label = file_list.path.name
-            if label in self.list_choices:
-                label = str(file_list.path)
-            labels.append(label)
-            self.list_choices[label] = file_list.path
         self.list_var = ctk.StringVar(value="All lists")
-        self.list_menu = ctk.CTkOptionMenu(controls, variable=self.list_var, values=labels,
+        self.list_menu = ctk.CTkOptionMenu(controls, variable=self.list_var, values=["All lists"],
                                            width=220, command=lambda _value: self._search())
         self.list_menu.grid(row=1, column=2, padx=(0, 10), pady=(5, 5))
+        self._set_list_choices()
 
         date_row = ctk.CTkFrame(controls, fg_color="transparent")
         date_row.grid(row=1, column=0, columnspan=2, sticky="w", padx=11, pady=(5, 5))
@@ -298,6 +291,28 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.open_btn = ctk.CTkButton(footer, text="Open folder", width=100,
                                       command=self._open_containing_folder, state="disabled")
         self.open_btn.grid(row=0, column=3, padx=(8, 0))
+
+    def _set_list_choices(self):
+        labels = ["All lists"]
+        self.list_choices = {"All lists": None}
+        for file_list in self.file_lists:
+            label = file_list.path.name
+            if label in self.list_choices:
+                label = str(file_list.path)
+            labels.append(label)
+            self.list_choices[label] = file_list.path
+        self.list_menu.configure(values=labels)
+        if self.list_var.get() not in self.list_choices:
+            self.list_var.set("All lists")
+
+    def use_lists(self, file_lists):
+        """Follow the main window's lists after drives were refreshed."""
+        self.file_lists = list(file_lists)
+        self._set_list_choices()
+        self.index_ready = False
+        self.search_btn.configure(state="disabled")
+        self.status_var.set("Updating the search index…")
+        self._start_index()
 
     def _show_help(self):
         messagebox.showinfo(
@@ -490,10 +505,16 @@ class FileSearchDialog(ctk.CTkToplevel):
             return
         folder = path if path.is_dir() else path.parent
         if not folder.is_dir():
-            messagebox.showinfo("Drive not connected",
-                                "The file is in the list, but its containing folder is not available right now.\n\n"
-                                + result.filepath, parent=self)
-            return
+            # A file inside a .zip: its path continues past the archive.
+            archive = next((parent for parent in path.parents if parent.is_file()), None)
+            if archive is None:
+                messagebox.showinfo("Drive not connected",
+                                    "The file is in the list, but its containing folder is not available right now.\n\n"
+                                    + result.filepath, parent=self)
+                return
+            folder = archive.parent
+            self.status_var.set(f"That file is inside {archive.name}; showing the folder that "
+                                "holds the archive.")
         try:
             open_folder(folder)
         except Exception as exc:
@@ -702,6 +723,10 @@ class CoverageDialog(ctk.CTkToplevel):
         self.progress.set(0)
         settings = fp._coverage_settings()
         health = fp.read_health_log(self.parent.list_dir)
+        # Use the main window's latest lists: drives may have been plugged in or
+        # out since this window opened, and cleanup needs to know which are connected.
+        if getattr(self.parent, "lists", None):
+            self.file_lists = list(self.parent.lists)
         lists = self.file_lists
 
         def progress(step, total, name):
@@ -769,8 +794,12 @@ class CoverageDialog(ctk.CTkToplevel):
         can_clean = drive.connected and drive.role != coverage.ROLE_GONE
         self.cleanup_btn.configure(state="normal" if can_clean else "disabled")
 
-    def _save_settings(self):
-        fp._save_coverage_settings(self.settings)
+    def _update_settings(self, change):
+        """Save one change, keeping changes made meanwhile elsewhere (such as
+        the dates drives were last connected)."""
+        self.settings = fp.update_coverage_settings(change)
+        for drive in self.drives:
+            drive.setting = self.settings.drive(drive.list_path.name)
 
     def _refresh_backblaze(self):
         today = _datetime.date.today()
@@ -782,8 +811,7 @@ class CoverageDialog(ctk.CTkToplevel):
 
     def _set_history(self, label):
         days = next(d for d, text in coverage.BACKBLAZE_HISTORY_CHOICES.items() if text == label)
-        self.settings.backblaze_history_days = days
-        self._save_settings()
+        self._update_settings(lambda s: setattr(s, "backblaze_history_days", days))
         self._refresh_backblaze()
 
     def _set_role(self, label):
@@ -791,18 +819,16 @@ class CoverageDialog(ctk.CTkToplevel):
         if drive is None:
             return
         role = next(r for r, text in coverage.ROLE_LABELS.items() if text == label)
-        self.settings.drive(drive.list_path.name).role = role
-        self._save_settings()
+        name = drive.list_path.name
+        self._update_settings(lambda s: setattr(s.drive(name), "role", role))
         self._calculate()  # which copies count as safe depends on every drive's role
 
     def _set_backblaze(self):
         drive = self._selected()
         if drive is None:
             return
-        setting = self.settings.drive(drive.list_path.name)
-        setting.backblaze = bool(self.backblaze_var.get())
-        drive.setting = setting
-        self._save_settings()
+        name, value = drive.list_path.name, bool(self.backblaze_var.get())
+        self._update_settings(lambda s: setattr(s.drive(name), "backblaze", value))
         self._refresh_backblaze()
 
     def _open_cleanup(self):
@@ -922,7 +948,12 @@ class CleanupDialog(ctk.CTkToplevel):
         ctk.CTkCheckBox(options, variable=self.trust_var,
                         text="Trust the file lists for drives that aren't connected "
                              "(otherwise those duplicates are kept)")\
-            .grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 10))
+            .grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=4)
+        self.compare_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options, variable=self.compare_var,
+                        text="Also compare a few small pieces of each file with its kept copy "
+                             "(a little slower)")\
+            .grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 10))
 
         frame = ctk.CTkFrame(self, corner_radius=8)
         frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -967,9 +998,13 @@ class CleanupDialog(ctk.CTkToplevel):
         return [f.strip() for f in self.folders_var.get().split(",") if f.strip()]
 
     def _find(self):
-        self.settings.keep_folders = self._keep_folders()
-        self.settings.keep_library_days = bool(self.library_var.get())
-        fp._save_coverage_settings(self.settings)
+        folders, library_days = self._keep_folders(), bool(self.library_var.get())
+
+        def change(saved):
+            saved.keep_folders = folders
+            saved.keep_library_days = library_days
+
+        self.settings = fp.update_coverage_settings(change)
         self.busy = True
         self.plan = None
         self.find_btn.configure(state="disabled")
@@ -1016,6 +1051,7 @@ class CleanupDialog(ctk.CTkToplevel):
         if not plan or not plan.items:
             return
         trust = bool(self.trust_var.get())
+        compare = bool(self.compare_var.get())
         if not messagebox.askyesno(
                 "Delete duplicates",
                 f"Permanently delete {len(plan.items):,} files "
@@ -1023,6 +1059,7 @@ class CleanupDialog(ctk.CTkToplevel):
                 "Each one's kept copy is checked on disk first when its drive is connected"
                 + ("; for drives that aren't connected, the file lists are trusted."
                    if trust else "; duplicates whose kept copy's drive isn't connected are kept.")
+                + (" Each file's contents are also compared with its copy." if compare else "")
                 + " Deleted files don't go to the trash.",
                 icon="warning", parent=self):
             return
@@ -1043,7 +1080,7 @@ class CleanupDialog(ctk.CTkToplevel):
         def work():
             try:
                 counts, freed = coverage.run_cleanup(plan, self.log_path, trust, progress,
-                                                     self.stop_event)
+                                                     self.stop_event, compare_contents=compare)
                 self.events.put(("deleted", counts, freed))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
@@ -1208,9 +1245,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         ctk.set_window_scaling(scale)
         if self.search_dialog is not None and self.search_dialog.winfo_exists():
             self.search_dialog.apply_scale(scale)
-        config = fp.load_config()
-        config["gui_scale"] = scale
-        fp.save_config(config)
+        fp.update_config(lambda config: config.update(gui_scale=scale))
 
     def _build_drives(self):
         outer = ctk.CTkFrame(self.body, corner_radius=10)
@@ -1778,9 +1813,7 @@ class FindPhotoDatesGUI(ctk.CTk):
                 import shutil
                 for fl in existing:
                     shutil.move(str(fl.path), str(fp._unused_path(new_dir / fl.path.name)))
-            config = fp.load_config()
-            config["inventory_dir"] = str(new_dir)
-            fp.save_config(config)
+            fp.update_config(lambda config: config.update(inventory_dir=str(new_dir)))
             self.list_dir = new_dir
             self.refresh()
         except Exception as exc:
@@ -1832,6 +1865,8 @@ class FindPhotoDatesGUI(ctk.CTk):
             self.search_dialog.deiconify()
             self.search_dialog.lift()
             self.search_dialog.date_entry.focus_set()
+            if self.search_dialog.file_lists != self.lists:  # drives changed meanwhile
+                self.search_dialog.use_lists(self.lists)
             return
         self.search_dialog = FileSearchDialog(self, self.lists)
         self.search_dialog.date_entry.focus_set()
@@ -1843,6 +1878,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         if self.coverage_dialog is not None and self.coverage_dialog.winfo_exists():
             self.coverage_dialog.deiconify()
             self.coverage_dialog.lift()
+            if self.coverage_dialog.file_lists != self.lists:  # drives changed meanwhile
+                self.coverage_dialog._calculate()
             return
         self.coverage_dialog = CoverageDialog(self, self.lists)
 
@@ -1871,6 +1908,16 @@ class FindPhotoDatesGUI(ctk.CTk):
 if __name__ == "__main__":
     try:
         app = FindPhotoDatesGUI()
+    except SystemExit as exc:
+        if not isinstance(exc.code, str):
+            raise
+        # e.g. a damaged settings file: say so instead of closing silently.
+        print(exc.code, file=sys.stderr)
+        try:
+            messagebox.showerror("Find Photo Dates", exc.code)
+        except Exception:
+            pass
+        raise SystemExit(1) from None
     except TclError as exc:
         if "display" not in str(exc).lower():
             raise

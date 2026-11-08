@@ -226,10 +226,10 @@ def test_windows_style_list_not_kept_for_posix_mount(tmp_path):
     assert fpd.resolve_output_path_style("auto", str(p), "/mnt/j") == "windows"
 
 
-def test_default_inventory_dir_honours_config(tmp_path, monkeypatch):
-    monkeypatch.setattr(fpd, "load_config", lambda: {"inventory_dir": str(tmp_path / "lists")})
+def test_default_inventory_dir_honours_config(tmp_path, monkeypatch, patch_everywhere):
+    patch_everywhere("load_config", lambda: {"inventory_dir": str(tmp_path / "lists")})
     assert fpd.default_inventory_dir() == tmp_path / "lists"
-    monkeypatch.setattr(fpd, "load_config", lambda: {"saved_scans": []})
+    patch_everywhere("load_config", lambda: {"saved_scans": []})
     assert fpd.default_inventory_dir().name == "findphotodates"
 
 

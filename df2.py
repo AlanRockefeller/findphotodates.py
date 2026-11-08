@@ -1,100 +1,188 @@
 #!/usr/bin/env python3
-"""df-like summary of photo inventory files (~/*:photo.taken.dates.txt)"""
+"""A df-like summary of your file lists: how many files, how much data, and
+how many photos and videos each drive holds, without connecting any drive.
 
-import csv
-import os
+Reads every list in the file lists folder (Documents/findphotodates unless you
+chose another one), plus lists from older versions in your home folder
+(~/*:photo.taken.dates.txt). Pass list files or folders to summarise those
+instead:
+
+    ./df2.py
+    ./df2.py "~/Documents/findphotodates/Sierra Club (5F61-DDF5).tsv"
+"""
+
+from __future__ import annotations
+
+import argparse
 import re
 import sys
-from collections import defaultdict
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
+
+from findphotodates_common import split_list_lines
+
+PHOTO_EXTENSIONS = {
+    "jpg", "jpeg", "nef", "orf", "cr2", "cr3", "arw", "dng", "rw2", "raf", "srw", "pef",
+    "x3f", "tif", "tiff", "heic", "heif", "psd", "png", "webp", "avif", "jxl",
+}
+VIDEO_EXTENSIONS = {
+    "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "3gp", "mts", "m2ts", "vob",
+    "mpg", "mpeg",
+}
+_LEGACY_GLOBS = ("*:photo.taken.dates.txt", "*_photo.taken.dates.txt",
+                 "*:photo.taken.dates.tsv", "*_photo.taken.dates.tsv")
+_OLD_FORMAT = re.compile(r"^(?P<path>.+?):\s+\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}\s*$")
 
 
 def human(size):
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if abs(size) < 1024 or u == "TB":
-            return f"{size:,.1f} {u}" if u != "B" else f"{int(size):,} B"
-        size /= 1024
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size) < 1000 or unit == "TB":
+            return f"{int(size):,} B" if unit == "B" else f"{size:,.1f} {unit}"
+        size /= 1000
+    return f"{size:,.1f} TB"
 
 
-def main():
-    inv_files = sorted(Path.home().glob("*:photo.taken.dates.txt")) + sorted(
-        Path.home().glob("*:photo.taken.dates.tsv")
-    )
+def list_dir():
+    """The folder findphotodates.py keeps its file lists in."""
+    try:
+        from findphotodates import default_inventory_dir
 
-    if not inv_files:
-        print("No inventory files found.")
+        return default_inventory_dir()
+    except (Exception, SystemExit):  # unreadable settings, or findphotodates.py missing
+        return Path.home() / "Documents" / "findphotodates"
+
+
+def find_lists(paths):
+    """File lists to summarise: the given files and folders, or the defaults."""
+    if not paths:
+        folder = list_dir()
+        found = sorted(folder.glob("*.tsv"), key=lambda p: p.name.lower())
+        for pattern in _LEGACY_GLOBS:
+            found += sorted(Path.home().glob(pattern))
+        return [p for p in found if p.name != "Drive health log.tsv"]
+    found = []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            found += sorted(path.glob("*.tsv"), key=lambda p: p.name.lower())
+        else:
+            found.append(path)
+    return found
+
+
+def summarise(path):
+    """A dict of totals for one list, or None if it isn't a file list."""
+    headers = {}
+    totals = {"files": 0, "bytes": 0, "media": 0, "media_bytes": 0, "hashed": 0,
+              "placeholders": 0, "in_archives": 0, "extensions": Counter()}
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+        first = ""
+        for line in handle:  # header comments, then the column names or old-format rows
+            if line.startswith("#"):
+                key, sep, value = line.lstrip("# ").rstrip("\r\n").partition("=")
+                if sep:
+                    headers[key] = value
+                continue
+            if line.strip():
+                first = line
+                break
+        if first.startswith("filepath\t"):
+            rows = split_list_lines(_prepend(first, handle))
+            columns = {name: i for i, name in enumerate(next(rows))}
+            for fields in rows:
+                _add_row(totals, fields, columns)
+        elif _OLD_FORMAT.match(first.strip()):
+            # Old format: "./path/file.jpg: 2016:01:03 18:03:43", no sizes.
+            for line in _prepend(first, handle):
+                match = _OLD_FORMAT.match(line.strip())
+                if match:
+                    _add_row(totals, [match.group("path")], {"filepath": 0})
+        else:
+            return None
+    label = headers.get("volume_label") or re.sub(r"\s*\([0-9A-Fa-f-]{4,}\)$", "", path.stem)
+    totals["name"] = label.split(":")[0] if ":photo.taken.dates" in path.name else label
+    totals["updated"] = datetime.fromtimestamp(path.stat().st_mtime)
+    return totals
+
+
+def _prepend(first, rest):
+    yield first
+    yield from rest
+
+
+def _add_row(totals, fields, columns):
+    def field(name):
+        index = columns.get(name)
+        return fields[index] if index is not None and index < len(fields) else ""
+
+    filepath = field("filepath")
+    if not filepath:
         return
+    try:
+        size = int(field("size_bytes") or 0)
+    except ValueError:
+        size = 0
+    flags = field("flags")
+    if "archive" in flags:
+        totals["in_archives"] += 1  # its bytes are already counted in the archive
+        size = 0
+    totals["files"] += 1
+    totals["bytes"] += size
+    name = re.split(r"[/\\]", filepath)[-1]
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    totals["extensions"][extension] += 1
+    if extension in PHOTO_EXTENSIONS or extension in VIDEO_EXTENSIONS:
+        totals["media"] += 1
+        totals["media_bytes"] += size
+    if field("content_hash").strip():
+        totals["hashed"] += 1
+    if "placeholder" in flags:
+        totals["placeholders"] += 1
 
-    grand_files = 0
-    grand_size = 0
 
-    # Per-drive stats
-    drives = []
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("lists", nargs="*", help="file lists or folders (default: yours)")
+    args = parser.parse_args(argv)
 
-    for inv in inv_files:
-        name = inv.name
-        drive = name.split(":")[0]
-        total_files = 0
-        total_size = 0
-        has_hash = 0
-        ext_counts = defaultdict(lambda: [0, 0])  # ext -> [count, size]
-        fieldnames = None
+    summaries = []
+    for path in find_lists(args.lists):
+        try:
+            summary = summarise(path)
+        except OSError as exc:
+            print(f"Couldn't read {path}: {exc.strerror or exc}", file=sys.stderr)
+            continue
+        if summary is not None:
+            summaries.append(summary)
+    if not summaries:
+        print("No file lists found.")
+        return 1
 
-        with inv.open("r", encoding="utf-8", errors="replace") as f:
-            reader = csv.reader(f, delimiter="\t")
-            for parts in reader:
-                if not parts or parts[0].startswith("#"):
-                    continue
-                if len(parts) > 1 and fieldnames is None:
-                    if parts[0] == "filepath":
-                        fieldnames = parts
-                        continue
-                if fieldnames and len(parts) == len(fieldnames):
-                    row = dict(zip(fieldnames, parts))
-                    filepath = row.get("filepath", "")
-                    try:
-                        sz = int(row.get("size_bytes", "0") or "0")
-                    except ValueError:
-                        sz = 0
-                    ch = (row.get("content_hash") or "").strip()
-                    if ch:
-                        has_hash += 1
-                elif len(parts) == 1:
-                    # old format - e.g. "./foo/bar.jpg: 2016:01:03 18:03:43"
-                    m = re.match(
-                        r"^(?P<path>.+?):\s+\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}\s*$",
-                        parts[0],
-                    )
-                    filepath = m.group("path") if m else parts[0]
-                    sz = 0
-                else:
-                    continue
-
-                total_files += 1
-                total_size += sz
-                ext = os.path.splitext(filepath)[1].lower()
-                ext_counts[ext][0] += 1
-                ext_counts[ext][1] += sz
-
-        top_exts = sorted(ext_counts.items(), key=lambda x: -x[1][1])[:8]
-        ext_summary = ", ".join(
-            f"{e or '(none)'}: {c[0]:,} ({human(c[1])})" for e, c in top_exts
-        )
-
-        drives.append((drive, total_files, total_size, has_hash, ext_summary))
-        grand_files += total_files
-        grand_size += total_size
-
-    # Print table
-    print(
-        f"{'Drive':<6} {'Files':>12} {'Total Size':>14} {'Hashed':>10}  Top extensions"
-    )
-    print("-" * 100)
-    for drive, nf, sz, nh, exts in drives:
-        print(f"{drive:<6} {nf:>12,} {human(sz):>14} {nh:>10,}  {exts}")
-    print("-" * 100)
-    print(f"{'TOTAL':<6} {grand_files:>12,} {human(grand_size):>14}")
+    width = max(12, *(len(s["name"]) for s in summaries))
+    header = (f"{'Drive':<{width}}  {'Files':>11}  {'Size':>10}  {'Photos+videos':>13}  "
+              f"{'Their size':>10}  {'Hashed':>9}  {'Updated':<10}  Most common types")
+    print(header)
+    print("-" * len(header))
+    for s in summaries:
+        common = ", ".join(f"{ext or '(none)'} {count:,}"
+                           for ext, count in s["extensions"].most_common(4))
+        notes = []
+        if s["placeholders"]:
+            notes.append(f"{s['placeholders']:,} cloud-only")
+        if s["in_archives"]:
+            notes.append(f"{s['in_archives']:,} inside archives")
+        print(f"{s['name']:<{width}}  {s['files']:>11,}  {human(s['bytes']):>10}  "
+              f"{s['media']:>13,}  {human(s['media_bytes']):>10}  {s['hashed']:>9,}  "
+              f"{s['updated']:%Y-%m-%d}  {common}" + (f"  ({'; '.join(notes)})" if notes else ""))
+    print("-" * len(header))
+    print(f"{'Total':<{width}}  {sum(s['files'] for s in summaries):>11,}  "
+          f"{human(sum(s['bytes'] for s in summaries)):>10}  "
+          f"{sum(s['media'] for s in summaries):>13,}  "
+          f"{human(sum(s['media_bytes'] for s in summaries)):>10}")
+    print("\nTotals count every copy: a photo on three drives is counted three times.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -146,15 +146,15 @@ def test_unsupported_usb_bridge():
     assert "doesn't report health data" in report.problem
 
 
-def test_sd_card_is_not_sent_to_smartctl(monkeypatch):
-    monkeypatch.setattr(fpd, "_run_smartctl", lambda *a, **k: pytest.fail("smartctl called"))
+def test_sd_card_is_not_sent_to_smartctl(monkeypatch, patch_everywhere):
+    patch_everywhere("_run_smartctl", lambda *a, **k: pytest.fail("smartctl called"))
     sd = _target(device="/dev/mmcblk0", transport="mmc", name="OM SYSTEM")
     assert sd.kind == "SD card"
     report = fpd.quick_health_check(sd)
     assert "SD cards don't report health data" in report.problem
 
 
-def test_usb_bridge_retry_with_sat(monkeypatch):
+def test_usb_bridge_retry_with_sat(monkeypatch, patch_everywhere):
     calls = []
 
     def fake(args, device, use_sudo, device_type=None, timeout=120):
@@ -163,7 +163,7 @@ def test_usb_bridge_retry_with_sat(monkeypatch):
             return _ata()
         return {"smartctl": {"messages": [{"string": "Unknown USB bridge", "severity": "error"}]}}
 
-    monkeypatch.setattr(fpd, "_run_smartctl", fake)
+    patch_everywhere("_run_smartctl", fake)
     data, used = fpd._read_smart(_target(), use_sudo=False)
     assert calls == [None, "sat"] and used == "sat" and data["smart_status"]["passed"]
 
@@ -199,18 +199,18 @@ def test_read_every_file_reports_unreadable(tmp_path):
     assert "bad.jpg" in report_path.read_text(encoding="utf-8")
 
 
-def test_health_targets_for_directory(monkeypatch, tmp_path):
+def test_health_targets_for_directory(monkeypatch, tmp_path, patch_everywhere):
     a = _target(name="A", mounts=[str(tmp_path)])
     b = _target(name="B", mounts=["/somewhere/else"])
-    monkeypatch.setattr(fpd, "detect_health_targets", lambda: [a, b])
-    monkeypatch.setattr(fpd, "_mount_root", lambda path: str(tmp_path))
+    patch_everywhere("detect_health_targets", lambda: [a, b])
+    patch_everywhere("_mount_root", lambda path: str(tmp_path))
     assert fpd.health_targets_for(str(tmp_path / "sub")) == [a]
     assert fpd.health_targets_for(None) == [a, b]
 
 
-def test_install_advice_names_package_manager(monkeypatch):
+def test_install_advice_names_package_manager(monkeypatch, patch_everywhere):
     monkeypatch.setattr(fpd.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(fpd, "_is_wsl", lambda: False)
+    patch_everywhere("_is_wsl", lambda: False)
     monkeypatch.setattr(fpd.shutil, "which", lambda tool: "/usr/bin/pacman" if tool == "pacman" else None)
     advice = " ".join(fpd.health_tool_advice())
     assert "sudo pacman -S smartmontools" in advice
@@ -306,11 +306,11 @@ def test_interpret_smart_fills_metrics_and_serial():
     assert report.metrics["connection_errors"] == 7
 
 
-def test_linux_targets_include_disk_mounted_without_partitions(monkeypatch):
+def test_linux_targets_include_disk_mounted_without_partitions(monkeypatch, patch_everywhere):
     lsblk = {"blockdevices": [{"path": "/dev/sdb", "name": "sdb", "type": "disk", "tran": "usb",
                                "model": "Stick", "size": 64_000_000_000, "rota": False,
                                "label": "CARD", "uuid": "1234-ABCD", "mountpoint": "/run/media/u/CARD"}]}
-    monkeypatch.setattr(fpd, "_run_quiet", lambda cmd: json.dumps(lsblk))
+    patch_everywhere("_run_quiet", lambda cmd: json.dumps(lsblk))
     [target] = fpd._linux_health_targets()
     assert target.mounts == ["/run/media/u/CARD"] and target.name == "CARD"
 

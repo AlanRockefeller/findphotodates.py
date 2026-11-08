@@ -71,7 +71,7 @@ The script attempts to match target files to inventory records using the followi
 |---|---|---|
 | `--target` | Required. The folder you want to verify. | N/A |
 | `--inventories` | Comma-separated list of inventory files. | Every `.tsv` in the file lists folder (`Documents/findphotodates` unless changed) and `~/*:photo.taken.dates.txt` |
-| `--exts` | Comma-separated file extensions to scan (jpg, jpeg, png, tif, orf, nef, mov, mp4, etc.). | *(depends on script defaults)* |
+| `--exts` | Comma-separated file extensions to check. | Common photo, RAW and video types (jpg, heic, png, nef, cr3, dng, mp4, mov, avi, mts, …) |
 | `--exclude-path-regex` | Regex to ignore specific paths in inventories (e.g., Trash). | `/$RECYCLE\.BIN/, /.Trash/, etc.` |
 | `--out-csv` | Filename for the report CSV. | `backup_check_report.csv` |
 | `--missing-list` | Filename for the missing files list. | `missing_from_backups.txt` |
@@ -82,23 +82,17 @@ At the end of the execution, the script analyzes per-directory statistics.
 
 ### "Directories safe to delete"
 
-If a directory is listed here, it means every single file inside that specific folder was found in your backups.
+A folder is listed here only when its whole tree can go: every photo and video in it **and in its subfolders** is safe to delete, nothing in it was left unchecked, and nothing in it couldn't be read. Only the top-most such folders are listed, because deleting a folder deletes its subfolders too.
+
+A folder is *not* listed if it also holds files of a type that wasn't checked (for example Lightroom `.xmp` sidecars with your edits, or documents). Thumbs.db, desktop.ini, .DS_Store and `._` files don't count; they are never worth keeping.
 
 Example output:
 
 ```text
 === Directories safe to delete (2) ===
-  2023/London_Trip/  (145 files, all backed up)
-  2023/Family_Picnic/  (88 files, all backed up)
+(Every photo and video in each one, including its subfolders, is safely backed up.)
+  2023/London_Trip/  (145 files, 2.1 GB)
+  2023/Family_Picnic/  (88 files, 940.0 MB)
 ```
 
-### "Directories NOT fully backed up"
-
-These folders contain at least one file that was not found in the inventories. Do not delete these folders yet.
-
-Example output:
-
-```text
-=== Directories NOT fully backed up (1) ===
-  2024/New_Photos/  (5 of 12 files missing from backups)
-```
+Files inside the folder being checked never count as backups of each other, even when one of your file lists covers that folder (for example the list of the laptop drive you are checking).

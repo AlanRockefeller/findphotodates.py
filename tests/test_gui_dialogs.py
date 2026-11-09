@@ -1,4 +1,4 @@
-"""The search window refreshes its index one list set at a time."""
+"""GUI windows follow the main window's file lists (run without a display)."""
 
 import queue
 import threading
@@ -94,3 +94,22 @@ def test_lists_changed_during_a_refresh_wait_and_old_results_are_ignored():
     assert "30 files ready" in dialog.status_var.get()
     assert index.calls == ["one", "three"]
     assert index.most_active == 1
+
+
+def test_recalculate_uses_the_main_windows_lists_even_when_there_are_none(monkeypatch, tmp_path):
+    # The main window switched to a folder with no lists: coverage must not
+    # keep comparing (and offering to clean up) the old folder's lists.
+    compared = []
+    monkeypatch.setattr(gui.fp, "_coverage_settings", lambda: None)
+    monkeypatch.setattr(gui.fp, "read_health_log", lambda folder: [])
+    monkeypatch.setattr(gui.coverage, "build_coverage",
+                        lambda lists, *args, **kwargs: compared.append(lists) or [])
+    dialog = types.SimpleNamespace(
+        generation=0, events=queue.Queue(), file_lists=["old folder's list"],
+        parent=types.SimpleNamespace(lists=[], list_dir=tmp_path),
+        recalc_btn=types.SimpleNamespace(configure=lambda **kw: None),
+        progress=types.SimpleNamespace(set=lambda value: None), status_var=_Var(),
+    )
+    gui.CoverageDialog._calculate(dialog)
+    assert dialog.events.get(timeout=5)[0] == "done"
+    assert compared == [[]]

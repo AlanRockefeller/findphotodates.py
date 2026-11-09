@@ -738,7 +738,8 @@ class CoverageDialog(ctk.CTkToplevel):
         health = fp.read_health_log(self.parent.list_dir)
         # Use the main window's latest lists: drives may have been plugged in or
         # out since this window opened, and cleanup needs to know which are connected.
-        if getattr(self.parent, "lists", None):
+        # An empty list counts: the main window now shows a folder with no lists.
+        if getattr(self.parent, "lists", None) is not None:
             self.file_lists = list(self.parent.lists)
         lists = self.file_lists
 

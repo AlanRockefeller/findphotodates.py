@@ -1,5 +1,9 @@
 """One reader for file lists: names with tabs, quotes and line breaks."""
 
+import os
+
+import pytest
+
 import findphotodates as fpd
 import findphotodates_coverage as cov
 from findphotodates_common import split_list_lines
@@ -64,6 +68,7 @@ def test_coverage_search_and_reuse_all_read_the_odd_name(tmp_path):
     assert other[key] == "2024:06:30 10:00:00"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows file names can't contain line breaks")
 def test_add_hashes_keeps_rows_with_line_breaks(tmp_path):
     folder = tmp_path / "drive"
     folder.mkdir()

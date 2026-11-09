@@ -1,6 +1,7 @@
 """check_photo_backups: a file is never its own backup, and a folder is only
 "safe to delete" when everything in it, including subfolders, was checked."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -103,7 +104,7 @@ def test_folder_with_only_unchecked_files_and_a_safe_subfolder(tmp_path, capsys)
     _write(target / "2024" / "06-30" / "a.jpg", b"y" * 300)
     backup = _inventory(tmp_path / "Backup.tsv", "/mnt/backup", [("/mnt/backup/a.jpg", 300)])
     _code, printed, _safe = _run(tmp_path, target, [backup], capsys)
-    assert _safe_folders(printed) == ["2024/06-30"]
+    assert _safe_folders(printed) == [os.path.join("2024", "06-30")]
 
 
 def test_whole_target_listed_when_everything_is_safe(tmp_path, capsys):

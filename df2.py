@@ -32,6 +32,8 @@ VIDEO_EXTENSIONS = {
 }
 _LEGACY_GLOBS = ("*:photo.taken.dates.txt", "*_photo.taken.dates.txt",
                  "*:photo.taken.dates.tsv", "*_photo.taken.dates.tsv")
+# "f:photo.taken.dates.txt" (or "f_..." where ":" can't be used) is drive F's list.
+_LEGACY_NAME = re.compile(r"^(?P<drive>.+?)[:_]photo\.taken\.dates\.(?:txt|tsv)$")
 _OLD_FORMAT = re.compile(r"^(?P<path>.+?):\s+\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}\s*$")
 
 
@@ -100,8 +102,10 @@ def summarise(path):
                     _add_row(totals, [match.group("path")], {"filepath": 0})
         else:
             return None
-    label = headers.get("volume_label") or re.sub(r"\s*\([0-9A-Fa-f-]{4,}\)$", "", path.stem)
-    totals["name"] = label.split(":")[0] if ":photo.taken.dates" in path.name else label
+    legacy = _LEGACY_NAME.match(path.name)
+    totals["name"] = (headers.get("volume_label")
+                      or (legacy.group("drive") if legacy else None)
+                      or re.sub(r"\s*\([0-9A-Fa-f-]{4,}\)$", "", path.stem))
     totals["updated"] = datetime.fromtimestamp(path.stat().st_mtime)
     return totals
 

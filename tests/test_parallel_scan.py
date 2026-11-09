@@ -148,6 +148,7 @@ def test_single_worker_matches_expected_serial_inventory(tmp_path, monkeypatch):
         hash_options=hash_options,
         workers=1,
         min_image_size=0,
+        path_style="auto",  # this host's style, as the menu and command line use
     )
 
     assert output.read_bytes() == _expected_inventory_bytes(root, hash_options)

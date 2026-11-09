@@ -5,6 +5,10 @@ from pathlib import Path
 
 import findphotodates as fpd
 
+# Old lists were named like f:photo.taken.dates.txt, or f_photo... on Windows,
+# where ":" can't be in a file name.
+LEGACY = "_photo.taken.dates.txt" if os.name == "nt" else ":photo.taken.dates.txt"
+
 
 def _write_inventory(path, root, rows, extra_headers=()):
     """Write a minimal TSV inventory; rows are (relative_path, size)."""
@@ -185,17 +189,17 @@ def test_import_legacy_lists_names_and_moves(tmp_path):
     home.mkdir()
     drive_dir = tmp_path / "Sierra Club"
     rows = _make_drive_tree(drive_dir)
-    _write_inventory(home / "l:photo.taken.dates.txt", "/mnt/l", rows)
-    _write_inventory(home / "f:photo.taken.dates.txt", "/mnt/f", [("a.jpg", 1)])
+    _write_inventory(home / f"l{LEGACY}", "/mnt/l", rows)
+    _write_inventory(home / f"f{LEGACY}", "/mnt/f", [("a.jpg", 1)])
     (home / "unrelated.txt").write_text("hello\n", encoding="utf-8")
     found = fpd.find_legacy_lists(home)
-    assert sorted(p.name for p in found) == ["f:photo.taken.dates.txt", "l:photo.taken.dates.txt"]
+    assert sorted(p.name for p in found) == [f"f{LEGACY}", f"l{LEGACY}"]
     dest = tmp_path / "Documents" / "findphotodates"
     drive = fpd.DriveInfo(str(drive_dir), "Sierra Club", "5F61-DDF5")
     moved = dict((old.name, new.name) for old, new in fpd.import_file_lists(found, dest, [drive]))
-    assert moved == {"l:photo.taken.dates.txt": "Sierra Club (5F61-DDF5).tsv",
-                     "f:photo.taken.dates.txt": "Drive F.tsv"}
-    assert not (home / "l:photo.taken.dates.txt").exists()
+    assert moved == {f"l{LEGACY}": "Sierra Club (5F61-DDF5).tsv",
+                     f"f{LEGACY}": "Drive F.tsv"}
+    assert not (home / f"l{LEGACY}").exists()
     assert (home / "unrelated.txt").exists()
     assert [fl.path.name for fl in fpd.find_file_lists(dest)] == ["Drive F.tsv", "Sierra Club (5F61-DDF5).tsv"]
 
@@ -204,7 +208,7 @@ def test_import_never_overwrites(tmp_path):
     dest = tmp_path / "lists"
     dest.mkdir()
     (dest / "Drive F.tsv").write_text("existing\n", encoding="utf-8")
-    src = tmp_path / "f:photo.taken.dates.txt"
+    src = tmp_path / f"f{LEGACY}"
     _write_inventory(src, "/mnt/f", [])
     [(_, new)] = fpd.import_file_lists([src], dest, [])
     assert new.name == "Drive F (2).tsv"
@@ -276,8 +280,9 @@ def test_change_report_after_rescan(tmp_path, capsys):
 
 
 def test_change_report_groups_many_files_by_folder(capsys):
-    root = "/drive"
-    new = [(f"/drive/big/f{i}.jpg", 10 + i, 1) for i in range(40)] + [("/drive/x.jpg", 5, 1)]
+    root = os.path.abspath("/drive")  # C:\\drive on Windows
+    new = ([(os.path.join(root, "big", f"f{i}.jpg"), 10 + i, 1) for i in range(40)]
+           + [(os.path.join(root, "x.jpg"), 5, 1)])
     fpd.print_change_report(root, new, [], [])
     out = capsys.readouterr().out
     assert "New files: 41" in out

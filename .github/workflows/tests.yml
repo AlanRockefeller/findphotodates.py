@@ -45,6 +45,9 @@ jobs:
       - name: Install ExifTool (macOS)
         if: runner.os == 'macOS'
         run: brew install exiftool
+      - name: Install ExifTool (Windows)
+        if: runner.os == 'Windows'
+        run: choco install exiftool --yes --no-progress
       - name: Install pytest
         run: python -m pip install pytest
       - name: Run the tests

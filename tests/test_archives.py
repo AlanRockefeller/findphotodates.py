@@ -28,10 +28,11 @@ def _scan(root, output, monkeypatch, archives=fpd.DEFAULT_ARCHIVE_MODE, extensio
     monkeypatch.setattr(fpd, "ExifToolPersistent", NoExifTool)
     assert fpd.run_scan(str(root), str(output), extensions, quiet=True,
                         hash_options=fpd.parse_hash_args(hash_mode="off"), workers=1,
-                        min_image_size=0, reuse_other_lists=False, archives=archives)
+                        min_image_size=0, reuse_other_lists=False, archives=archives,
+                        path_style="auto")  # this host's style, as the menu uses
     with open(output, encoding="utf-8", newline="") as handle:
         lines = (line for line in handle if not line.startswith("#"))
-        return {r["filepath"][len(str(root)) + 1:]: r
+        return {r["filepath"][len(str(root)) + 1:].replace("\\", "/"): r
                 for r in csv.DictReader(lines, delimiter="\t")}
 
 

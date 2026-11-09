@@ -14,6 +14,7 @@ instead:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from collections import Counter
@@ -61,6 +62,8 @@ def find_lists(paths):
         folder = list_dir()
         found = sorted(folder.glob("*.tsv"), key=lambda p: p.name.lower())
         for pattern in _LEGACY_GLOBS:
+            if os.name == "nt" and ":" in pattern:
+                continue  # can't be in a Windows file name; pathlib reads "*:" as a drive
             found += sorted(Path.home().glob(pattern))
         return [p for p in found if p.name != "Drive health log.tsv"]
     found = []

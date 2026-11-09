@@ -24,3 +24,11 @@ def test_summary_of_new_and_old_lists(tmp_path, capsys):
     assert "1 inside archives" in ext
     for path in legacy:
         assert any(line.startswith(path.name[0] + " ") for line in out.splitlines())
+
+
+def test_default_lists_include_old_lists_in_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(df2.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(df2, "list_dir", lambda: tmp_path / "lists")
+    old = tmp_path / "g_photo.taken.dates.txt"
+    old.write_text("./x/y.jpg: 2016:01:03 18:03:43\n")
+    assert df2.find_lists([]) == [old]

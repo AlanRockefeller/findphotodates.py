@@ -36,6 +36,16 @@ _LEGACY_LIST_GLOBS = (
     "*:photo.taken.dates.tsv",
     "*_photo.taken.dates.tsv",
 )
+
+
+def _legacy_list_globs():
+    """The patterns that can match here. Windows file names can't contain ":",
+    and pathlib on Windows reads "*:..." as a drive and raises an error."""
+    if os.name == "nt":
+        return tuple(pattern for pattern in _LEGACY_LIST_GLOBS if ":" not in pattern)
+    return _LEGACY_LIST_GLOBS
+
+
 _PSEUDO_FSTYPES = {"tmpfs", "autofs", "overlay", "squashfs", "proc", "sysfs"}
 
 
@@ -569,7 +579,7 @@ def find_legacy_lists(folder=None):
     """Lists made by older versions (named like ~/f:photo.taken.dates.txt)."""
     folder = Path(folder) if folder else Path.home()
     found = []
-    for pattern in _LEGACY_LIST_GLOBS:
+    for pattern in _legacy_list_globs():
         for path in sorted(folder.glob(pattern)):
             if path not in found and read_inventory_header(path)[1]:
                 found.append(path)

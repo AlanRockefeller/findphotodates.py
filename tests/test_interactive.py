@@ -453,3 +453,15 @@ def test_unused_path_skips_paths_already_assigned(tmp_path):
     first = fpd._unused_path(tmp_path / "Card.tsv")
     second = fpd._unused_path(tmp_path / "Card.tsv", {first})
     assert first == tmp_path / "Card.tsv" and second == tmp_path / "Card (2).tsv"
+
+
+def test_legacy_patterns_on_windows_have_no_colon(monkeypatch):
+    # pathlib on Windows reads "*:photo..." as a drive and raises an error,
+    # which stopped the menu from starting.
+    import findphotodates_drives as drives
+
+    assert any(":" in pattern for pattern in drives._legacy_list_globs()) == (os.name != "nt")
+    monkeypatch.setattr(drives.os, "name", "nt")
+    patterns = drives._legacy_list_globs()
+    monkeypatch.undo()
+    assert patterns == ("*_photo.taken.dates.txt", "*_photo.taken.dates.tsv")

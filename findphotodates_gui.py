@@ -168,6 +168,9 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.results = {}
         self.generation = 0
         self.index_ready = False
+        # One index refresh at a time; events from an older refresh are ignored.
+        self.index_generation = 0
+        self._index_lock = threading.Lock()
         self.pending_search = False
         self.offset = 0
         self._after_id = None
@@ -334,17 +337,25 @@ class FileSearchDialog(ctk.CTkToplevel):
         )
 
     def _start_index(self):
+        self.index_generation += 1
+        generation = self.index_generation
         paths = [file_list.path for file_list in self.file_lists]
 
         def progress(number, total, name, rows):
-            self.events.put(("progress", number, total, name, rows))
+            self.events.put(("progress", generation, number, total, name, rows))
 
         def work():
-            try:
-                changed, total = self.index.refresh(paths, progress=progress)
-                self.events.put(("ready", changed, total, list(self.index.skipped)))
-            except Exception as exc:
-                self.events.put(("error", str(exc)))
+            # Two refreshes writing the same index at once can hit "database
+            # is locked", so a newer one waits for the one running to finish.
+            with self._index_lock:
+                if generation != self.index_generation:
+                    return  # the lists changed again; a newer refresh follows
+                try:
+                    changed, total = self.index.refresh(paths, progress=progress)
+                    self.events.put(("ready", generation, changed, total,
+                                     list(self.index.skipped)))
+                except Exception as exc:
+                    self.events.put(("error", generation, str(exc)))
         threading.Thread(target=work, daemon=True).start()
 
     def _schedule_search(self, event=None):
@@ -527,12 +538,14 @@ class FileSearchDialog(ctk.CTkToplevel):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
+                if kind in ("progress", "ready", "error") and event[1] != self.index_generation:
+                    continue  # from a refresh of lists since replaced
                 if kind == "progress":
-                    _, number, total, name, rows = event
+                    _, _generation, number, total, name, rows = event
                     detail = f" — {rows:,} files" if rows is not None else ""
                     self.status_var.set(f"Indexing {name} ({number}/{total}){detail}")
                 elif kind == "ready":
-                    _, changed, total, skipped = event
+                    _, _generation, changed, total, skipped = event
                     self.index_ready = True
                     self.search_btn.configure(state="normal")
                     action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
@@ -544,7 +557,7 @@ class FileSearchDialog(ctk.CTkToplevel):
                         self.pending_search = False
                         self._search()
                 elif kind == "error":
-                    self.status_var.set("Could not build the search index: " + event[1])
+                    self.status_var.set("Could not build the search index: " + event[2])
                 elif kind == "results":
                     _, generation, query, append, rows, more = event
                     if generation == self.generation:

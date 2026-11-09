@@ -60,7 +60,7 @@ def split_list_lines(lines):
                 lines = _chain(pending, lines)
             else:
                 yield next(csv.reader([record], delimiter="\t"))
-        else:
+        elif line.strip():  # blank lines (a hand edit, a cut-off write) aren't rows
             yield line.rstrip("\r\n").split("\t")
         line = next(lines, None)
 

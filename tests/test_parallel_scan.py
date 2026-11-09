@@ -2,6 +2,7 @@ import csv
 import io
 import os
 import signal
+import sys
 import threading
 import time
 from collections import Counter
@@ -10,6 +11,18 @@ from pathlib import Path
 import pytest
 
 import findphotodates as fpd
+
+
+def _press_ctrl_c():
+    """Interrupt this process as Ctrl-C in its terminal would.
+
+    On Windows os.kill(pid, SIGINT) ends the process at once (it calls
+    TerminateProcess), so the signal is raised inside the process instead,
+    which is how Windows delivers a console Ctrl-C to Python."""
+    if sys.platform == "win32":
+        signal.raise_signal(signal.SIGINT)
+    else:
+        os.kill(os.getpid(), signal.SIGINT)
 
 
 class FakeResponse:
@@ -546,7 +559,7 @@ def test_keyboard_interrupt_during_dispatch_writes_clean_partial_tsv(
 
     monkeypatch.setattr(fpd, "ExifToolPersistent", SlowExifTool)
     output = tmp_path / "partial.tsv"
-    timer = threading.Timer(0.16, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer = threading.Timer(0.16, _press_ctrl_c)
     timer.start()
     try:
         result = fpd.run_scan(
@@ -597,8 +610,8 @@ def test_repeated_keyboard_interrupt_during_cleanup_stays_friendly(
 
     monkeypatch.setattr(fpd, "ExifToolPersistent", SlowExifTool)
     output = tmp_path / "partial.tsv"
-    first = threading.Timer(0.08, lambda: os.kill(os.getpid(), signal.SIGINT))
-    second = threading.Timer(0.10, lambda: os.kill(os.getpid(), signal.SIGINT))
+    first = threading.Timer(0.08, _press_ctrl_c)
+    second = threading.Timer(0.10, _press_ctrl_c)
     first.start()
     second.start()
     try:
@@ -658,7 +671,7 @@ def test_second_keyboard_interrupt_can_abort_interrupted_save(
     monkeypatch.setattr(fpd, "ExifToolPersistent", SlowExifTool)
     monkeypatch.setattr(fpd, "_safe_write_inventory", interrupting_safe_write_inventory)
     output = tmp_path / "partial.tsv"
-    timer = threading.Timer(0.08, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer = threading.Timer(0.08, _press_ctrl_c)
     timer.start()
     try:
         result = fpd.run_scan(
@@ -790,16 +803,19 @@ def test_normal_shutdown_timeout_fails_and_returns_quickly(
     path.write_bytes(b"jpg")
 
     class HangingStopExifTool:
-        aborted = False
+        # Like ExifToolPersistent: stop() hangs, but abort() kills ExifTool,
+        # which ends a stop() in progress.
+        def __init__(self):
+            self.killed = threading.Event()
 
         def abort(self):
-            self.aborted = True
+            self.killed.set()
 
         def start(self):
             pass
 
         def stop(self):
-            time.sleep(0.6)
+            self.killed.wait(0.6)
 
         def batch_query(self, filepaths, fast2=False):
             return {

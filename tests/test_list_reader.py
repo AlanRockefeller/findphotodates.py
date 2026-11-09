@@ -33,6 +33,22 @@ def test_damaged_quoting_only_loses_that_line():
     assert ["/ok.jpg", "2"] in rows and ["/ok2.jpg", "3"] in rows
 
 
+def test_blank_lines_are_not_rows(tmp_path):
+    lines = ["filepath\tsize\n", "\n", "/a.jpg\t1\n", "\r\n", "\t\n", "/b.jpg\t2\n", "\n"]
+    assert list(split_list_lines(lines)) == [["filepath", "size"], ["/a.jpg", "1"],
+                                             ["/b.jpg", "2"]]
+    # A blank line inside a quoted name is part of the name.
+    quoted = ["filepath\tsize\n", '"/odd\n', "\n", 'name.jpg"\t3\n']
+    assert list(split_list_lines(quoted))[1] == ["/odd\n\nname.jpg", "3"]
+
+    path = _write(tmp_path / "list.tsv")
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        handle.write("\n\n")
+    index = InventorySearchIndex(tmp_path / "index.sqlite3")
+    _changed, total = index.refresh([path])
+    assert total == 2
+
+
 def test_coverage_search_and_reuse_all_read_the_odd_name(tmp_path):
     lists = tmp_path / "lists"
     lists.mkdir()

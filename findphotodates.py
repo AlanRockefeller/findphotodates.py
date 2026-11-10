@@ -5,6 +5,7 @@
 # Hashing is off by default for fast indexing. Use --hash sample to enable, or --add-hashes to fill in later.
 
 from pathlib import Path
+import errno
 import os
 import sys
 import subprocess
@@ -3150,10 +3151,14 @@ def run_scan(
     # the directory walk are collected in discovery.read_errors; these are the rest.
     read_problems = []  # (kind, path, is_io_error, message)
     unreadable_keys = set()  # cache keys of files that couldn't be read
+    # Alan 11/10/26 - Problems of kind "link" are symlinks the filesystem driver
+    # can't follow (e.g. WSL-made links on an NTFS drive mounted with ntfs3 give
+    # EINVAL). They hold no data, so they're counted apart, not as read errors.
     slow_batches = 0
     struggling = False
     shown_walk_problems = 0  # how many of discovery.read_errors have been printed
     shown_scan_problems = 0  # how many of read_problems have been printed
+    counted_live_problems = 0  # real problems (not unfollowable links) seen so far
     MAX_LIVE_READ_PROBLEMS = 20
 
     def _mark_done(key):
@@ -3163,7 +3168,10 @@ def run_scan(
             entry["_seen"] = True
 
     def _all_read_problems():
-        return list(discovery.read_errors) + read_problems
+        return [p for p in list(discovery.read_errors) + read_problems if p[0] != "link"]
+
+    def _unfollowable_links():
+        return [p for p in list(discovery.read_errors) + read_problems if p[0] == "link"]
 
     def _kept_old_rows(final):
         """Rows from the previous list to write back.
@@ -3503,21 +3511,28 @@ def run_scan(
 
         def _show_new_read_problems():
             """Print read problems as they happen, up to MAX_LIVE_READ_PROBLEMS."""
-            nonlocal shown_walk_problems, shown_scan_problems
+            nonlocal shown_walk_problems, shown_scan_problems, counted_live_problems
             walk_new = discovery.read_errors[shown_walk_problems:]
             scan_new = read_problems[shown_scan_problems:]
-            if not walk_new and not scan_new:
-                return
-            before = shown_walk_problems + shown_scan_problems
             shown_walk_problems += len(walk_new)
             shown_scan_problems += len(scan_new)
+            new = [p for p in walk_new + scan_new if p[0] != "link"]
+            if debug and not quiet:
+                for _k, path, _io, _m in (p for p in walk_new + scan_new if p[0] == "link"):
+                    _clear_progress_line()
+                    print(f"Skipping link that can't be followed: "
+                          f"{_relative_display(path, inventory_root)}")
+            if not new:
+                return
+            before = counted_live_problems
+            counted_live_problems += len(new)
             if quiet or before >= MAX_LIVE_READ_PROBLEMS:
                 return
             _clear_progress_line()
-            for kind, path, _io, message in (walk_new + scan_new)[: MAX_LIVE_READ_PROBLEMS - before]:
+            for kind, path, _io, message in new[: MAX_LIVE_READ_PROBLEMS - before]:
                 label = {"folder": "Can't open folder", "file": "Can't read"}.get(kind, "Can't read")
                 print(f"{label}: {_relative_display(path, inventory_root)} ({message})")
-            if shown_walk_problems + shown_scan_problems >= MAX_LIVE_READ_PROBLEMS:
+            if counted_live_problems >= MAX_LIVE_READ_PROBLEMS:
                 print(f"(More than {MAX_LIVE_READ_PROBLEMS} read problems; the rest will be "
                       "listed at the end and saved to a file.)")
 
@@ -3976,7 +3991,10 @@ def run_scan(
 
                 except OSError as e:
                     error_log.write(f"Warning: Could not access '{file}': {str(e)}\n")
-                    read_problems.append(("file", file, _is_io_error(e), e.strerror or str(e)))
+                    kind = "link" if is_symlink and e.errno == errno.EINVAL else "file"
+                    read_problems.append((kind, file, _is_io_error(e), e.strerror or str(e)))
+                    if kind == "link":
+                        continue
                     # Alan 9/28/26 - One unreadable file on a failing drive is not a
                     # disconnect; stop only if the drive itself is gone.
                     if _root_gone(inventory_root) and any(
@@ -4127,10 +4145,19 @@ def run_scan(
         _list_archive_contents(archives_found, cache, photo_data, _mark_done, extensions,
                                quiet)
 
+    def _report_unfollowable_links():
+        links = _unfollowable_links()
+        if links and not quiet:
+            print(_wrap(
+                f"Skipped {len(links):,} link(s) the drive's driver can't follow "
+                "(usually Linux-style links made by WSL on an NTFS drive). They hold no data "
+                "of their own; the files they point to are listed normally.", indent=""))
+
     total_seen = cached_count + processed_count
     if total_seen == 0 and not photo_data:  # files inside archives count too
         if not quiet:
             print("No files found.")
+            _report_unfollowable_links()
         cleanup_all()
         return True
 
@@ -4205,6 +4232,7 @@ def run_scan(
     problems = _all_read_problems()
     if problems:
         report_read_problems(problems, output, len(final_rows) - len(photo_data), quiet=quiet)
+    _report_unfollowable_links()
     cleanup_all()
 
     if perf_stats is not None:

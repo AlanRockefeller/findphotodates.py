@@ -469,6 +469,7 @@ def _find_files(directory, extensions, debug=False, errors=None, with_stat=False
         return
     with scan_it:
         for entry in scan_it:
+            is_link = False
             try:
                 is_link = entry.is_symlink()
                 is_dir_no_follow = entry.is_dir(follow_symlinks=False)
@@ -503,7 +504,10 @@ def _find_files(directory, extensions, debug=False, errors=None, with_stat=False
                                 (st,) if with_stat else ())
             except (PermissionError, OSError) as e:
                 if errors is not None:
-                    errors.append(("file", entry.path, _is_io_error(e), e.strerror or str(e)))
+                    # Alan 11/10/26 - A link the filesystem driver can't follow
+                    # (e.g. a WSL-made link on NTFS under ntfs3) is not a read error.
+                    kind = "link" if is_link and e.errno == errno.EINVAL else "file"
+                    errors.append((kind, entry.path, _is_io_error(e), e.strerror or str(e)))
                 continue
 
 

@@ -258,3 +258,95 @@ def test_ctrl_c_also_reports_read_problems(tmp_path, monkeypatch, capsys):
     assert "Read problems:" in after_interrupt
     assert "1 folder(s) couldn't be opened (Permission denied)" in after_interrupt
     assert "entries from the previous list were kept" not in after_interrupt
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks")
+def test_links_the_driver_cant_follow_are_skipped_not_read_errors(tmp_path, monkeypatch, capsys):
+    # ntfs3 shows WSL-made links as symlinks but fails reading them with EINVAL.
+    drive = tmp_path / "drive"
+    _make_tree(drive, NAMES)
+    os.symlink("0.txt", drive / "a" / "link1")
+    os.symlink("1.txt", drive / "a" / "link2")
+    real_realpath = os.path.realpath
+
+    def realpath(path, *args, **kwargs):
+        if os.path.basename(path).startswith("link"):
+            raise OSError(errno.EINVAL, "Invalid argument", path)
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    out = tmp_path / "list.tsv"
+    assert fpd.run_scan(str(drive), str(out), None, quiet=False) is not False
+    printed = capsys.readouterr().out
+    assert "Can't read" not in printed
+    assert "Read problems:" not in printed
+    assert "Skipped 2 link(s) the drive's driver can't follow" in printed
+    assert _rows(out) == set(NAMES)
+    assert not (tmp_path / "Read errors").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks")
+def test_links_that_fail_during_the_walk_are_skipped_not_read_errors(tmp_path, monkeypatch, capsys):
+    # On ntfs3 the walk itself fails: is_file(follow_symlinks=True) raises EINVAL.
+    drive = tmp_path / "drive"
+    _make_tree(drive, NAMES)
+    for i in range(25):  # more than the live cap, so a real error must still show
+        os.symlink("0.txt", drive / "a" / f"link{i}")
+    (drive / "b" / "bad.txt").write_text("x", encoding="utf-8")
+    _fake_ntfs3_scandir(monkeypatch)
+    out = tmp_path / "list.tsv"
+    assert fpd.run_scan(str(drive), str(out), None, quiet=False) is not False
+    printed = capsys.readouterr().out
+    assert "a/link" not in printed and "Can't read: a/" not in printed
+    assert "Can't read: b/bad.txt (Input/output error)" in printed
+    assert "1 file(s) couldn't be read" in printed
+    assert "Skipped 25 link(s) the drive's driver can't follow" in printed
+    report = next((tmp_path / "Read errors").iterdir()).read_text(encoding="utf-8")
+    assert "bad.txt" in report and "/link" not in report
+
+
+def _fake_ntfs3_scandir(monkeypatch):
+    """Make the directory walk behave like ntfs3 on WSL-made links: following
+    a "link*" symlink fails with EINVAL; "bad.txt" fails with an I/O error."""
+    import findphotodates_common as common
+    real_scandir = os.scandir
+
+    class Entry:
+        def __init__(self, entry):
+            self._e = entry
+
+        def __getattr__(self, name):
+            return getattr(self._e, name)
+
+        def is_file(self, follow_symlinks=True):
+            if self._e.name.startswith("link") and follow_symlinks:
+                raise OSError(errno.EINVAL, "Invalid argument")
+            if self._e.name == "bad.txt":
+                raise OSError(errno.EIO, "Input/output error")
+            return self._e.is_file(follow_symlinks=follow_symlinks)
+
+    class Scandir:
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+        def __iter__(self):
+            return (Entry(e) for e in self._it)
+
+    monkeypatch.setattr(common.os, "scandir", Scandir)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks")
+def test_health_read_check_skips_links_the_driver_cant_follow(tmp_path, monkeypatch):
+    _make_tree(tmp_path, ["a/0.txt"])
+    os.symlink("0.txt", tmp_path / "a" / "link0")
+    (tmp_path / "a" / "bad.txt").write_text("x", encoding="utf-8")
+    _fake_ntfs3_scandir(monkeypatch)
+    files, _bytes, errors, finished = fpd.read_every_file(str(tmp_path))
+    assert finished and files == 1
+    assert [os.path.basename(p) for p, _m in errors] == ["bad.txt"]

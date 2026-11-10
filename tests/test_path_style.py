@@ -5,7 +5,13 @@ import os
 import platform
 import tempfile
 
+import pytest
+
 import findphotodates as fpd
+
+# On Windows "/mnt/c/Photos" is a folder on the current drive, not drive C.
+posix_paths_only = pytest.mark.skipif(
+    os.name == "nt", reason="/mnt/<letter> paths are WSL paths, not Windows ones")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -162,7 +168,7 @@ class TestResolveOutputPathStyle:
         expected = "windows" if platform.system() == "Windows" else "linux"
         assert (
             fpd.resolve_output_path_style(
-                "auto", "/nonexistent.tsv", "/home/user/photos"
+                "auto", "/nonexistent.tsv", None  # no folder to infer a style from
             )
             == expected
         )
@@ -198,6 +204,7 @@ class TestWriteInventoryRoot:
         )
         assert not root_val.startswith("/")  # no bogus POSIX prefix
 
+    @posix_paths_only
     def test_linux_style_inventory_root_correct(self, tmp_path):
         out = str(tmp_path / "out.tsv")
         data = [("/mnt/c/Photos/a.jpg", "2023:01:01", 100, 0, "", "", "", "")]
@@ -233,6 +240,7 @@ class TestWriteInventoryRoot:
         assert "\\" in root_val
         assert "\\" in filepath
 
+    @posix_paths_only
     def test_windows_drive_root_inventory_root_and_rows_consistent(self, tmp_path):
         out = str(tmp_path / "out.tsv")
         data = [("/mnt/c/a.jpg", "", 100, 0, "", "", "", "")]
@@ -392,6 +400,7 @@ class TestOldFormat:
         assert "/home/" not in content
         assert "/tmp/" not in content
 
+    @posix_paths_only
     def test_old_format_linux_relative_paths_correct(self, tmp_path):
         out = str(tmp_path / "out.txt")
         data = [("/mnt/c/Photos/a.jpg", "2023:01:01 12:00:00", 100, 0, "", "", "", "")]
@@ -468,6 +477,6 @@ class TestFallbackBehavior:
 
     def test_auto_with_undetectable_everything_falls_back_to_platform(self, tmp_path):
         tsv = _make_tsv(["\t".join(fpd.TSV_COLUMNS)], path=str(tmp_path))
-        result = fpd.resolve_output_path_style("auto", tsv, "/home/user/photos")
+        result = fpd.resolve_output_path_style("auto", tsv, None)
         expected = "windows" if platform.system() == "Windows" else "linux"
         assert result == expected

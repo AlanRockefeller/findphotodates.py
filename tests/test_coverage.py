@@ -272,7 +272,7 @@ class CoverageTests(unittest.TestCase):
         plan = cov.plan_cleanup(self.connected_lists("Library", "Cards"),
                                 cov.CoverageSettings(), Path(self.folder) / "Cards.tsv")
         log = Path(self.folder) / "log.tsv"
-        with unittest.mock.patch.object(fp, "is_placeholder_stat", lambda st: True):
+        with unittest.mock.patch.object(cov, "is_placeholder_stat", lambda st: True):
             counts, _ = cov.run_cleanup(plan, log)
         self.assertEqual(counts["kept: other copy not found on disk"], 1)
         self.assertTrue((cards / "a.mp4").exists())
@@ -286,6 +286,64 @@ class CoverageTests(unittest.TestCase):
         drives = self.by_name(cov.build_coverage(fp.find_file_lists(self.folder),
                                                  cov.CoverageSettings()))
         self.assertEqual(drives["Phone"].total.files, 2)
+
+    def test_lists_of_the_same_drive_are_not_copies_of_each_other(self):
+        rows = [("Photos/P1.ORF", "2025:01:01 00:00:00", 10)]
+        # An old list and a new one for the same drive (same serial)...
+        write_list(self.folder, "Ext old", "/mnt/e", rows, volume_id="AAAA-BBBB")
+        write_list(self.folder, "Ext (AAAA-BBBB)", "/run/media/me/Ext", rows,
+                   label="Ext", volume_id="AAAA-BBBB")
+        # ...and a list of one folder on another drive that also has a whole-drive list.
+        write_list(self.folder, "Other", "/run/media/me/Other",
+                   [("Photos/P2.ORF", "2025:01:01 00:00:01", 20)], volume_id="CCCC-DDDD")
+        write_list(self.folder, "Other photos", "/run/media/me/Other/Photos",
+                   [("P2.ORF", "2025:01:01 00:00:01", 20)])
+        lists = self.lists()
+        groups = dict(zip((fl.path.stem for fl in lists), cov.same_drive_groups(lists)))
+        self.assertEqual(groups["Ext old"], groups["Ext (AAAA-BBBB)"])
+        self.assertEqual(groups["Other"], groups["Other photos"])
+        self.assertNotEqual(groups["Ext old"], groups["Other"])
+        drives = self.by_name(cov.build_coverage(lists, cov.CoverageSettings(), today=TODAY))
+        for name in ("Ext", "Ext old", "Other", "Other photos"):
+            self.assertEqual(drives[name].only_copy.files, 1, name)
+
+    def test_cleanup_never_counts_another_list_of_the_same_drive(self):
+        cards = self.make_drive("Cards", {"dump/a.mp4": ("2020:01:01 00:00:00", 20)})
+        # An old list of the same card, recorded as if the file were in a keep folder.
+        write_list(self.folder, "Cards old", str(cards / "dump"),
+                   [("Important/a.mp4", "2020:01:01 00:00:00", 20)])
+        for path in Path(self.folder).glob("Cards*.tsv"):
+            text = path.read_text().replace("# inventory_root=", "# volume_ids=EEEE-FFFF\n"
+                                            "# inventory_root=", 1)
+            path.write_text(text)
+        plan = cov.plan_cleanup(self.connected_lists("Cards"), cov.CoverageSettings(),
+                                Path(self.folder) / "Cards.tsv")
+        self.assertEqual(plan.items, [])
+        self.assertTrue((cards / "dump/a.mp4").exists())
+
+    def test_cleanup_keeps_a_file_whose_kept_copy_is_itself(self):
+        cards = self.make_drive("Cards", {"a.mp4": ("2020:01:01 00:00:00", 20)})
+        alias = Path(self.folder) / "alias.mp4"
+        os.link(cards / "a.mp4", alias)  # the same file under another name
+        plan = cov.CleanupPlan("Cards", items=[
+            cov.CleanupItem(str(cards / "a.mp4"), 20, "", [(str(alias), True)])])
+        counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv")
+        self.assertEqual(counts["kept: other copy not found on disk"], 1)
+        self.assertTrue((cards / "a.mp4").exists())
+
+    def test_cleanup_can_compare_contents_before_deleting(self):
+        library = self.make_drive("Library", {"Important/a.mp4": ("2020:01:01 00:00:00", 20),
+                                              "Important/b.mp4": ("2020:01:01 00:00:01", 21)})
+        cards = self.make_drive("Cards", {"a.mp4": ("2020:01:01 00:00:00", 20),
+                                          "b.mp4": ("2020:01:01 00:00:01", 21)})
+        (library / "Important/b.mp4").write_bytes(b"z" * 21)  # same size, other contents
+        plan = cov.plan_cleanup(self.connected_lists("Library", "Cards"),
+                                cov.CoverageSettings(), Path(self.folder) / "Cards.tsv")
+        counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv", compare_contents=True)
+        self.assertEqual(counts["deleted"], 1)
+        self.assertEqual(counts["kept: other copy's contents differ"], 1)
+        self.assertTrue((cards / "b.mp4").exists())
+        self.assertFalse((cards / "a.mp4").exists())
 
     def test_cleanup_requires_connected_target(self):
         self.make_drive("Cards", {"a.mp4": ("", 20)})
@@ -303,6 +361,7 @@ class CoverageTests(unittest.TestCase):
                                     cov.CoverageSettings(), Path(self.folder) / "Cards.tsv")
             counts, _ = cov.run_cleanup(plan, Path(self.folder) / "log.tsv")
             self.assertEqual(counts["deleted"], 1)
+            self.assertEqual(os.stat(cards / "card").st_mode & 0o777, 0o555)  # read-only again
         finally:
             os.chmod(cards / "card", 0o755)
 

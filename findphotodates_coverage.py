@@ -20,6 +20,22 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from findphotodates_common import (
+    _root_cache_prefix,
+    compute_samplehash_v1,
+    is_placeholder_stat,
+    load_config,
+    split_list_lines,
+    update_config,
+)
+from findphotodates_drives import (
+    default_inventory_dir,
+    detect_drives,
+    find_file_lists,
+    match_lists_to_drives,
+)
+from findphotodates_health import read_health_log
+
 PHOTO_EXTENSIONS = frozenset({
     "jpg", "jpeg", "nef", "orf", "cr2", "cr3", "arw", "dng", "rw2", "raf", "srw",
     "pef", "x3f", "tif", "tiff", "heic", "heif", "psd", "png", "webp", "avif", "jxl",
@@ -129,16 +145,8 @@ def relative_path(path, root):
 
 
 def _split_rows(handle):
-    """Data rows of a list as lists of fields, header row first. Plain tab
-    splitting is several times faster than csv; csv is used only for the rare
-    line with quoted fields."""
-    for line in handle:
-        if line.startswith("#"):
-            continue
-        if '"' in line:
-            yield next(csv.reader([line], delimiter="\t"))
-        else:
-            yield line.rstrip("\r\n").split("\t")
+    """Data rows of a list as lists of fields, header row first."""
+    return split_list_lines(handle)
 
 
 def iter_media(path):
@@ -404,6 +412,46 @@ def backblaze_status(coverage, history_days, today):
             f"its backup for {left} more days.")
 
 
+def same_drive_groups(file_lists):
+    """A group number for each list; lists with the same number describe the
+    same drive, so they never count as copies of each other. That happens with
+    an old and a new list for one drive, or a list of one folder on a drive
+    that also has a whole-drive list.
+
+    Lists are on the same drive when they share a volume ID, or record the same
+    root without having different IDs. A folder list (no volume ID) belongs to
+    the whole-drive list whose root holds it.
+    """
+    lists = list(file_lists)
+    group = list(range(len(lists)))
+
+    def find(i):
+        while group[i] != i:
+            group[i] = group[group[i]]
+            i = group[i]
+        return i
+
+    def join(a, b):
+        group[find(a)] = find(b)
+
+    ids = [set(fl.volume_ids) for fl in lists]
+    roots = [_root_cache_prefix(fl.root) if fl.root else "" for fl in lists]
+    for i in range(len(lists)):
+        for j in range(i + 1, len(lists)):
+            if ids[i] & ids[j]:
+                join(i, j)
+            elif roots[i] and roots[i] == roots[j] and not (ids[i] and ids[j]):
+                join(i, j)
+    for i in range(len(lists)):
+        if ids[i] or not roots[i]:
+            continue
+        holders = [j for j in range(len(lists)) if j != i and ids[j] and roots[j]
+                   and roots[i].startswith(roots[j])]
+        if holders:
+            join(i, max(holders, key=lambda j: len(roots[j])))
+    return [find(i) for i in range(len(lists))]
+
+
 def build_coverage(file_lists, settings, health_rows=(), today=None, progress=None):
     """Coverage of every file list. Returns [DriveCoverage], most at risk first.
 
@@ -420,6 +468,10 @@ def build_coverage(file_lists, settings, health_rows=(), today=None, progress=No
             keep_mask |= 1 << index
         elif coverage.role == ROLE_GONE:
             gone_mask |= 1 << index
+    # Bits of every list describing the same drive as each list (itself included).
+    groups = same_drive_groups(lists)
+    same_drive = [sum(1 << j for j, g in enumerate(groups) if g == groups[i])
+                  for i in range(len(lists))]
 
     # (name, size) -> {date or "": bitmask of lists holding a real copy}
     index_by_key = defaultdict(dict)
@@ -442,7 +494,7 @@ def build_coverage(file_lists, settings, health_rows=(), today=None, progress=No
             progress(len(lists) + number + 1, total_steps, coverage.name)
         if coverage.role == ROLE_GONE:
             continue
-        bit = 1 << number
+        own_drive = same_drive[number]
         for _, relative, name, size, date, _, _, placeholder, _ in _media_tuples(fl.path):
             coverage.total.add(size)
             if placeholder:
@@ -455,7 +507,7 @@ def build_coverage(file_lists, settings, health_rows=(), today=None, progress=No
                 holders = 0
                 for mask in dates.values():
                     holders |= mask
-            others = holders & ~bit
+            others = holders & ~own_drive
             if others & keep_mask:
                 coverage.safe.add(size)
             elif others:
@@ -605,7 +657,11 @@ def plan_cleanup(file_lists, settings, target, keep_folders=DEFAULT_KEEP_FOLDERS
     roles = {d.list_path: d.role for d in
              build_roles(lists, settings, health_rows)}
     kept = defaultdict(list)  # (name, size) -> [(date, mtime, path, connected)]
-    others = [fl for fl in lists if fl is not target_fl and roles[fl.path] == ROLE_KEEP]
+    # Another list of the same drive holds the very files being deleted.
+    groups = same_drive_groups(lists)
+    target_group = groups[lists.index(target_fl)]
+    others = [fl for fl, group in zip(lists, groups)
+              if group != target_group and roles[fl.path] == ROLE_KEEP]
     for number, fl in enumerate(others, 1):
         if progress:
             progress(number, len(others) + 1, list_display_name(fl))
@@ -662,7 +718,8 @@ CLEANUP_LOG_COLUMNS = ["time", "status", "deleted", "size", "date_taken", "kept 
 
 def _remove(path):
     """Delete a file, clearing a read-only flag on it or its folder if that's
-    what stands in the way (common on folders copied from camera cards)."""
+    what stands in the way (common on folders copied from camera cards). A
+    folder made writable this way is made read-only again afterwards."""
     import os
     import stat
 
@@ -670,20 +727,32 @@ def _remove(path):
         os.remove(path)
     except PermissionError:
         folder = os.path.dirname(path)
-        os.chmod(folder, os.stat(folder).st_mode | stat.S_IWUSR)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
-        os.remove(path)
+        folder_mode = os.stat(folder).st_mode
+        os.chmod(folder, folder_mode | stat.S_IWUSR)
+        try:
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+            os.remove(path)
+        finally:
+            os.chmod(folder, stat.S_IMODE(folder_mode))
 
 
-def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
+# compare_contents reads this much from the start, middle and end of each file.
+_COMPARE_CHUNK_BYTES = 64 * 1024
+_COMPARE_CHUNKS = 3
+
+
+def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None,
+                compare_contents=False):
     """Delete the plan's duplicates. Each kept copy is checked on disk first
     (same size) when its drive is connected; when it isn't, the file is kept
-    unless *trust_lists* is True. Every file is logged. Returns a Counter of
-    statuses and the bytes freed."""
+    unless *trust_lists* is True. With *compare_contents*, a few small pieces
+    of the file and its connected kept copy must also be identical. Every file
+    is logged. Returns a Counter of statuses and the bytes freed."""
     import os
     import time
 
-    from findphotodates import is_placeholder_stat
+    def fingerprint(path):
+        return compute_samplehash_v1(path, _COMPARE_CHUNK_BYTES, _COMPARE_CHUNKS, "blake2b")
 
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -696,28 +765,43 @@ def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
         for number, item in enumerate(plan.items, 1):
             if stop is not None and stop.is_set():
                 break
+            try:
+                current_stat = os.stat(item.path)
+                current = current_stat.st_size
+            except OSError:
+                current_stat = current = None
             keep = None
+            contents_differ = False
+            own_fingerprint = None
             for kept_path, connected in item.kept:
                 if connected:
                     try:
                         kept_stat = os.stat(kept_path)
                     except OSError:
                         continue
-                    # A copy that's now only in the cloud doesn't count.
-                    if kept_stat.st_size == item.size and not is_placeholder_stat(kept_stat):
+                    # A copy that's now only in the cloud doesn't count, and
+                    # neither does the file itself reached by another path.
+                    same_file = current_stat is not None and (
+                        (kept_stat.st_dev, kept_stat.st_ino)
+                        == (current_stat.st_dev, current_stat.st_ino))
+                    if (kept_stat.st_size == item.size and not same_file
+                            and not is_placeholder_stat(kept_stat)):
+                        if compare_contents and current_stat is not None:
+                            own_fingerprint = own_fingerprint or fingerprint(item.path)
+                            if not own_fingerprint or fingerprint(kept_path) != own_fingerprint:
+                                contents_differ = True
+                                continue
                         keep = kept_path
                         break
                 elif trust_lists:
                     keep = kept_path
                     break
-            try:
-                current = os.path.getsize(item.path)
-            except OSError:
-                current = None
             if current is None:
                 status = "already gone"
             elif current != item.size:
                 status = "kept: size changed since the list was made"
+            elif keep is None and contents_differ:
+                status = "kept: other copy's contents differ"
             elif keep is None:
                 status = ("kept: other copy not found on disk"
                           if any(c for _, c in item.kept) else
@@ -736,3 +820,59 @@ def run_cleanup(plan, log_path, trust_lists=False, progress=None, stop=None):
             if progress and (number % 200 == 0 or number == len(plan.items)):
                 progress(number, len(plan.items), freed)
     return counts, freed
+
+
+# --- Settings and the report, for the menu, the GUI and --coverage -------------
+def _coverage_settings():
+    return CoverageSettings.from_config(load_config())
+
+
+def update_coverage_settings(change):
+    """Apply change(settings) to the saved coverage settings (see update_config).
+    If change() returns False, nothing is saved. Returns the settings."""
+    result = {}
+
+    def apply(config):
+        settings = CoverageSettings.from_config(config)
+        result["settings"] = settings
+        if change(settings) is False:
+            return False
+        settings.to_config(config)
+        return None
+
+    update_config(apply)
+    return result["settings"]
+
+
+def remember_connected_drives(lists):
+    """Record today as the last day each listed drive was seen connected
+    (used for the Backblaze reminder in the coverage report)."""
+    try:
+        update_coverage_settings(lambda settings: record_connected(settings, lists))
+    except (Exception, SystemExit):  # an unreadable or unwritable config raises SystemExit
+        pass  # a reminder date is never worth interrupting the user for
+
+
+def coverage_for(lists=None, list_dir=None, progress=None):
+    """(drives, settings) for every file list; connected drives are matched first."""
+    if lists is None:
+        lists = find_file_lists(list_dir or default_inventory_dir())
+        match_lists_to_drives(lists, detect_drives())
+        remember_connected_drives(lists)
+    settings = _coverage_settings()
+    drives = build_coverage(lists, settings, read_health_log(list_dir), progress=progress)
+    return drives, settings
+
+
+def print_coverage_report(history_days=None, report=True, lists=None, list_dir=None):
+    if history_days is not None:
+        update_coverage_settings(
+            lambda settings: setattr(settings, "backblaze_history_days", history_days))
+        print(f"Backblaze version history set to {BACKBLAZE_HISTORY_CHOICES[history_days]}.")
+    if not report:
+        return None
+    print("Comparing every file list (this reads the lists, not the drives)...")
+    drives, settings = coverage_for(lists, list_dir)
+    print()
+    print(format_report(drives, settings))
+    return drives

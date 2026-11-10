@@ -213,7 +213,7 @@ The output is `dist/FindPhotoDates/` on Linux and Windows, or `dist/FindPhotoDat
 
 ## Requirements
 
-- Python 3.x
+- Python 3.10 or newer
 - **ExifTool** must be installed and available on your system PATH. Run `exiftool -ver` to verify. This applies on Linux, macOS, WSL, **and** native Windows.
 - Scans that need ExifTool fail fast if the `exiftool` command cannot be started, rather than writing blank EXIF/date fields for every media file.
 - (Optional) `blake3` library for faster hashing (`pip install blake3`)
@@ -225,7 +225,7 @@ The output is `dist/FindPhotoDates/` on Linux and Windows, or `dist/FindPhotoDat
    - **macOS:** `brew install exiftool`
    - **Ubuntu/Debian / WSL:** `sudo apt-get install libimage-exiftool-perl`
    - **Windows:** Download from [ExifTool website](https://exiftool.org/) and add to PATH. Verify with `exiftool -ver` in PowerShell or Command Prompt.
-2. **Download scripts:** Download `findphotodates.py` and `check_photo_backups.py`.
+2. **Download the program:** Download or clone the whole repository. `findphotodates.py` needs the `findphotodates_*.py` files next to it (shared helpers, drives, drive health, the menu and the coverage report); `check_photo_backups.py` and `df2.py` work best beside them too.
 3. **Make executable (Linux/macOS/WSL):** `chmod +x findphotodates.py check_photo_backups.py`
    On Windows, run with `python findphotodates.py`.
 

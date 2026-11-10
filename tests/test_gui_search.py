@@ -199,6 +199,19 @@ class InventorySearchTests(unittest.TestCase):
         with self.assertRaisesRegex(SearchQueryError, "quote"):
             compile_query('location:"New York')
 
+    def test_modified_dates_mean_whole_days(self):
+        import datetime
+
+        day = datetime.datetime.fromtimestamp(1719766800).date()  # Sunset's local day
+        sunset = "/photos/New York/Sunset.JPG"
+        self.assertIn(sunset, paths(self.index, f"modified={day}"))
+        self.assertIn(sunset, paths(self.index, f"modified<={day}"))
+        self.assertIn(sunset, paths(self.index, f"modified>={day}"))
+        self.assertNotIn(sunset, paths(self.index, f"modified>{day}"))
+        self.assertNotIn(sunset, paths(self.index, f"modified<{day}"))
+        self.assertNotIn(sunset, paths(self.index, f"modified!={day}"))
+        self.assertNotIn(sunset, paths(self.index, f"modified={day + datetime.timedelta(1)}"))
+
     def test_photo_day_input_is_normalized_and_validated(self):
         self.assertEqual(normalize_photo_day("2024-06-30"), "2024-06-30")
         self.assertEqual(normalize_photo_day("06/30/2024"), "2024-06-30")

@@ -32,7 +32,7 @@ import csv
 import hashlib
 import os
 import re
-
+import stat as _stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -492,6 +492,80 @@ def classify_safe_to_delete(safety: str) -> bool:
     return safety in SAFE_SAFETY_VALUES
 
 
+# Photo and video types checked by default (the same set findphotodates.py reads
+# dates from), plus Photoshop files.
+DEFAULT_EXTS = (
+    "jpg,jpeg,png,tif,tiff,heic,heif,webp,avif,jxl,psd,"
+    "orf,nef,arw,dng,cr2,cr3,raf,rw2,srw,pef,x3f,"
+    "mp4,mov,avi,mkv,wmv,flv,webm,m4v,3gp,mts,m2ts,ts,vob,mpg,mpeg"
+)
+# Files that are never worth keeping, so they don't stop a folder from being
+# safe to delete. Anything else that isn't checked (sidecar .xmp edits, notes,
+# documents) does.
+_JUNK_NAMES = frozenset({"thumbs.db", "desktop.ini", ".ds_store", "ehthumbs.db"})
+
+
+def _is_junk_file(name: str) -> bool:
+    lower = name.lower()
+    return lower in _JUNK_NAMES or lower.startswith("._")
+
+
+def _path_key(path: str) -> str:
+    """A path in one comparable form: forward slashes, Windows drive letters as
+    /mnt/<letter>/ (as WSL shows them), case-folded on Windows drives, which
+    ignore case."""
+    text = str(path).replace("\\", "/")
+    match = re.match(r"^([A-Za-z]):(/|$)", text)
+    if match:
+        text = f"/mnt/{match.group(1).lower()}/" + text[len(match.group(0)):]
+    if re.match(r"^/mnt/[A-Za-z](/|$)", text):
+        text = text.casefold()
+    return text.rstrip("/") + "/"
+
+
+def safe_folders(dir_stats, unsafe_dirs, target_dir):
+    """Folders whose whole tree can be deleted: every file in them and in their
+    subfolders is safe to delete (or junk), and nothing in them was left
+    unchecked or couldn't be read. Only the top-most such folders are returned,
+    since deleting a folder deletes its subfolders too."""
+    blocked = set(unsafe_dirs)
+    for folder, stats in dir_stats.items():
+        if stats["total"] != stats["found_safe"]:
+            blocked.add(folder)
+    # A blocked folder blocks every folder above it, up to the target.
+    for folder in list(blocked):
+        for parent in folder.parents:
+            if parent in blocked or not (parent == target_dir or target_dir in parent.parents):
+                break
+            blocked.add(parent)
+    candidates = [d for d, s in dir_stats.items() if d not in blocked and s["found_safe"]]
+    # Folders with no checked files of their own (e.g. year folders holding day
+    # folders) can be safe too, when everything below them is.
+    for folder in list(candidates):
+        for parent in folder.parents:
+            if parent in blocked or not (parent == target_dir or target_dir in parent.parents):
+                break
+            if parent not in dir_stats:
+                candidates.append(parent)
+    chosen = set(candidates)
+    return sorted(d for d in chosen if not any(p in chosen for p in d.parents))
+
+
+def target_drive(target_dir: Path) -> Optional[Tuple[str, str]]:
+    """(volume ID, mount point) of the connected drive holding *target_dir*, or
+    None. Lets the target's own drive be recognized in its file list even when
+    the drive was mounted somewhere else when that list was made."""
+    try:
+        from findphotodates import _mount_root, identify_drive
+
+        drive = identify_drive(_mount_root(str(target_dir)))
+    except (Exception, SystemExit):  # missing module, unreadable config, no tools
+        return None
+    if drive is None or not drive.volume_id:
+        return None
+    return drive.volume_id, drive.mount
+
+
 def default_list_dir() -> Path:
     """Folder where findphotodates.py keeps file lists (Documents/findphotodates)."""
     try:
@@ -519,8 +593,10 @@ def main() -> int:
     )
     ap.add_argument(
         "--exts",
-        default="jpg,jpeg,png,tif,tiff,orf,nef,arw,dng,cr2,cr3,raf,heic,mp4,mov",
-        help="Comma-separated extensions",
+        default=DEFAULT_EXTS,
+        help="Comma-separated extensions to check (default: common photo and video types). "
+        "Folders holding other files (except Thumbs.db and the like) aren't listed as safe "
+        "to delete.",
     )
     ap.add_argument(
         "--out-csv", default="backup_check_report.csv", help="CSV report path"
@@ -680,6 +756,20 @@ def main() -> int:
             return None
         return None
 
+    # Files inside the folder being checked are the files being checked: a file
+    # can't be its own backup (or a copy kept in a folder about to be deleted).
+    target_key = _path_key(str(target_dir))
+    inside_target = 0
+    own_drive = target_drive(target_dir)
+    target_in_drive = ""  # the target's path inside its drive, e.g. "Users/me/Pictures"
+    if own_drive:
+        try:
+            target_in_drive = target_dir.relative_to(own_drive[1]).as_posix()
+            if target_in_drive == ".":
+                target_in_drive = ""
+        except ValueError:
+            own_drive = None
+
     print(f"Loading {len(inv_files)} inventory file(s)...")
     for inv in inv_files:
         inv = inv.expanduser().resolve()
@@ -688,6 +778,7 @@ def main() -> int:
         drive = drive_label_from_inventory_filename(inv)
         kept, hashes_found_in_inv, inv_headers = 0, 0, {}
         current_inv_cfg: Optional[InvHashConfig] = None  # resolved once per inventory
+        own_keys: Optional[Tuple[str, ...]] = None  # where the target is in this list
 
         for (
             filepath,
@@ -701,6 +792,14 @@ def main() -> int:
             # Parse config on first row (headers are stable for the whole file)
             if current_inv_cfg is None:
                 current_inv_cfg = _parse_inv_hash_config(headers)
+            if own_keys is None:
+                own_keys = (target_key,)
+                ids = [i for i in headers.get("volume_ids", "").split(",") if i]
+                root = headers.get("inventory_root", "")
+                if own_drive and root and own_drive[0] in ids:
+                    # This is the list of the target's own drive, which may have
+                    # been mounted somewhere else when the list was made.
+                    own_keys += (_path_key(root.rstrip("/\\") + "/" + target_in_drive),)
 
             display_path = resolve_inventory_display_path(
                 filepath, headers.get("inventory_root") or drive_map.get(drive)
@@ -709,6 +808,9 @@ def main() -> int:
             # Normalize to forward slashes for cross-platform regex matching
             match_path = display_path.replace(os.sep, "/").replace("\\", "/")
             if exclude_re.search(match_path):
+                continue
+            if _path_key(display_path).startswith(own_keys):
+                inside_target += 1
                 continue
 
             # Use forward slashes so os.path.basename works on Windows paths read on POSIX
@@ -758,6 +860,12 @@ def main() -> int:
             )
             break
 
+    if inside_target and not args.quiet:
+        print(
+            f"Ignored {inside_target:,} inventory entries inside {target_dir} itself: "
+            "a file there can't be the backup of a file there."
+        )
+
     if not inv_hash_configs and args.hash_mode != "off" and not args.quiet:
         print(
             "Note: No hash-bearing inventories loaded; no verification hashes will be computed."
@@ -789,12 +897,38 @@ def main() -> int:
     target_hashes: Dict[Path, List[Tuple[InvHashConfig, str]]] = {}
     print(f"Scanning target: {target_dir}")
 
-    for p in target_dir.rglob("*"):
-        if not is_photo_like(p, exts):
-            continue
+    # Folders holding something that wasn't checked (another file type, a file
+    # or folder that couldn't be read) are never listed as safe to delete.
+    unsafe_dirs: Set[Path] = set()
+    unchecked_files = 0
+    unreadable: List[str] = []
+
+    def _on_walk_error(err: OSError) -> None:
+        unreadable.append(f"{err.filename}: {err.strerror or err}")
+        if err.filename:
+            unsafe_dirs.add(Path(err.filename))
+
+    def _target_files():
+        nonlocal unchecked_files
+        for folder, dirnames, filenames in os.walk(target_dir, onerror=_on_walk_error):
+            dirnames.sort()
+            folder_path = Path(folder)
+            for name in sorted(filenames):
+                if Path(name).suffix.lower().lstrip(".") in exts:
+                    yield folder_path / name
+                elif not _is_junk_file(name):
+                    unchecked_files += 1
+                    unsafe_dirs.add(folder_path)
+
+    for p in _target_files():
         try:
             st = p.stat()
-        except OSError:
+        except OSError as exc:
+            unreadable.append(f"{p}: {exc.strerror or exc}")
+            unsafe_dirs.add(p.parent)
+            continue
+        if not _stat.S_ISREG(st.st_mode):
+            unsafe_dirs.add(p.parent)
             continue
         base, date_taken = p.name.lower(), ""
         if p.suffix.lower() in (".jpg", ".jpeg"):
@@ -1041,18 +1175,36 @@ def main() -> int:
                 f"Note: {metadata_matched_but_not_hashed} files matched by metadata but weren't hashed (rerun with --hash-mode compute)."
             )
 
-        safe_dirs = [d for d, s in dir_stats.items() if s["total"] == s["found_safe"]]
+        if unchecked_files:
+            print(
+                f"\n{unchecked_files:,} other files (not {', '.join(sorted(exts)[:6])}...) "
+                "weren't checked; folders holding them aren't listed as safe to delete."
+            )
+        if unreadable:
+            print(f"\n{len(unreadable):,} files or folders couldn't be read:")
+            for line in unreadable[:10]:
+                print(f"  {line}")
+
+        safe_dirs = safe_folders(dir_stats, unsafe_dirs, target_dir)
+
+        def tree_totals(folder: Path) -> Tuple[int, int]:
+            files = size = 0
+            for d, s in dir_stats.items():
+                if d == folder or folder in d.parents:
+                    files += s["total"]
+                    size += s["size_safe"]
+            return files, size
+
+        totals = {d: tree_totals(d) for d in safe_dirs}
         if args.sort:
-            safe_dirs.sort(key=lambda x: dir_stats[x]["size_safe"], reverse=True)
-        else:
-            safe_dirs.sort()
+            safe_dirs.sort(key=lambda x: totals[x][1], reverse=True)
         if safe_dirs:
             print(f"\n=== Directories safe to delete ({len(safe_dirs)}) ===")
+            print("(Every photo and video in each one, including its subfolders, is safely backed up.)")
             for d in safe_dirs:
                 rel = d.relative_to(target_dir) if d != target_dir else Path(".")
-                print(
-                    f"  {rel}/  ({dir_stats[d]['total']} files, {human_readable_size(dir_stats[d]['size_safe'])})"
-                )
+                files, size = totals[d]
+                print(f"  {rel}/  ({files} files, {human_readable_size(size)})")
     return 1 if missing else 0
 
 

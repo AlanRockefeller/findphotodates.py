@@ -161,20 +161,20 @@ def _failing_log(tmp_path, health="FAILING", pending="2440", volume_ids="8A54-01
     path.write_text("\t".join(cols) + "\n" + "\t".join(row[c] for c in cols) + "\n", encoding="utf-8")
 
 
-def test_health_warning_before_scanning_a_failing_drive(tmp_path, monkeypatch, capsys):
+def test_health_warning_before_scanning_a_failing_drive(tmp_path, monkeypatch, capsys, patch_everywhere):
     drive_dir = tmp_path / "Crime Pays"
     _make_tree(drive_dir, ["a.txt"])
     _failing_log(tmp_path)
-    monkeypatch.setattr(fpd, "default_inventory_dir", lambda: tmp_path)
-    monkeypatch.setattr(fpd, "identify_drive",
-                        lambda path: fpd.DriveInfo(str(drive_dir), "Crime Pays", "8a54-01d8"))
+    patch_everywhere("default_inventory_dir", lambda: tmp_path)
+    patch_everywhere("identify_drive",
+                     lambda path: fpd.DriveInfo(str(drive_dir), "Crime Pays", "8a54-01d8"))
     assert fpd.run_scan(str(drive_dir), str(tmp_path / "out.tsv"), None, quiet=False) is not False
     printed = capsys.readouterr().out
     assert "this drive was rated FAILING: 2,440 sector(s) are unreadable" in " ".join(printed.split())
 
 
-def test_no_warning_for_minor_or_other_drives(tmp_path, monkeypatch):
-    monkeypatch.setattr(fpd, "default_inventory_dir", lambda: tmp_path)
+def test_no_warning_for_minor_or_other_drives(tmp_path, monkeypatch, patch_everywhere):
+    patch_everywhere("default_inventory_dir", lambda: tmp_path)
     drive = fpd.DriveInfo("/x", "Lightroom", "768C-FB5E")
     _failing_log(tmp_path, health="WARNING", pending="0", volume_ids="768C-FB5E", drive="Lightroom")
     assert fpd._troubling_health_record("/x", drive) is None  # e.g. one cable error
@@ -200,11 +200,11 @@ def test_old_health_log_gets_new_columns(tmp_path):
     assert rows[1]["volume_ids"] == "1234-ABCD"
 
 
-def test_health_targets_follow_main_menu_order(monkeypatch):
+def test_health_targets_follow_main_menu_order(monkeypatch, patch_everywhere):
     targets = [fpd.HealthTarget("/dev/sdb", "Z", mounts=["/run/media/u/Zed"]),
                fpd.HealthTarget("/dev/sdc", "Unmounted"),
                fpd.HealthTarget("/dev/nvme1n1", "C", mounts=["/mnt/c"])]
-    monkeypatch.setattr(fpd, "_detect_health_targets", lambda: targets)
+    patch_everywhere("_detect_health_targets", lambda: targets)
     assert [t.name for t in fpd.detect_health_targets()] == ["C", "Z", "Unmounted"]
 
 

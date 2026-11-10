@@ -10,6 +10,8 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from findphotodates_common import split_list_lines
+
 SCHEMA_VERSION = 1
 SEARCH_FIELDS = (
     "filepath",
@@ -165,6 +167,31 @@ def _parse_timestamp(value):
         )
 
 
+def _day_bounds_ns(value):
+    """(start, end) in nanoseconds of a local calendar day written YYYY-MM-DD, or None."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return None
+    try:
+        day = _datetime.date.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    start = _datetime.datetime.combine(day, _datetime.time()).astimezone()
+    # The next midnight, not start + 24 hours: a day can be 23 or 25 hours long.
+    end = _datetime.datetime.combine(day + _datetime.timedelta(days=1), _datetime.time()).astimezone()
+    return int(start.timestamp() * 1_000_000_000), int(end.timestamp() * 1_000_000_000)
+
+
+# A whole day for modified=2024-06-30 and its ranges: (SQL, which bounds)
+_DAY_RANGE_SQL = {
+    "=": ("(f.mtime_ns >= ? AND f.mtime_ns < ?)", (0, 1)),
+    "!=": ("NOT (f.mtime_ns >= ? AND f.mtime_ns < ?)", (0, 1)),
+    "<": ("f.mtime_ns < ?", (0,)),
+    "<=": ("f.mtime_ns < ?", (1,)),
+    ">": ("f.mtime_ns >= ?", (1,)),
+    ">=": ("f.mtime_ns >= ?", (0,)),
+}
+
+
 def _like_pattern(value):
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     if "*" in escaped or "?" in escaped:
@@ -282,9 +309,17 @@ def compile_query(query, *, fts_enabled=True):
         elif field == "mtime_ns":
             if operator == ":":
                 operator = "="
-            sql = f"f.mtime_ns {operator} ?"
-            conditions.append(f"NOT ({sql})" if negative else sql)
-            params.append(_parse_timestamp(value))
+            bounds = _day_bounds_ns(value)
+            if bounds is not None:
+                # A date means the whole day: modified=2024-06-30 is anything
+                # changed that day, and modified<=2024-06-30 includes it.
+                sql, which = _DAY_RANGE_SQL[operator]
+                conditions.append(f"NOT ({sql})" if negative else sql)
+                params.extend(bounds[i] for i in which)
+            else:
+                sql = f"f.mtime_ns {operator} ?"
+                conditions.append(f"NOT ({sql})" if negative else sql)
+                params.append(_parse_timestamp(value))
         elif field in ("gps_lat", "gps_lon") and operator in ("<", "<=", ">", ">="):
             try:
                 number = float(value)
@@ -477,11 +512,12 @@ class InventorySearchIndex:
     def _import_inventory(self, connection, source_id, path, source_name, progress):
         count, batch = 0, []
         with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
-            lines = (line for line in handle if not line.startswith("#"))
-            reader = csv.DictReader(lines, delimiter="\t", restval="")
-            if not reader.fieldnames or "filepath" not in reader.fieldnames:
+            rows = split_list_lines(handle)
+            fieldnames = next(rows, None)
+            if not fieldnames or "filepath" not in fieldnames:
                 raise SearchQueryError(f"{path.name} is not a valid file-list TSV.")
-            for row in reader:
+            for fields in rows:
+                row = dict(zip(fieldnames, fields))
                 filepath = row.get("filepath", "") or ""
                 filename = re.split(r"[/\\]", filepath)[-1]
                 extension = (

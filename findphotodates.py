@@ -3485,7 +3485,7 @@ def run_scan(
                     if pending_exiftool > 0
                     else ""
                 )
-                problem_count = len(discovery.read_errors) + len(read_problems)
+                problem_count = len(_all_read_problems())
                 if problem_count:
                     exiftool_part += f" — {problem_count:,} unreadable"
 

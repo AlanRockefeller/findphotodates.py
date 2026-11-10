@@ -1081,7 +1081,9 @@ def read_every_file(mount, report_path=None):
     except KeyboardInterrupt:
         pass
     # A folder that can't be opened is as telling as a file that can't be read.
-    errors = [(path, message) for _kind, path, _io, message in walk_errors] + errors
+    # Links the drive's driver can't follow hold no data, like the links skipped above.
+    errors = [(path, message) for kind, path, _io, message in walk_errors
+              if kind != "link"] + errors
     _clear_progress_line()
     if errors and report_path:
         Path(report_path).parent.mkdir(parents=True, exist_ok=True)

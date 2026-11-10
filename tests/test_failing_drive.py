@@ -288,12 +288,27 @@ def test_links_the_driver_cant_follow_are_skipped_not_read_errors(tmp_path, monk
 @pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks")
 def test_links_that_fail_during_the_walk_are_skipped_not_read_errors(tmp_path, monkeypatch, capsys):
     # On ntfs3 the walk itself fails: is_file(follow_symlinks=True) raises EINVAL.
-    import findphotodates_common as common
     drive = tmp_path / "drive"
     _make_tree(drive, NAMES)
     for i in range(25):  # more than the live cap, so a real error must still show
         os.symlink("0.txt", drive / "a" / f"link{i}")
     (drive / "b" / "bad.txt").write_text("x", encoding="utf-8")
+    _fake_ntfs3_scandir(monkeypatch)
+    out = tmp_path / "list.tsv"
+    assert fpd.run_scan(str(drive), str(out), None, quiet=False) is not False
+    printed = capsys.readouterr().out
+    assert "a/link" not in printed and "Can't read: a/" not in printed
+    assert "Can't read: b/bad.txt (Input/output error)" in printed
+    assert "1 file(s) couldn't be read" in printed
+    assert "Skipped 25 link(s) the drive's driver can't follow" in printed
+    report = next((tmp_path / "Read errors").iterdir()).read_text(encoding="utf-8")
+    assert "bad.txt" in report and "/link" not in report
+
+
+def _fake_ntfs3_scandir(monkeypatch):
+    """Make the directory walk behave like ntfs3 on WSL-made links: following
+    a "link*" symlink fails with EINVAL; "bad.txt" fails with an I/O error."""
+    import findphotodates_common as common
     real_scandir = os.scandir
 
     class Entry:
@@ -324,12 +339,14 @@ def test_links_that_fail_during_the_walk_are_skipped_not_read_errors(tmp_path, m
             return (Entry(e) for e in self._it)
 
     monkeypatch.setattr(common.os, "scandir", Scandir)
-    out = tmp_path / "list.tsv"
-    assert fpd.run_scan(str(drive), str(out), None, quiet=False) is not False
-    printed = capsys.readouterr().out
-    assert "a/link" not in printed and "Can't read: a/" not in printed
-    assert "Can't read: b/bad.txt (Input/output error)" in printed
-    assert "1 file(s) couldn't be read" in printed
-    assert "Skipped 25 link(s) the drive's driver can't follow" in printed
-    report = next((tmp_path / "Read errors").iterdir()).read_text(encoding="utf-8")
-    assert "bad.txt" in report and "/link" not in report
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX symlinks")
+def test_health_read_check_skips_links_the_driver_cant_follow(tmp_path, monkeypatch):
+    _make_tree(tmp_path, ["a/0.txt"])
+    os.symlink("0.txt", tmp_path / "a" / "link0")
+    (tmp_path / "a" / "bad.txt").write_text("x", encoding="utf-8")
+    _fake_ntfs3_scandir(monkeypatch)
+    files, _bytes, errors, finished = fpd.read_every_file(str(tmp_path))
+    assert finished and files == 1
+    assert [os.path.basename(p) for p, _m in errors] == ["bad.txt"]

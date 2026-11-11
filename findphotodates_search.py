@@ -367,6 +367,10 @@ def compile_query(query, *, fts_enabled=True):
         order = (
             "bm25(files_fts), f.filepath COLLATE NOCASE, s.path COLLATE NOCASE, f.id"
         )
+    if not conditions:
+        # Nothing to match: list order needs no sort.  Sorting every indexed
+        # path takes many seconds once there are millions of them.
+        order = "s.path COLLATE NOCASE, f.id"
     return join, (" AND ".join(conditions) if conditions else "1"), params, order
 
 
@@ -387,6 +391,10 @@ class InventorySearchIndex:
 
     def _prepare(self, connection):
         version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION and self._has_fts(connection):
+            # Already set up.  Writing nothing here matters: a search must
+            # not wait behind an index update that holds the write lock.
+            return
         if version not in (0, SCHEMA_VERSION):
             connection.executescript(
                 "DROP TABLE IF EXISTS files_fts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS sources;"
@@ -432,6 +440,20 @@ class InventorySearchIndex:
             ).fetchone()
             is not None
         )
+
+    def indexed_total(self):
+        """Files indexed by an earlier run, or None when nothing is indexed
+        yet.  Those can be searched while refresh() brings the index up to date."""
+        if not self.database_path.exists():
+            return None
+        try:
+            with closing(self._connect()) as connection:
+                lists, total = connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(row_count), 0) FROM sources"
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        return total if lists else None
 
     def _remove_source(self, connection, source_id):
         if self._has_fts(connection):

@@ -12,12 +12,13 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from findphotodates_gui_startup import dependency_message
 
 try:
-    from tkinter import TclError, filedialog, messagebox, ttk
+    from tkinter import Menu, TclError, filedialog, messagebox, ttk
     from tkinter import font as tkfont
 
     import customtkinter as ctk
@@ -95,7 +96,57 @@ def open_folder(path):
     elif sys.platform == "darwin":
         subprocess.Popen(["open", str(path)])
     else:
-        subprocess.Popen(["xdg-open", str(path)])
+        # The file manager is a separate program: don't hand it this Python
+        # environment (its own Python add-ons then fail to load) or let its
+        # start-up chatter land in our terminal.
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")}
+        if sys.prefix != sys.base_prefix:
+            ours = os.path.join(sys.prefix, "bin")
+            env["PATH"] = os.pathsep.join(part for part in env.get("PATH", "").split(os.pathsep)
+                                          if part.rstrip("/") != ours)
+        subprocess.Popen(["xdg-open", str(path)], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# One search-index update at a time, whichever window asked for it; two
+# writing at once can hit "database is locked".
+_SEARCH_INDEX_LOCK = threading.Lock()
+LIST_CHECK_SECONDS = 5
+
+
+def search_index():
+    return InventorySearchIndex(fp.DEFAULT_CACHE_DIR / "inventory_search.sqlite3")
+
+
+def list_signatures(file_lists):
+    """What tells one saved version of each file list from another."""
+    found = []
+    for file_list in file_lists:
+        try:
+            stat = os.stat(file_list.path)
+            found.append((str(file_list.path), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            found.append((str(file_list.path), None, None))
+    return found
+
+
+def update_search_index_in_background(file_lists):
+    """Bring the search index up to date before the search window is opened,
+    so searching doesn't start with a wait."""
+    paths = [file_list.path for file_list in file_lists]
+    if not paths:
+        return None
+
+    def work():
+        with _SEARCH_INDEX_LOCK:
+            try:
+                search_index().refresh(paths)
+            except Exception:
+                pass  # the search window reports index problems when it opens
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    return thread
 
 
 class HoverHelp:
@@ -163,14 +214,18 @@ class FileSearchDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.file_lists = list(file_lists)
-        self.index = InventorySearchIndex(fp.DEFAULT_CACHE_DIR / "inventory_search.sqlite3")
+        self.index = search_index()
         self.events = queue.Queue()
         self.results = {}
         self.generation = 0
         self.index_ready = False
         # One index refresh at a time; events from an older refresh are ignored.
         self.index_generation = 0
-        self._index_lock = threading.Lock()
+        self._index_lock = _SEARCH_INDEX_LOCK
+        self._list_signatures = None   # the lists as last handed to the index
+        self._unsettled_signatures = None
+        self._last_list_check = time.monotonic()
+        self._searched = False
         self.pending_search = False
         self.offset = 0
         self._after_id = None
@@ -188,6 +243,14 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._build_results()
         self._build_details()
         self._after_id = self.after(75, self._drain_events)
+        # What an earlier run indexed can be searched straight away; lists
+        # that changed since are brought up to date in the background.
+        indexed = self.index.indexed_total()
+        if indexed is not None:
+            self.index_ready = True
+            self.search_btn.configure(state="normal")
+            self.status_var.set(f"{indexed:,} files ready to search.")
+            self._set_index_note("Checking for changed file lists…")
         self._start_index()
 
     def _build_controls(self):
@@ -236,6 +299,16 @@ class FileSearchDialog(ctk.CTkToplevel):
         ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
                      text_color=("gray35", "gray72"))\
             .grid(row=2, column=0, columnspan=3, sticky="ew", padx=11, pady=(0, 8))
+        self.index_var = ctk.StringVar()
+        self.index_label = ctk.CTkLabel(controls, textvariable=self.index_var, anchor="w",
+                                        text_color=("gray35", "gray72"))
+        self.index_label.grid(row=3, column=0, columnspan=3, sticky="ew", padx=11, pady=(0, 8))
+        self.index_label.grid_remove()
+
+    def _set_index_note(self, text):
+        """Show what the index is doing in the background, or nothing."""
+        self.index_var.set(text)
+        (self.index_label.grid if text else self.index_label.grid_remove)()
 
     def _build_results(self):
         frame = ctk.CTkFrame(self, corner_radius=8)
@@ -274,6 +347,26 @@ class FileSearchDialog(ctk.CTkToplevel):
         horizontal.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(0, 8))
         self.tree.bind("<<TreeviewSelect>>", self._selection_changed)
         self.tree.bind("<Double-1>", self._open_containing_folder)
+        self.result_menu = Menu(self, tearoff=0, font=self.tree_font,
+                                background="#2b2b2b" if dark else "#ffffff",
+                                foreground="#f2f2f2" if dark else "#202020",
+                                activebackground="#1f6aa5", activeforeground="#ffffff")
+        self.result_menu.add_command(label="Copy", command=self._copy_path)
+        right_clicks = ("<Button-2>", "<Button-3>", "<Control-Button-1>") \
+            if sys.platform == "darwin" else ("<Button-3>",)
+        for sequence in right_clicks:
+            self.tree.bind(sequence, self._show_result_menu)
+
+    def _show_result_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        try:
+            self.result_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.result_menu.grab_release()
 
     def _build_details(self):
         footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -312,9 +405,10 @@ class FileSearchDialog(ctk.CTkToplevel):
         """Follow the main window's lists after drives were refreshed."""
         self.file_lists = list(file_lists)
         self._set_list_choices()
-        self.index_ready = False
-        self.search_btn.configure(state="disabled")
-        self.status_var.set("Updating the search index…")
+        if self.index_ready:
+            self._set_index_note("Checking for changed file lists…")
+        else:
+            self.status_var.set("Updating the search index…")
         self._start_index()
 
     def _show_help(self):
@@ -340,6 +434,8 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.index_generation += 1
         generation = self.index_generation
         paths = [file_list.path for file_list in self.file_lists]
+        self._list_signatures = list_signatures(self.file_lists)
+        self._unsettled_signatures = None
 
         def progress(number, total, name, rows):
             self.events.put(("progress", generation, number, total, name, rows))
@@ -357,6 +453,20 @@ class FileSearchDialog(ctk.CTkToplevel):
                 except Exception as exc:
                     self.events.put(("error", generation, str(exc)))
         threading.Thread(target=work, daemon=True).start()
+
+    def _check_lists_changed(self):
+        """Re-index when a file list was saved again while this window is open
+        (a scan finished, say).  A list still being written is left until its
+        size and time stop moving."""
+        current = list_signatures(self.file_lists)
+        if current == self._list_signatures:
+            self._unsettled_signatures = None
+        elif current == self._unsettled_signatures:
+            if self.index_ready:
+                self._set_index_note("A file list changed; updating the search index…")
+            self._start_index()
+        else:
+            self._unsettled_signatures = current
 
     def _schedule_search(self, event=None):
         if event and event.keysym in ("Return", "Up", "Down", "Left", "Right", "Shift_L", "Shift_R"):
@@ -387,6 +497,7 @@ class FileSearchDialog(ctk.CTkToplevel):
             return
         self.generation += 1
         generation = self.generation
+        self._searched = True
         if not append:
             self.offset = 0
         selected = self.list_choices.get(self.list_var.get())
@@ -543,21 +654,33 @@ class FileSearchDialog(ctk.CTkToplevel):
                 if kind == "progress":
                     _, _generation, number, total, name, rows = event
                     detail = f" — {rows:,} files" if rows is not None else ""
-                    self.status_var.set(f"Indexing {name} ({number}/{total}){detail}")
+                    if not self.index_ready:
+                        self.status_var.set(f"Indexing {name} ({number}/{total}){detail}")
+                    elif rows is not None:  # this list changed; the rest stay searchable
+                        self._set_index_note(f"Updating {name} in the background "
+                                             f"({number}/{total}){detail}. Results come from "
+                                             "the earlier version until it finishes.")
                 elif kind == "ready":
                     _, _generation, changed, total, skipped = event
+                    was_ready = self.index_ready
                     self.index_ready = True
                     self.search_btn.configure(state="normal")
+                    self._set_index_note("")
                     action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
                     problem = (" Couldn't read " + ", ".join(name for name, _ in skipped) + "."
                                if skipped else "")
-                    self.status_var.set(f"{action}{total:,} files ready to search.{problem}")
-                    if (self.pending_search or self.query_var.get().strip()
-                            or self.date_var.get().strip()):
+                    fresh = changed or not was_ready
+                    if fresh or skipped or not self._searched:
+                        self.status_var.set(f"{action}{total:,} files ready to search.{problem}")
+                    if self.pending_search or (fresh and (self.query_var.get().strip()
+                                                          or self.date_var.get().strip())):
                         self.pending_search = False
                         self._search()
                 elif kind == "error":
-                    self.status_var.set("Could not build the search index: " + event[2])
+                    if self.index_ready:
+                        self._set_index_note("Could not update the search index: " + event[2])
+                    else:
+                        self.status_var.set("Could not build the search index: " + event[2])
                 elif kind == "results":
                     _, generation, query, append, rows, more = event
                     if generation == self.generation:
@@ -570,6 +693,9 @@ class FileSearchDialog(ctk.CTkToplevel):
                         self.search_btn.configure(state="normal")
         except queue.Empty:
             pass
+        if time.monotonic() - self._last_list_check >= LIST_CHECK_SECONDS:
+            self._last_list_check = time.monotonic()
+            self._check_lists_changed()
         self._after_id = self.after(75, self._drain_events)
 
     def _close(self):
@@ -1171,6 +1297,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.gui_scale = GUI_SCALE_CHOICES[self.gui_scale_label]
         ctk.set_widget_scaling(self.gui_scale)
         ctk.set_window_scaling(self.gui_scale)
+        self._dialog_font_sizes = {}
+        self._scale_dialog_fonts()
         self.title(APP_TITLE)
         self.geometry("820x560")
         self.minsize(700, 480)
@@ -1251,12 +1379,28 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._text_button(exif_row, "Get ExifTool", lambda: __import__("webbrowser").open("https://exiftool.org/"))\
             .grid(row=0, column=1, sticky="e")
 
+    def _scale_dialog_fonts(self):
+        """Message boxes on Linux are drawn by Tk in its own fonts, which
+        CustomTkinter's scaling doesn't touch; without this they stay tiny
+        on a high-resolution screen."""
+        if not sys.platform.startswith("linux"):
+            return  # Windows and macOS show their own, already scaled, dialogs
+        for name in ("TkDefaultFont", "TkCaptionFont", "TkTextFont", "TkMenuFont"):
+            try:
+                font = tkfont.nametofont(name)
+                base = self._dialog_font_sizes.setdefault(name, font.cget("size"))
+                size = round(base * self.gui_scale)  # negative sizes are pixels
+                font.configure(size=size or (-1 if base < 0 else 1))
+            except TclError:
+                pass
+
     def _set_gui_scale(self, label):
         scale = GUI_SCALE_CHOICES[label]
         self.gui_scale_label = label
         self.gui_scale = scale
         ctk.set_widget_scaling(scale)
         ctk.set_window_scaling(scale)
+        self._scale_dialog_fonts()
         if self.search_dialog is not None and self.search_dialog.winfo_exists():
             self.search_dialog.apply_scale(scale)
         fp.update_config(lambda config: config.update(gui_scale=scale))
@@ -1548,8 +1692,11 @@ class FindPhotoDatesGUI(ctk.CTk):
             messagebox.showinfo("Choose a drive", "Select at least one connected drive.")
             return
         descriptions = [f"{drive.display_name}: {'update' if drive.mount in self.list_for else 'make'} its list" for drive in chosen]
-        if not messagebox.askyesno("Make or update file lists", "Run these scans in order?\n\n" + "\n".join(descriptions)
-                                   + "\n\nThe first scan of a large drive can take hours."):
+        question = "Run these scans in order?\n\n" + "\n".join(descriptions)
+        if any(drive.mount not in self.list_for for drive in chosen):
+            # Updating an existing list reuses what it already knows and is quick.
+            question += "\n\nThe first scan of a large drive can take hours."
+        if not messagebox.askyesno("Make or update file lists", question):
             return
         self._pending_scans = []
         assigned = set()  # new lists don't exist until scanned; keep same-named drives apart
@@ -1655,6 +1802,11 @@ class FindPhotoDatesGUI(ctk.CTk):
                     self.list_for = {fl.drive.mount: fl for fl in self.lists if fl.drive}
                     self._render_drives()
                     self.list_dir_var.set(f"File lists: {self.list_dir}  ({len(self.lists)} lists)")
+                    if self.search_dialog is not None and self.search_dialog.winfo_exists():
+                        if self.search_dialog.file_lists != self.lists:
+                            self.search_dialog.use_lists(self.lists)
+                    else:
+                        update_search_index_in_background(self.lists)
                     if error:
                         messagebox.showerror("Refresh drives", error)
                 elif kind == "exiftool":

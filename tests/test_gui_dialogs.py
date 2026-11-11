@@ -56,6 +56,9 @@ def _dialog(index):
         _closed=False, _after_id=None, status_var=_Var(), query_var=_Var(),
         date_var=_Var(), search_btn=types.SimpleNamespace(configure=lambda **kw: None),
         after=lambda *args: None, _search=lambda: None, _drain_events=None,
+        _set_index_note=lambda text: None, _check_lists_changed=lambda: None,
+        _searched=False, _list_signatures=None, _unsettled_signatures=None,
+        _last_list_check=time.monotonic(),
     )
 
 

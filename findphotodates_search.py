@@ -468,6 +468,7 @@ class InventorySearchIndex:
         """Synchronize the index and return (changed lists, total indexed rows).
         Lists that can't be read are skipped and named in self.skipped."""
         self.skipped = []
+        changed = 0
         paths = [Path(path).resolve() for path in inventory_paths]
         signatures = {}
         unreadable = set()  # supplied but can't be read now: keep what's indexed
@@ -480,7 +481,6 @@ class InventorySearchIndex:
                 continue
             signatures[str(path)] = (stat.st_mtime_ns, stat.st_size, path.name)
 
-        changed = 0
         with closing(self._connect()) as connection, connection:
             existing = {
                 row[1]: row
@@ -491,6 +491,7 @@ class InventorySearchIndex:
             for old_path, row in existing.items():
                 if old_path not in signatures and old_path not in unreadable:
                     self._remove_source(connection, row[0])
+                    changed += 1  # results from it must go too
             connection.commit()
 
             total_lists = len(signatures)

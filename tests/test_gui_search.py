@@ -255,6 +255,12 @@ class SearchWhileUpdatingTests(unittest.TestCase):
             writer.rollback()
             writer.close()
 
+    def test_dropping_a_list_counts_as_a_change(self):
+        index = InventorySearchIndex(self.database)
+        index.refresh([self.listing])
+        self.assertEqual(index.refresh([]), (1, 0))
+        self.assertEqual(index.refresh([]), (0, 0))
+
     def test_everything_is_listed_in_file_list_order(self):
         index = InventorySearchIndex(self.database)
         row = {"date_taken": "", "size_bytes": "1", "mtime_ns": "1", "gps_lat": "",

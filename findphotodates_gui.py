@@ -115,7 +115,39 @@ _SEARCH_INDEX_LOCK = threading.Lock()
 LIST_CHECK_SECONDS = 5
 
 
+class _IndexState:
+    """Shared by every index update in this program, whichever window asked."""
+
+    request = 0  # the newest update asked for; older ones still waiting give way
+    version = 0  # goes up whenever an update may have changed what is indexed
+    guard = threading.Lock()
+
+
+def _new_index_request():
+    with _IndexState.guard:
+        _IndexState.request += 1
+        return _IndexState.request
+
+
+def _refresh_search_index(index, request, paths, progress=None):
+    """Run one index update, or return None when a newer request replaced it
+    while it waited (an update for lists since replaced would undo the newer
+    one's work if it ran last)."""
+    with _SEARCH_INDEX_LOCK:
+        if request != _IndexState.request:
+            return None
+        changed = True  # assume so if it fails part-way: some lists may be done
+        try:
+            changed, total = index.refresh(paths, progress=progress)
+        finally:
+            if changed:
+                with _IndexState.guard:
+                    _IndexState.version += 1
+        return changed, total
+
+
 def search_index():
+    """The saved search index every window shares."""
     return InventorySearchIndex(fp.DEFAULT_CACHE_DIR / "inventory_search.sqlite3")
 
 
@@ -138,12 +170,13 @@ def update_search_index_in_background(file_lists):
     if not paths:
         return None
 
+    request = _new_index_request()
+
     def work():
-        with _SEARCH_INDEX_LOCK:
-            try:
-                search_index().refresh(paths)
-            except Exception:
-                pass  # the search window reports index problems when it opens
+        try:
+            _refresh_search_index(search_index(), request, paths)
+        except Exception:
+            pass  # the search window reports index problems when it opens
     thread = threading.Thread(target=work, daemon=True)
     thread.start()
     return thread
@@ -226,6 +259,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._unsettled_signatures = None
         self._last_list_check = time.monotonic()
         self._searched = False
+        self._search_version = None  # index version the shown results came from
         self.pending_search = False
         self.offset = 0
         self._after_id = None
@@ -245,12 +279,9 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._after_id = self.after(75, self._drain_events)
         # What an earlier run indexed can be searched straight away; lists
         # that changed since are brought up to date in the background.
-        indexed = self.index.indexed_total()
-        if indexed is not None:
-            self.index_ready = True
-            self.search_btn.configure(state="normal")
-            self.status_var.set(f"{indexed:,} files ready to search.")
-            self._set_index_note("Checking for changed file lists…")
+        # (Counted off the window's thread, in case the index is busy.)
+        threading.Thread(target=lambda: self.events.put(("indexed", self.index.indexed_total())),
+                         daemon=True).start()
         self._start_index()
 
     def _build_controls(self):
@@ -431,8 +462,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         )
 
     def _start_index(self):
-        self.index_generation += 1
-        generation = self.index_generation
+        self.index_generation = generation = _new_index_request()
         paths = [file_list.path for file_list in self.file_lists]
         self._list_signatures = list_signatures(self.file_lists)
         self._unsettled_signatures = None
@@ -443,15 +473,13 @@ class FileSearchDialog(ctk.CTkToplevel):
         def work():
             # Two refreshes writing the same index at once can hit "database
             # is locked", so a newer one waits for the one running to finish.
-            with self._index_lock:
-                if generation != self.index_generation:
-                    return  # the lists changed again; a newer refresh follows
-                try:
-                    changed, total = self.index.refresh(paths, progress=progress)
-                    self.events.put(("ready", generation, changed, total,
-                                     list(self.index.skipped)))
-                except Exception as exc:
-                    self.events.put(("error", generation, str(exc)))
+            try:
+                outcome = _refresh_search_index(self.index, generation, paths, progress)
+            except Exception as exc:
+                self.events.put(("error", generation, str(exc)))
+                return
+            if outcome is not None:  # None: the lists changed again; a newer refresh follows
+                self.events.put(("ready", generation, *outcome, list(self.index.skipped)))
         threading.Thread(target=work, daemon=True).start()
 
     def _check_lists_changed(self):
@@ -498,6 +526,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.generation += 1
         generation = self.generation
         self._searched = True
+        self._search_version = _IndexState.version
         if not append:
             self.offset = 0
         selected = self.list_choices.get(self.list_var.get())
@@ -651,7 +680,16 @@ class FileSearchDialog(ctk.CTkToplevel):
                 kind = event[0]
                 if kind in ("progress", "ready", "error") and event[1] != self.index_generation:
                     continue  # from a refresh of lists since replaced
-                if kind == "progress":
+                if kind == "indexed":
+                    if event[1] is not None and not self.index_ready:
+                        self.index_ready = True
+                        self.search_btn.configure(state="normal")
+                        self.status_var.set(f"{event[1]:,} files ready to search.")
+                        self._set_index_note("Checking for changed file lists…")
+                        if self.pending_search:
+                            self.pending_search = False
+                            self._search()
+                elif kind == "progress":
                     _, _generation, number, total, name, rows = event
                     detail = f" — {rows:,} files" if rows is not None else ""
                     if not self.index_ready:
@@ -669,11 +707,14 @@ class FileSearchDialog(ctk.CTkToplevel):
                     action = f"Updated {changed} list{'s' if changed != 1 else ''}; " if changed else ""
                     problem = (" Couldn't read " + ", ".join(name for name, _ in skipped) + "."
                                if skipped else "")
-                    fresh = changed or not was_ready
-                    if fresh or skipped or not self._searched:
+                    # Results on screen are out of date if any update (this
+                    # one, an earlier one it replaced, or the main window's)
+                    # changed the index after they were fetched.
+                    stale = self._searched and self._search_version != _IndexState.version
+                    if changed or not was_ready or skipped or not self._searched:
                         self.status_var.set(f"{action}{total:,} files ready to search.{problem}")
-                    if self.pending_search or (fresh and (self.query_var.get().strip()
-                                                          or self.date_var.get().strip())):
+                    if self.pending_search or stale or (not was_ready and (
+                            self.query_var.get().strip() or self.date_var.get().strip())):
                         self.pending_search = False
                         self._search()
                 elif kind == "error":

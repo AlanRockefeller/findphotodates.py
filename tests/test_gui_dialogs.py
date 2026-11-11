@@ -57,7 +57,7 @@ def _dialog(index):
         date_var=_Var(), search_btn=types.SimpleNamespace(configure=lambda **kw: None),
         after=lambda *args: None, _search=lambda: None, _drain_events=None,
         _set_index_note=lambda text: None, _check_lists_changed=lambda: None,
-        _searched=False, _search_version=None, _list_signatures=None, _unsettled_signatures=None,
+        _searched=False, _index_error="", _search_version=None, _list_signatures=None, _unsettled_signatures=None,
         _last_list_check=time.monotonic(),
     )
 
@@ -156,3 +156,15 @@ def test_results_fetched_before_the_index_changed_are_fetched_again():
     dialog.events.put(("ready", dialog.index_generation, 0, 10, []))
     gui.FileSearchDialog._drain_events(dialog)
     assert searches == [1]  # nothing changed: the results stay as they are
+
+
+def test_a_failed_update_is_still_reported_when_the_earlier_index_turns_up_later():
+    notes = []
+    dialog = _dialog(None)
+    dialog._set_index_note = notes.append
+    dialog.events.put(("error", dialog.index_generation, "disk full"))
+    dialog.events.put(("indexed", 10))
+    gui.FileSearchDialog._drain_events(dialog)
+    assert dialog.index_ready  # what was indexed before can still be searched
+    assert "10 files ready" in dialog.status_var.get()
+    assert notes == ["Could not update the search index: disk full"]

@@ -260,6 +260,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._last_list_check = time.monotonic()
         self._searched = False
         self._search_version = None  # index version the shown results came from
+        self._index_error = ""  # why the latest index update failed, if it did
         self.pending_search = False
         self.offset = 0
         self._after_id = None
@@ -463,6 +464,7 @@ class FileSearchDialog(ctk.CTkToplevel):
 
     def _start_index(self):
         self.index_generation = generation = _new_index_request()
+        self._index_error = ""
         paths = [file_list.path for file_list in self.file_lists]
         self._list_signatures = list_signatures(self.file_lists)
         self._unsettled_signatures = None
@@ -685,7 +687,9 @@ class FileSearchDialog(ctk.CTkToplevel):
                         self.index_ready = True
                         self.search_btn.configure(state="normal")
                         self.status_var.set(f"{event[1]:,} files ready to search.")
-                        self._set_index_note("Checking for changed file lists…")
+                        # The update may already have failed; keep saying so.
+                        self._set_index_note(self._index_error
+                                             or "Checking for changed file lists…")
                         if self.pending_search:
                             self.pending_search = False
                             self._search()
@@ -718,8 +722,9 @@ class FileSearchDialog(ctk.CTkToplevel):
                         self.pending_search = False
                         self._search()
                 elif kind == "error":
+                    self._index_error = "Could not update the search index: " + event[2]
                     if self.index_ready:
-                        self._set_index_note("Could not update the search index: " + event[2])
+                        self._set_index_note(self._index_error)
                     else:
                         self.status_var.set("Could not build the search index: " + event[2])
                 elif kind == "results":

@@ -1,5 +1,6 @@
 import csv
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -217,3 +218,54 @@ class InventorySearchTests(unittest.TestCase):
         self.assertEqual(normalize_photo_day("06/30/2024"), "2024-06-30")
         with self.assertRaisesRegex(SearchQueryError, "YYYY-MM-DD"):
             normalize_photo_day("2024-02-30")
+
+
+class SearchWhileUpdatingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.listing = root / "Camera.tsv"
+        self.database = root / "search.sqlite3"
+        row = {"filepath": "/photos/IMG_1.jpg", "date_taken": "", "size_bytes": "1",
+               "mtime_ns": "1", "gps_lat": "", "gps_lon": "", "location": "",
+               "content_hash": ""}
+        write_inventory(self.listing, [row])
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_earlier_index_is_reported_without_creating_one(self):
+        index = InventorySearchIndex(self.database)
+        self.assertIsNone(index.indexed_total())
+        self.assertFalse(self.database.exists())
+        index.refresh([self.listing])
+        self.assertEqual(InventorySearchIndex(self.database).indexed_total(), 1)
+
+    def test_search_works_while_an_update_holds_the_write_lock(self):
+        InventorySearchIndex(self.database).refresh([self.listing])
+        writer = sqlite3.connect(str(self.database))
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE sources SET row_count=row_count")
+            reader = InventorySearchIndex(self.database)
+            self.assertEqual(reader.indexed_total(), 1)
+            rows, _more = reader.search("IMG_1")
+            self.assertEqual([row.filepath for row in rows], ["/photos/IMG_1.jpg"])
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_dropping_a_list_counts_as_a_change(self):
+        index = InventorySearchIndex(self.database)
+        index.refresh([self.listing])
+        self.assertEqual(index.refresh([]), (1, 0))
+        self.assertEqual(index.refresh([]), (0, 0))
+
+    def test_everything_is_listed_in_file_list_order(self):
+        index = InventorySearchIndex(self.database)
+        row = {"date_taken": "", "size_bytes": "1", "mtime_ns": "1", "gps_lat": "",
+               "gps_lon": "", "location": "", "content_hash": ""}
+        write_inventory(self.listing, [dict(row, filepath="/b.jpg"), dict(row, filepath="/a.jpg")])
+        index.refresh([self.listing])
+        rows, _more = index.search("")
+        self.assertEqual([item.filepath for item in rows], ["/b.jpg", "/a.jpg"])

@@ -56,6 +56,9 @@ def _dialog(index):
         _closed=False, _after_id=None, status_var=_Var(), query_var=_Var(),
         date_var=_Var(), search_btn=types.SimpleNamespace(configure=lambda **kw: None),
         after=lambda *args: None, _search=lambda: None, _drain_events=None,
+        _set_index_note=lambda text: None, _check_lists_changed=lambda: None,
+        _searched=False, _index_error="", _search_version=None, _list_signatures=None, _unsettled_signatures=None,
+        _last_list_check=time.monotonic(),
     )
 
 
@@ -89,6 +92,10 @@ def test_lists_changed_during_a_refresh_wait_and_old_results_are_ignored():
 
     index.release["three"].set()
     _wait_until_free(dialog._index_lock)
+    deadline = time.monotonic() + 5  # the result is posted just after the lock is freed
+    while dialog.events.empty():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
     gui.FileSearchDialog._drain_events(dialog)
     assert dialog.index_ready
     assert "30 files ready" in dialog.status_var.get()
@@ -113,3 +120,51 @@ def test_recalculate_uses_the_main_windows_lists_even_when_there_are_none(monkey
     gui.CoverageDialog._calculate(dialog)
     assert dialog.events.get(timeout=5)[0] == "done"
     assert compared == [[]]
+
+
+def test_an_update_for_replaced_lists_gives_way_and_changes_mark_results_stale():
+    class Index:
+        def __init__(self):
+            self.calls = []
+
+        def refresh(self, paths, progress=None):
+            self.calls.append(paths)
+            return 1, 5
+
+    index = Index()
+    old = gui._new_index_request()
+    new = gui._new_index_request()
+    before = gui._IndexState.version
+    assert gui._refresh_search_index(index, old, ["old"]) is None
+    assert gui._refresh_search_index(index, new, ["new"]) == (1, 5)
+    assert index.calls == [["new"]]
+    assert gui._IndexState.version == before + 1
+
+
+def test_results_fetched_before_the_index_changed_are_fetched_again():
+    searches = []
+    dialog = _dialog(None)
+    dialog._search = lambda: searches.append(1)
+    dialog.index_ready = True
+    dialog._searched = True
+    dialog._search_version = gui._IndexState.version - 1  # another update finished since
+    dialog.events.put(("ready", dialog.index_generation, 0, 10, []))
+    gui.FileSearchDialog._drain_events(dialog)
+    assert searches == [1]
+
+    dialog._search_version = gui._IndexState.version
+    dialog.events.put(("ready", dialog.index_generation, 0, 10, []))
+    gui.FileSearchDialog._drain_events(dialog)
+    assert searches == [1]  # nothing changed: the results stay as they are
+
+
+def test_a_failed_update_is_still_reported_when_the_earlier_index_turns_up_later():
+    notes = []
+    dialog = _dialog(None)
+    dialog._set_index_note = notes.append
+    dialog.events.put(("error", dialog.index_generation, "disk full"))
+    dialog.events.put(("indexed", 10))
+    gui.FileSearchDialog._drain_events(dialog)
+    assert dialog.index_ready  # what was indexed before can still be searched
+    assert "10 files ready" in dialog.status_var.get()
+    assert notes == ["Could not update the search index: disk full"]

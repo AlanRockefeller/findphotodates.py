@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- File lists have a new last column, `stack`, read from Olympus and OM System maker notes: `Focus Bracketing, Shot 3` for focus-bracketing (stack input) shots, and the camera's own description for photos it stacked or merged itself, such as `Focus-stacked (15 images)`. `-` means the photo was read and there's nothing to say. JPGs are still read quickly; only JPGs from Olympus/OM cameras are read in full for this. A rescan reads each Olympus raw file (and the JPGs in the same folders) from an older list once to fill the column in. Lists from earlier versions are read as before.
+- Search: a Stack column, and `stack:bracketing` / `stack:stacked` filters. The search index is rebuilt once for the new column.
+- Search: **Folders only** lists the folders that hold matches instead of the files, with how many files match in each, their total size and photo dates. Searching for a folder's name (such as `olympus.stack.input`) lists that folder once rather than every folder inside it.
+- Search: more results load as you scroll to the end of the list; the scroll bars are easier to see; the column headings follow dark mode.
+- Drives that are plugged in but not mounted are listed (Linux) in the GUI and the menu. A drive the system refused because it wasn't shut down cleanly (an NTFS volume marked dirty) gets a red ✗, a **Mount read-only** button (read-only is enough to scan it) and advice to run chkdsk on it in Windows. Others get a **Mount** button.
+- GUI: an **Unmount** button for each drive (Linux and macOS), so it's safe to unplug.
+- The **Get ExifTool** link only appears when ExifTool is missing or older than 12.23, the version that reads every file type findphotodates sends it. An older ExifTool still works, with a note that it may miss dates in HEIC, CR3 and JPEG XL files.
+
 ## v1.7.0 (2026-11-01)
 
 - New coverage report: "do my photos and videos have a second copy?" It compares every file list, including unplugged drives, and shows for each drive how many photos and videos are the only copy anywhere, how many have copies only on weak drives, and whether a drive is safe to retire. PNG, WebP, AVIF and JPEG XL photos count too (PNG, WebP and AVIF files under 100 KB, mostly icons and web graphics, and `.ts` files that small, which are TypeScript source rather than video, are left out). Drives can be marked Automatic (follows the health log; cable errors alone don't count), Keep, Weak or Gone. In the GUI (**Coverage**), the menu (`c`) and with `--coverage`.

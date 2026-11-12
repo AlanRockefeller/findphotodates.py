@@ -9,6 +9,7 @@ import re
 import shutil
 import string
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -145,6 +146,121 @@ class DriveInfo:
         if m:
             return f"Drive {m.group(1).upper()}"
         return os.path.basename(self.mount.rstrip("/\\")) or self.mount
+
+
+def unmount_command(mount):
+    """The command that unmounts the drive at `mount` so it is safe to unplug,
+    or None when there is nothing suitable to run here: Windows and WSL (use
+    the taskbar's "Safely Remove Hardware") and the drive the system runs from."""
+    mount = str(mount)
+    system = platform.system()
+    if mount.rstrip("/") == "" or _is_wsl():
+        return None
+    if system == "Darwin":
+        return ["diskutil", "unmount", mount]
+    if system != "Linux":
+        return None
+    device = ""
+    try:
+        with open("/proc/self/mounts", "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2 and _unescape_mount_path(parts[1]) == mount.rstrip("/"):
+                    device = _unescape_mount_path(parts[0])  # the last mount there wins
+    except OSError:
+        pass
+    # udisksctl needs no administrator rights for removable drives.
+    if device.startswith("/dev/") and shutil.which("udisksctl"):
+        return ["udisksctl", "unmount", "-b", device]
+    return ["umount", mount]
+
+
+@dataclass
+class UnmountedDrive:
+    """A plugged-in drive the system didn't mount, so it can't be scanned yet."""
+
+    device: str     # /dev/sdb2
+    label: str
+    fstype: str
+    size_bytes: int
+    dirty: bool     # the system refused it: not shut down cleanly (NTFS)
+
+    @property
+    def display_name(self):
+        return self.label or os.path.basename(self.device)
+
+
+# Filesystems worth offering; partitions that are parts of a system disk
+# (EFI, Windows recovery, swap, encrypted containers) are left out.
+_MOUNTABLE_FSTYPES = {"ntfs", "exfat", "vfat", "ext4", "ext3", "ext2", "btrfs", "xfs",
+                      "hfsplus", "apfs", "f2fs"}
+_SYSTEM_PARTITION_TYPES = ("EFI System", "Microsoft reserved", "Windows recovery environment")
+
+
+def _dirty_ntfs_devices(log_text):
+    """Partitions the kernel refused to mount because their NTFS volume is
+    marked dirty, from this boot's kernel log.  A disk plugged in again (its
+    partition table read again) starts fresh, as device names get reused."""
+    dirty = set()
+    for line in log_text.splitlines():
+        match = re.search(r"\b([a-z]+[a-z0-9]*?): ([a-z0-9]+(?: [a-z0-9]+)*)\s*$", line)
+        if match and all(part.startswith(match.group(1)) for part in match.group(2).split()):
+            dirty = {name for name in dirty if not name.startswith(match.group(1))}
+            continue
+        # "ntfs3(sdb2): ..." in newer kernels, "ntfs3: sdb2: ..." in older ones
+        match = re.search(r"ntfs3(?:\((\w+)\)|: (\w+)): volume is dirty", line)
+        if match:
+            dirty.add(match.group(1) or match.group(2))
+    return dirty
+
+
+def unmounted_drives():
+    """Plugged-in (hot-pluggable) drives with a filesystem that aren't mounted.
+    Linux only, and not WSL; elsewhere the system mounts drives itself."""
+    if platform.system() != "Linux" or _is_wsl() or not shutil.which("lsblk"):
+        return []
+    columns = "NAME,PATH,LABEL,FSTYPE,SIZE,MOUNTPOINT,HOTPLUG,TYPE"
+    # PARTTYPENAME needs util-linux 2.35; without it, the EFI label check remains.
+    out = (_run_quiet(["lsblk", "-J", "-b", "-o", columns + ",PARTTYPENAME"])
+           or _run_quiet(["lsblk", "-J", "-b", "-o", columns]))
+    try:
+        stack = list(json.loads(out or "{}").get("blockdevices", []))
+    except ValueError:
+        return []
+    found = []
+    while stack:
+        dev = stack.pop()
+        children = dev.get("children") or []
+        stack.extend(children)
+        if (children or dev.get("mountpoint") or not dev.get("hotplug")
+                or dev.get("type") not in ("part", "disk")
+                or (dev.get("fstype") or "") not in _MOUNTABLE_FSTYPES
+                or (dev.get("parttypename") or "") in _SYSTEM_PARTITION_TYPES
+                or (dev.get("label") or "").upper() == "EFI"):
+            continue
+        try:
+            size = int(dev.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        found.append(UnmountedDrive(dev.get("path") or f"/dev/{dev.get('name')}",
+                                    dev.get("label") or "", dev.get("fstype") or "", size,
+                                    False))
+    if any(drive.fstype == "ntfs" for drive in found):
+        log = _run_quiet(["journalctl", "-k", "-b", "-q", "-o", "cat", "--no-pager"]) \
+            or _run_quiet(["dmesg"]) or ""
+        dirty = _dirty_ntfs_devices(log)
+        for drive in found:
+            drive.dirty = os.path.basename(drive.device) in dirty
+    return sorted(found, key=lambda d: d.device)
+
+
+def mount_command(device, read_only=False):
+    """udisksctl mounts a plugged-in drive without administrator rights.  A
+    dirty NTFS drive can only be mounted read-only, which is enough to scan it."""
+    if not shutil.which("udisksctl"):
+        return None
+    command = ["udisksctl", "mount", "-b", device]
+    return command + ["-o", "ro"] if read_only else command
 
 
 def _normalize_volume_id(raw):

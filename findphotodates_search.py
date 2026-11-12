@@ -12,7 +12,7 @@ from pathlib import Path
 
 from findphotodates_common import split_list_lines
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: the stack column
 SEARCH_FIELDS = (
     "filepath",
     "date_taken",
@@ -22,6 +22,7 @@ SEARCH_FIELDS = (
     "gps_lon",
     "location",
     "content_hash",
+    "stack",
 )
 
 
@@ -40,6 +41,66 @@ class SearchResult:
     gps_lon: str
     location: str
     content_hash: str
+    stack: str = ""
+
+
+@dataclass(frozen=True)
+class FolderResult:
+    """A folder holding files that matched a search.  `filepath` is the
+    folder, so it can be copied and opened like a file result."""
+
+    source_path: str
+    filepath: str
+    files: int
+    size_bytes: int
+    first_date: str  # YYYY-MM-DD of the earliest photo date, or ""
+    last_date: str
+    newest_mtime_ns: int
+
+
+def _folder_words(query):
+    """The lowercase words a folder's own path should contain: plain words
+    and path: filters.  Field filters such as ext:jpg describe files."""
+    words = []
+    for token in _split_query(query):
+        match = _CLAUSE_RE.match(token)
+        if match:
+            if match.group(1) or match.group(3) != ":" or \
+                    _FIELD_ALIASES.get(match.group(2).lower()) not in ("filepath", "all"):
+                continue
+            value = match.group(4)
+        elif token.startswith("-"):
+            continue
+        else:
+            value = token
+        if "|" in value:
+            continue
+        words.extend(word.lower() for word in re.findall(r"[^\W_]+", value, re.UNICODE))
+    return words
+
+
+def folder_for(filepath, words):
+    """The highest folder above a file whose path contains every word, so a
+    search for a folder's name lists that folder once rather than each
+    folder below it.  The file's own folder when no folder name matches."""
+    separators = [i for i, char in enumerate(filepath) if char in "/\\"]
+    if not separators:
+        return ""
+    parent_end = separators[-1]
+    if words:
+        lowered = filepath.lower()
+        for end in separators:
+            if end and all(word in lowered[:end] for word in words):
+                return _with_root_separator(filepath, end)
+    return _with_root_separator(filepath, parent_end) if parent_end else filepath[:1]
+
+
+def _with_root_separator(filepath, end):
+    """filepath[:end], keeping the separator after a Windows drive letter:
+    F:\\ is the drive's root folder, but F: alone means F:'s current folder."""
+    if end == 2 and filepath[1] == ":":
+        return filepath[:3]
+    return filepath[:end]
 
 
 def normalize_photo_day(value):
@@ -88,6 +149,8 @@ _FIELD_ALIASES = {
     "content_hash": "content_hash",
     "list": "source_name",
     "source": "source_name",
+    "stack": "stack",
+    "bracket": "stack",
 }
 _TEXT_COLUMNS = {
     "filepath": "f.filepath",
@@ -98,6 +161,7 @@ _TEXT_COLUMNS = {
     "gps_lon": "f.gps_lon",
     "location": "f.location",
     "content_hash": "f.content_hash",
+    "stack": "f.stack",
     "source_name": "s.name",
 }
 _ALL_TEXT_COLUMNS = tuple(_TEXT_COLUMNS.values())
@@ -290,7 +354,7 @@ def compile_query(query, *, fts_enabled=True):
         field = _FIELD_ALIASES.get(raw_field)
         if field is None:
             names = (
-                "path, name, ext, date, size, modified, lat, lon, location, hash, list"
+                "path, name, ext, date, size, modified, lat, lon, location, hash, stack, list"
             )
             raise SearchQueryError(
                 f"Unknown field {raw_field!r}. Searchable fields: {names}."
@@ -408,7 +472,8 @@ class InventorySearchIndex:
                 id INTEGER PRIMARY KEY, source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
                 filepath TEXT NOT NULL, filename TEXT NOT NULL, extension TEXT NOT NULL,
                 date_taken TEXT NOT NULL, size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
-                gps_lat TEXT NOT NULL, gps_lon TEXT NOT NULL, location TEXT NOT NULL, content_hash TEXT NOT NULL
+                gps_lat TEXT NOT NULL, gps_lon TEXT NOT NULL, location TEXT NOT NULL, content_hash TEXT NOT NULL,
+                stack TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS files_source ON files(source_id);
             CREATE INDEX IF NOT EXISTS files_size ON files(size_bytes);
@@ -419,15 +484,16 @@ class InventorySearchIndex:
         had_fts = self._has_fts(connection)
         try:
             connection.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-                filepath, date_taken, gps_lat, gps_lon, location, content_hash, source_name
+                filepath, date_taken, gps_lat, gps_lon, location, content_hash, stack, source_name
             )""")
         except sqlite3.OperationalError:
             pass
         if not had_fts and self._has_fts(connection):
             connection.execute("""INSERT INTO files_fts(
-                rowid, filepath, date_taken, gps_lat, gps_lon, location, content_hash, source_name)
+                rowid, filepath, date_taken, gps_lat, gps_lon, location, content_hash, stack,
+                source_name)
                 SELECT f.id, f.filepath, f.date_taken, f.gps_lat, f.gps_lon,
-                       f.location, f.content_hash, s.name
+                       f.location, f.content_hash, f.stack, s.name
                 FROM files f JOIN sources s ON s.id=f.source_id""")
         connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         connection.commit()
@@ -554,6 +620,7 @@ class InventorySearchIndex:
                     mtime = int(row.get("mtime_ns", "") or 0)
                 except ValueError:
                     mtime = 0
+                stack = row.get("stack", "") or ""
                 batch.append(
                     (
                         source_id,
@@ -567,13 +634,15 @@ class InventorySearchIndex:
                         row.get("gps_lon", "") or "",
                         row.get("location", "") or "",
                         row.get("content_hash", "") or "",
+                        stack if stack != "-" else "",  # "-": read, nothing to say
                     )
                 )
                 if len(batch) >= 2000:
                     connection.executemany(
                         """INSERT INTO files(
                         source_id, filepath, filename, extension, date_taken, size_bytes, mtime_ns,
-                        gps_lat, gps_lon, location, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        gps_lat, gps_lon, location, content_hash, stack)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         batch,
                     )
                     count += len(batch)
@@ -584,32 +653,81 @@ class InventorySearchIndex:
                 connection.executemany(
                     """INSERT INTO files(
                     source_id, filepath, filename, extension, date_taken, size_bytes, mtime_ns,
-                    gps_lat, gps_lon, location, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    gps_lat, gps_lon, location, content_hash, stack)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     batch,
                 )
                 count += len(batch)
         if self._has_fts(connection):
             connection.execute(
                 """INSERT INTO files_fts(
-                rowid, filepath, date_taken, gps_lat, gps_lon, location, content_hash, source_name)
-                SELECT id, filepath, date_taken, gps_lat, gps_lon, location, content_hash, ?
+                rowid, filepath, date_taken, gps_lat, gps_lon, location, content_hash, stack,
+                source_name)
+                SELECT id, filepath, date_taken, gps_lat, gps_lon, location, content_hash, stack, ?
                 FROM files WHERE source_id=?""",
                 (source_name, source_id),
             )
         return count
+
+    @staticmethod
+    def _limit_sources(where, params, source_paths):
+        if source_paths:
+            normalized = [str(Path(path).resolve()) for path in source_paths]
+            marks = ",".join("?" for _ in normalized)
+            where += f" AND s.path IN ({marks})"
+            params.extend(normalized)
+        return where
+
+    def search_folders(self, query, *, source_paths=None, should_stop=None):
+        """Every folder holding matching files (see folder_for), with how
+        many files match in it and their total size, sorted by folder.
+        Returns None when should_stop() says the search was replaced."""
+        words = _folder_words(query)
+        folders, totals = {}, {}
+        with closing(self._connect()) as connection:
+            join, where, params, _order = compile_query(
+                query, fts_enabled=self._has_fts(connection)
+            )
+            where = self._limit_sources(where, params, source_paths)
+            cursor = connection.execute(
+                f"""SELECT s.path, f.filepath, f.size_bytes, f.date_taken, f.mtime_ns
+                    FROM files f JOIN sources s ON s.id=f.source_id{join} WHERE {where}""",
+                params,
+            )
+            for number, (source, filepath, size, date_taken, mtime) in enumerate(cursor):
+                if should_stop and number % 5000 == 0 and should_stop():
+                    return None
+                cut = max(filepath.rfind("/"), filepath.rfind("\\"))
+                parent = filepath[:cut] if cut > 0 else filepath[:1]
+                folder = folders.get(parent)
+                if folder is None:
+                    folder = folders[parent] = folder_for(filepath, words)
+                total = totals.get((source, folder))
+                if total is None:
+                    total = totals[(source, folder)] = [0, 0, "", "", 0]
+                total[0] += 1
+                total[1] += size or 0
+                day = (date_taken or "")[:10].replace(":", "-")
+                if day:
+                    if not total[2] or day < total[2]:
+                        total[2] = day
+                    if day > total[3]:
+                        total[3] = day
+                if (mtime or 0) > total[4]:
+                    total[4] = mtime
+        results = [FolderResult(source, folder, *total)
+                   for (source, folder), total in totals.items()]
+        results.sort(key=lambda r: (r.filepath.lower(), r.source_path.lower()))
+        return results
 
     def search(self, query, *, source_paths=None, limit=500, offset=0):
         with closing(self._connect()) as connection:
             join, where, params, order = compile_query(
                 query, fts_enabled=self._has_fts(connection)
             )
-            if source_paths:
-                normalized = [str(Path(path).resolve()) for path in source_paths]
-                marks = ",".join("?" for _ in normalized)
-                where += f" AND s.path IN ({marks})"
-                params.extend(normalized)
+            where = self._limit_sources(where, params, source_paths)
             sql = f"""SELECT s.path, f.filepath, f.date_taken, f.size_bytes, f.mtime_ns,
-                            f.gps_lat, f.gps_lon, f.location, f.content_hash
+                            f.gps_lat, f.gps_lon, f.location, f.content_hash, f.stack
                      FROM files f JOIN sources s ON s.id=f.source_id{join}
                      WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?"""
             params.extend((int(limit) + 1, int(offset)))

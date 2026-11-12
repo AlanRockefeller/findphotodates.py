@@ -119,6 +119,7 @@ def _expected_inventory_bytes(root, hash_options):
                 "",
                 "",
                 "",
+                "",  # stack: the fake ExifTool reads no maker notes
             ]
         )
 

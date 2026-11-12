@@ -168,3 +168,19 @@ def test_a_failed_update_is_still_reported_when_the_earlier_index_turns_up_later
     assert dialog.index_ready  # what was indexed before can still be searched
     assert "10 files ready" in dialog.status_var.get()
     assert notes == ["Could not update the search index: disk full"]
+
+
+def test_unmount_command_is_only_offered_where_it_can_work(monkeypatch):
+    import findphotodates_drives as drives
+
+    monkeypatch.setattr(drives, "_is_wsl", lambda: False)
+    monkeypatch.setattr(drives.platform, "system", lambda: "Darwin")
+    assert drives.unmount_command("/Volumes/Photos") == ["diskutil", "unmount", "/Volumes/Photos"]
+    assert drives.unmount_command("/") is None  # the system drive
+    monkeypatch.setattr(drives.platform, "system", lambda: "Windows")
+    assert drives.unmount_command("E:\\") is None
+    monkeypatch.setattr(drives.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(drives.shutil, "which", lambda name: None)
+    assert drives.unmount_command("/no/such/mount") == ["umount", "/no/such/mount"]
+    monkeypatch.setattr(drives, "_is_wsl", lambda: True)
+    assert drives.unmount_command("/mnt/e") is None

@@ -126,7 +126,10 @@ from findphotodates_drives import (  # noqa: E402,F401
     INVENTORY_DIR_NAME,
     list_belongs_to_other_drive,
     match_lists_to_drives,
+    mount_command,
     read_inventory_header,
+    UnmountedDrive,
+    unmounted_drives,
 )
 from findphotodates_health import (  # noqa: E402,F401
     _add_usb_findings,
@@ -268,7 +271,39 @@ TSV_COLUMNS = [
     # inside a .zip/.tar archive; its path is the archive's path plus the
     # path inside it). Lists from before v1.7 don't have this column.
     "flags",
+    # How the photo was shot, when the camera records it (Olympus/OM System):
+    # "Focus Bracketing, Shot 3", "Focus-stacked (15 images)" and the like.
+    # "-" means it was read and there's nothing to say; blank means it was
+    # never read (lists made before this column was added have none).
+    "stack",
 ]
+# File types whose maker notes may say how a photo was shot (see "stack")
+STACK_EXTENSIONS = frozenset({"orf", "jpg", "jpeg"})
+STACK_NONE = "-"
+
+
+def _file_extension(path):
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _is_olympus(make):
+    make = (make or "").upper()
+    return make.startswith("OLYMPUS") or make.startswith("OM DIGITAL")
+
+
+def _stack_label(record):
+    """What an ExifTool record says about focus stacking or bracketing:
+    the camera's stacked result ("Focus-stacked (15 images)", or another
+    merged shot such as "Tripod high resolution"), a bracketing shot
+    ("Focus Bracketing, Shot 3"), or STACK_NONE."""
+    stacked = str(record.get("StackedImage") or "").strip()
+    if stacked and stacked not in ("-", "No") and not stacked.startswith("No "):
+        return stacked
+    drive = str(record.get("DriveMode") or "").strip()
+    if "Bracketing" in drive:
+        return drive
+    return STACK_NONE
 # Flags, see TSV_COLUMNS
 FLAG_PLACEHOLDER = "placeholder"
 FLAG_ARCHIVE = "archive"
@@ -1027,13 +1062,16 @@ class ExifToolPersistent:
     """
 
     _SENTINEL = "{ready}\n"
+    # No -n: the stack tags are wanted as ExifTool words, not numbers, so the
+    # GPS tags ask for numbers on their own with "#".
     _TAGS = [
         "-DateTimeOriginal",
         "-CreateDate",
         "-MediaCreateDate",
-        "-GPSLatitude",
-        "-GPSLongitude",
+        "-GPSLatitude#",
+        "-GPSLongitude#",
     ]
+    _STACK_TAGS = ["-Make", "-Olympus:DriveMode", "-Olympus:StackedImage"]
     _DATE_TAG_COUNT = 3  # first 3 are date tags
     _DATE_KEYS = ("DateTimeOriginal", "CreateDate", "MediaCreateDate")
 
@@ -1041,6 +1079,7 @@ class ExifToolPersistent:
         self._proc = None
         self.aborted = False
         self.last_errors = {}  # filepath -> ExifTool error from the last batch_query
+        self.last_stack = {}   # filepath -> _stack_label() for STACK_EXTENSIONS files
 
     def abort(self):
         """Kill ExifTool now, from any thread. A query in progress returns
@@ -1183,7 +1222,7 @@ class ExifToolPersistent:
 
     def query(self, filepath):
         """Query a single file. Returns (date, gps_lat, gps_lon)."""
-        args = ["-n", "-f", "-s", "-s", "-s", *self._TAGS, filepath]
+        args = ["-f", "-s", "-s", "-s", *self._TAGS, filepath]
         lines = self._send_and_read(args)
         if lines is None:
             return None, None, None
@@ -1208,10 +1247,12 @@ class ExifToolPersistent:
             return {}
 
         self.last_errors = {}
-        args = ["-json", "-n", "-f"]
+        self.last_stack = {}
+        args = ["-json", "-f"]
         if fast2:
             args.append("-fast2")
         args.extend(self._TAGS)
+        args.extend(self._STACK_TAGS)
         args.append("-Error")  # per-file "Error opening/reading file" etc.
         args.extend(filepaths)
         lines = self._send_and_read(args)
@@ -1243,6 +1284,7 @@ class ExifToolPersistent:
                 results[fp] = self.query(fp)
             return results
 
+        olympus = []  # read with -fast2, but the maker notes are wanted
         # Build lookup tables for safe matching (exact string, then abspath)
         exact_set = set(filepaths)
         abs_lookup = {}  # abspath -> original filepath
@@ -1283,6 +1325,21 @@ class ExifToolPersistent:
             error = rec.get("Error")
             if error and str(error) != "-" and _is_read_error_message(str(error)):
                 self.last_errors[matched_fp] = str(error)
+            if _file_extension(matched_fp) in STACK_EXTENSIONS:
+                self.last_stack[matched_fp] = _stack_label(rec)
+                if fast2 and _is_olympus(rec.get("Make")):
+                    olympus.append(matched_fp)
+
+        if olympus and not self.aborted:
+            # -fast2 skips maker notes, where Olympus cameras say how a photo
+            # was shot; read just those photos again in full.
+            errors, stack = self.last_errors, self.last_stack
+            full = self.batch_query(olympus, fast2=False)
+            for fp in olympus:
+                if full.get(fp, (None,))[0] or not results[fp][0]:
+                    results[fp] = full[fp]
+            stack.update(self.last_stack)
+            self.last_errors, self.last_stack = errors, stack
 
         return results
 
@@ -1616,8 +1673,8 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                 return cache
 
             expected = list(TSV_COLUMNS)
-            # Older lists: without flags (v1.6), and also without content_hash.
-            if fieldnames not in (expected, expected[:-1], expected[:-2]):
+            # Older lists: without stack (v1.7), flags (v1.6), and content_hash.
+            if fieldnames not in (expected, expected[:-1], expected[:-2], expected[:-3]):
                 if debug:
                     print(
                         f"Debug: Cache file {output_file} header mismatch. Found: {fieldnames}"
@@ -1674,6 +1731,7 @@ def load_cache(output_file, debug=False, inventory_root=None, quiet=True):
                             "filepath": display_path,
                             "content_hash": row.get("content_hash", "") or "",
                             "flags": row.get("flags", "") or "",
+                            "stack": row.get("stack", "") or "",
                         }
                     except (ValueError, KeyError):
                         continue
@@ -1779,6 +1837,7 @@ def write_dates_to_file_atomic(
                     location = row[6] if len(row) > 6 else ""
                     content_hash = row[7] if len(row) > 7 else ""
                     flags = row[8] if len(row) > 8 else ""
+                    stack = row[9] if len(row) > 9 else ""
                     writer.writerow(
                         [
                             filepath,
@@ -1790,6 +1849,7 @@ def write_dates_to_file_atomic(
                             location or "",
                             content_hash or "",
                             flags or "",
+                            stack or "",
                         ]
                     )
         os.replace(temp_file, output_file)
@@ -1971,7 +2031,7 @@ def _build_other_lists_index(output, quiet=False):
     from another drive's list instead of reading the file again.  Only rows
     with a date or GPS are indexed: a blank row may just mean that scan skipped
     or couldn't read the file.  Keys come from _other_list_key(); values are
-    (date_taken, gps_lat, gps_lon, location), or just date_taken when there is
+    (date_taken, gps_lat, gps_lon, location, stack), or just date_taken when there is
     no GPS (most rows; this keeps a few million entries to a few hundred MB).
     """
     index = {}
@@ -1992,6 +2052,7 @@ def _build_other_lists_index(output, quiet=False):
                     continue
                 col = {name: header.index(name) for name in TSV_COLUMNS[:7]}
                 width = max(col.values()) + 1
+                stack_col = header.index("stack") if "stack" in header else None
                 for row in reader:
                     if len(row) < width:
                         continue
@@ -2015,17 +2076,20 @@ def _build_other_lists_index(output, quiet=False):
                     location = row[col["location"]]
                     if location and is_coordinate_string(location):
                         location = ""
-                    fields = (date_taken, gps_lat or None, gps_lon or None, location or None)
+                    stack = (row[stack_col] if stack_col is not None and len(row) > stack_col
+                             else "")
+                    fields = (date_taken, gps_lat or None, gps_lon or None, location or None,
+                              stack or None)
                     existing = index.get(sig)
                     if existing is not None:
                         # Another list has this photo too: keep what it has and
                         # fill in whatever it is missing (e.g. a date) from this one.
                         if not isinstance(existing, tuple):
-                            existing = (existing, None, None, None)
+                            existing = (existing, None, None, None, None)
                         fields = tuple(old or new for old, new in zip(existing, fields))
                         if fields == existing:
                             continue
-                    if fields[1] or fields[2] or fields[3]:
+                    if fields[1] or fields[2] or fields[3] or fields[4]:
                         index[sig] = fields
                     else:
                         index[sig] = fields[0]
@@ -2648,6 +2712,24 @@ def _format_scan_activity(locate, hash_options):
     return f"Processing {work}"
 
 
+def _orf_folders(cache):
+    """Folders (cache keys) holding Olympus raw files."""
+    return {key.rsplit("/", 1)[0] for key in cache if key.lower().endswith(".orf")}
+
+
+def _needs_stack_read(key_path, ext, entry, orf_folders):
+    """A row from a list made before the stack column, for a photo that may
+    be an Olympus focus-bracketing shot or stack: raw files, and JPGs next
+    to them.  Read once; afterwards its stack value is never blank."""
+    if ext not in STACK_EXTENSIONS or not entry or entry.get("stack") or entry.get("flags"):
+        return False
+    if ext == "orf":
+        return True
+    if orf_folders is None:
+        return None  # the caller works out the folders, then asks again
+    return key_path.rsplit("/", 1)[0] in orf_folders
+
+
 def _should_retry_blank_exif(filepath, cached_row, retry_blank_exif):
     if not retry_blank_exif or not cached_row:
         return False
@@ -2716,9 +2798,12 @@ def _build_exiftool_rows(
     hash_conn,
     hash_cache_pending,
     stop_event=None,
+    stack=None,
 ):
     """Build inventory rows for a batch.  Returns None if *stop_event* is set
-    part way through, since a stopped batch must not be published."""
+    part way through, since a stopped batch must not be published.
+    *stack* maps a file's os path to its "stack" value."""
+    stack = stack or {}
     results = []
     file_counts = Counter()
     stats = {"t_hashing": 0.0, "t_geolocate": 0.0}
@@ -2759,6 +2844,8 @@ def _build_exiftool_rows(
                 gps_lon or "",
                 location or "",
                 content_hash,
+                "",
+                stack.get(os_path, ""),
             )
         )
         file_counts[ext] += 1
@@ -2808,6 +2895,7 @@ def _exiftool_worker(
             _t_active_start = time.time()
             batch_results = None
             read_errors = {}
+            stack = {}
             t_exiftool = 0.0
             metadata_done_count = 0
             try:
@@ -2841,12 +2929,14 @@ def _exiftool_worker(
                 ]
                 batch_results = {}
                 read_errors = {}
+                stack = {}
                 if fast2_batch:
                     fast2_paths = [item[1] for item in fast2_batch]
                     _te0 = time.time()
                     with throttle:
                         fast2_results = exiftool.batch_query(fast2_paths, fast2=True)
                     read_errors.update(getattr(exiftool, "last_errors", {}))
+                    stack.update(getattr(exiftool, "last_stack", {}))
                     batch_results.update(fast2_results)
                     t_exiftool += time.time() - _te0
                     metadata_done_count += len(fast2_batch)
@@ -2859,6 +2949,7 @@ def _exiftool_worker(
                     with throttle:
                         full_results = exiftool.batch_query(full_paths, fast2=False)
                     read_errors.update(getattr(exiftool, "last_errors", {}))
+                    stack.update(getattr(exiftool, "last_stack", {}))
                     batch_results.update(full_results)
                     t_exiftool += time.time() - _te0
                     metadata_done_count += len(full_batch)
@@ -2897,6 +2988,7 @@ def _exiftool_worker(
                 hash_conn,
                 hash_cache_pending,
                 stop_event,
+                stack=stack,
             )
             if stop_event.is_set():
                 # Stopped while hashing: leave the batch out so a resumed scan reads it.
@@ -3136,6 +3228,8 @@ def run_scan(
     retry_blank_exif_count = 0
     # Alan 9/28/26 - Track what differs from the previous list for the end-of-scan report.
     had_previous_list = bool(cache)
+    orf_folders = None  # see _needs_stack_read
+    stack_read_count = 0
     new_files = []  # (out_path, size_bytes, mtime_ns) not in the previous list
     # Alan 9/28/26 - Photos that were moved or copied keep their name, size and
     # modification time; reuse their earlier EXIF results instead of re-reading.
@@ -3208,6 +3302,7 @@ def run_scan(
                     entry.get("location") or "",
                     entry.get("content_hash") or "",
                     entry.get("flags") or "",
+                    entry.get("stack") or "",
                 )
             )
         return rows
@@ -3836,9 +3931,19 @@ def run_scan(
                     # A placeholder that has since been downloaded is read now.
                     downloaded = (cache_valid and not placeholder and FLAG_PLACEHOLDER
                                   in (cached_entry.get("flags") or ""))
+                    read_stack = False
+                    if cache_valid and not placeholder and not old_format:
+                        read_stack = _needs_stack_read(key_path, ext, cached_entry, orf_folders)
+                        if read_stack is None:
+                            orf_folders = _orf_folders(cache)
+                            read_stack = _needs_stack_read(key_path, ext, cached_entry,
+                                                           orf_folders)
+                        if read_stack:
+                            stack_read_count += 1
                     source_entry = (
                         cached_entry
                         if cache_valid and not retry_cached_blank_exif and not downloaded
+                        and not read_stack
                         else None
                     )
                     reused_moved = False
@@ -3855,7 +3960,7 @@ def run_scan(
                         )
                         if moved_entry is not None and not (
                             retry_blank_exif and not moved_entry.get("date_taken")
-                        ):
+                        ) and not (ext == "orf" and not moved_entry.get("stack")):
                             source_entry = moved_entry
                             reused_moved = True
                     reused_other = False
@@ -3864,6 +3969,7 @@ def run_scan(
                         and reuse_other_lists
                         and not old_format
                         and not retry_cached_blank_exif
+                        and not read_stack
                         and size_bytes
                         and ext in EXIFTOOL_EXTENSIONS
                     ):
@@ -3874,15 +3980,19 @@ def run_scan(
                         ))
                         if other_row is not None:
                             if isinstance(other_row, str):
-                                other_row = (other_row, None, None, None)
-                            date_taken, gps_lat, gps_lon, location = other_row
-                            source_entry = {
-                                "date_taken": date_taken,
-                                "gps_lat": gps_lat,
-                                "gps_lon": gps_lon,
-                                "location": location,
-                            }
-                            reused_other = True
+                                other_row = (other_row, None, None, None, None)
+                            date_taken, gps_lat, gps_lon, location, other_stack = other_row
+                            # An Olympus raw from a list made before the stack
+                            # column is read here instead, to learn its stack.
+                            if not (ext == "orf" and not other_stack):
+                                source_entry = {
+                                    "date_taken": date_taken,
+                                    "gps_lat": gps_lat,
+                                    "gps_lon": gps_lon,
+                                    "location": location,
+                                    "stack": other_stack,
+                                }
+                                reused_other = True
 
                     if source_entry is not None:
                         date_taken = source_entry["date_taken"]
@@ -3924,6 +4034,7 @@ def run_scan(
                                 location or "",
                                 content_hash,
                                 FLAG_PLACEHOLDER if placeholder else "",
+                                source_entry.get("stack") or "",
                             )
                         )
                         cached_count += 1
@@ -3947,6 +4058,7 @@ def run_scan(
                             # RAW/video/other EXIFTOOL_EXTENSIONS are not filtered.
                             skip_for_size = (
                                 not retry_cached_blank_exif
+                                and not read_stack
                                 and min_image_size > 0
                                 and ext in SIZE_FILTERED_IMAGE_EXTENSIONS
                                 and size_bytes < min_image_size
@@ -4215,6 +4327,8 @@ def run_scan(
             )
         if retry_blank_exif:
             print(f"Blank EXIF rows retried: {retry_blank_exif_count:,}")
+        if stack_read_count:
+            print(f"Photos read again for focus stacking info: {stack_read_count:,}")
 
     summarize_results(photo_data, file_counts, quiet, debug)
     if not quiet:
@@ -4619,6 +4733,7 @@ def add_hashes_to_inventory(
                         row.get("location", ""),
                         row.get("content_hash", ""),
                         row.get("flags", ""),
+                        row.get("stack", ""),
                     ]
                 )
         os.replace(temp_file, tsv_path)
@@ -5292,12 +5407,16 @@ _MENU_NAMES = frozenset({
     "_ask_folder",
     "_exiftool_install_hint",
     "_exiftool_available",
+    "_exiftool_version",
+    "_exiftool_status",
+    "EXIFTOOL_MIN_VERSION",
     "_ADVANCED_HELP",
     "_hash_label",
     "_run_interactive_scan",
     "_update_drive",
     "_drive_table_row",
     "_print_drive_menu",
+    "_print_unmounted",
     "_show_all_lists",
     "_advanced_menu",
     "_pick",

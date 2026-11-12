@@ -39,7 +39,9 @@ except (ImportError, OSError) as exc:
 
 import findphotodates as fp
 import findphotodates_coverage as coverage
+from findphotodates_drives import unmount_command
 from findphotodates_search import (
+    FolderResult,
     InventorySearchIndex,
     SearchQueryError,
     normalize_photo_day,
@@ -238,6 +240,14 @@ class HoverHelp:
             self.popup = None
 
 
+def _scrollbar(parent, orientation, command):
+    """A scrollbar in the window's theme, easy to see in light and dark
+    mode (Tk's own is pale gray on pale gray)."""
+    return ctk.CTkScrollbar(parent, orientation=orientation, command=command,
+                            button_color=("gray55", "gray50"),
+                            button_hover_color=("gray35", "gray70"))
+
+
 class FileSearchDialog(ctk.CTkToplevel):
     """Responsive search window backed by a persistent inventory index."""
 
@@ -263,6 +273,8 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._index_error = ""  # why the latest index update failed, if it did
         self.pending_search = False
         self.offset = 0
+        self._more = False      # the search has more file results to load
+        self._loading = False   # a search is running
         self._after_id = None
         self._closed = False
 
@@ -300,7 +312,7 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.query_var = ctk.StringVar()
         self.query_entry = ctk.CTkEntry(
             controls, textvariable=self.query_var, height=38,
-            placeholder_text='Optional: filename, folder, place, or filters such as ext:jpg size>10MB',
+            placeholder_text='Optional: filename, folder, place, or filters such as ext:jpg size>10MB stack:stacked',
         )
         self.query_entry.grid(row=0, column=0, sticky="ew", padx=(10, 7), pady=(10, 5))
         self.query_entry.bind("<Return>", self._search)
@@ -327,6 +339,9 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.date_entry.bind("<KeyRelease>", self._schedule_search)
         self.parent._text_button(date_row, "Today", self._use_today).grid(row=0, column=2, padx=(7, 0))
         self.parent._text_button(date_row, "Clear", self._clear_date).grid(row=0, column=3, padx=(3, 0))
+        self.folders_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(date_row, text="Folders only", variable=self.folders_var,
+                        command=self._folders_toggled).grid(row=0, column=4, padx=(24, 0))
         self.status_var = ctk.StringVar(value="Preparing the search index…")
         ctk.CTkLabel(controls, textvariable=self.status_var, anchor="w",
                      text_color=("gray35", "gray72"))\
@@ -357,26 +372,34 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.tree_style.map("FileSearch.Treeview",
                             background=[("selected", "#1f6aa5")],
                             foreground=[("selected", "#ffffff")])
-        columns = ("path", "date", "size", "modified", "location", "list")
+        self.tree_style.configure("FileSearch.Treeview.Heading",
+                                  background="#333333" if dark else "#e6e6e6",
+                                  foreground="#f2f2f2" if dark else "#202020")
+        columns = ("path", "date", "size", "modified", "location", "stack", "list")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings",
                                  style="FileSearch.Treeview", selectmode="browse")
         self.tree_columns = (("path", "File path", 390), ("date", "Photo date", 145),
                              ("size", "Size", 85), ("modified", "Modified", 145),
-                             ("location", "Place", 170), ("list", "File list", 170))
+                             ("location", "Place", 170), ("stack", "Stack", 190),
+                             ("list", "File list", 170))
         for column, title, width in self.tree_columns:
             self.tree.heading(column, text=title)
             self.tree.column(column, width=width, minwidth=60, stretch=column in ("path", "location"))
         self.tree_font = tkfont.nametofont("TkDefaultFont").copy()
         self.tree_heading_font = tkfont.nametofont("TkHeadingFont").copy()
         self.apply_scale(self.parent.gui_scale)
-        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview,
-                                 style="FileSearch.Vertical.TScrollbar")
-        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview,
-                                   style="FileSearch.Horizontal.TScrollbar")
-        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical = _scrollbar(frame, "vertical", self.tree.yview)
+        horizontal = _scrollbar(frame, "horizontal", self.tree.xview)
+
+        def scrolled(first, last):
+            vertical.set(first, last)
+            # Reaching the end of the results loads the next batch.
+            if float(first) > 0 and float(last) >= 0.999:
+                self._load_more()
+        self.tree.configure(yscrollcommand=scrolled, xscrollcommand=horizontal.set)
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(8, 0))
-        vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=(8, 0))
-        horizontal.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(0, 8))
+        vertical.grid(row=0, column=1, sticky="ns", padx=(2, 6), pady=(8, 0))
+        horizontal.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(2, 6))
         self.tree.bind("<<TreeviewSelect>>", self._selection_changed)
         self.tree.bind("<Double-1>", self._open_containing_folder)
         self.result_menu = Menu(self, tearoff=0, font=self.tree_font,
@@ -455,10 +478,14 @@ class FileSearchDialog(ctk.CTkToplevel):
             "  date:2024-06-30   date>=2020-01-01   date:missing\n"
             "  size>10MB   modified<2024-06-30\n"
             "  lat>35   lon<-120   location:\"New York\"\n"
-            "  hash:abc123   list:Archive\n\n"
+            "  hash:abc123   list:Archive\n"
+            "  stack:bracketing   stack:stacked   (Olympus / OM System cameras)\n\n"
             "Use : for contains, = for an exact value, * and ? as wildcards, | for alternatives, "
             "and a leading - to exclude a word or filter (for example -ext:tmp). "
-            "Use missing or present to test empty fields.",
+            "Use missing or present to test empty fields.\n\n"
+            "Folders only lists the folders that hold matches, with how many files match in "
+            "each. Searching for a folder's name lists that folder once, not every folder "
+            "inside it.",
             parent=self,
         )
 
@@ -535,10 +562,20 @@ class FileSearchDialog(ctk.CTkToplevel):
         sources = [selected] if selected else None
         self.search_btn.configure(state="disabled")
         self.more_btn.configure(state="disabled")
-        self.status_var.set("Searching…")
+        self._loading = True
+        folders = self.folders_var.get()
+        self.status_var.set("Finding folders…" if folders else
+                            "Loading more…" if append else "Searching…")
 
         def work():
             try:
+                if folders:
+                    found = self.index.search_folders(
+                        query, source_paths=sources,
+                        should_stop=lambda: generation != self.generation)
+                    if found is not None:
+                        self.events.put(("folders", generation, query, found))
+                    return
                 rows, more = self.index.search(query, source_paths=sources,
                                                limit=self.RESULT_LIMIT, offset=self.offset)
                 self.events.put(("results", generation, query, append, rows, more))
@@ -565,15 +602,35 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.tree_style.configure("FileSearch.Treeview", rowheight=round(27 * scale),
                                   font=self.tree_font)
         self.tree_style.configure("FileSearch.Treeview.Heading", font=self.tree_heading_font)
-        scrollbar_size = round(15 * scale)
-        self.tree_style.configure("FileSearch.Vertical.TScrollbar", width=scrollbar_size,
-                                  arrowsize=scrollbar_size)
-        self.tree_style.configure("FileSearch.Horizontal.TScrollbar", width=scrollbar_size,
-                                  arrowsize=scrollbar_size)
-        for column, _title, width in self.tree_columns:
-            self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale))
+        self._set_columns()
+
+    # In "Folders only" the table shows folders: Place becomes the number of
+    # matching files, and the other columns sum up the files in each folder.
+    FOLDER_COLUMNS = (("path", "Folder", 390), ("location", "Files", 90),
+                      ("size", "Total size", 100), ("date", "Photo dates", 210),
+                      ("modified", "Newest change", 145), ("list", "File list", 170))
+
+    def _set_columns(self):
+        folders = self.folders_var.get() if hasattr(self, "folders_var") else False
+        layout = self.FOLDER_COLUMNS if folders else self.tree_columns
+        scale = self.parent.gui_scale
+        self.tree.configure(displaycolumns=[column for column, _title, _width in layout])
+        for column, title, width in layout:
+            self.tree.heading(column, text=title, anchor="e" if column == "location" and folders
+                              else "center")
+            self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale),
+                             anchor="e" if column == "location" and folders else "w",
+                             stretch=column == "path" or (column == "location" and not folders))
+
+    def _folders_toggled(self):
+        self._set_columns()
+        self._clear_results()
+        if self._searched or self.query_var.get().strip() or self.date_var.get().strip():
+            self._search()
 
     def _load_more(self):
+        if not self._more or self._loading:
+            return
         self.offset = len(self.results)
         self._search(append=True)
 
@@ -590,24 +647,56 @@ class FileSearchDialog(ctk.CTkToplevel):
         except (ValueError, OSError, OverflowError):
             return ""
 
+    def _clear_results(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.results.clear()
+        self._more = False
+        self.more_btn.grid_remove()
+        self.copy_btn.configure(state="disabled")
+        self.open_btn.configure(state="disabled")
+        self.detail_var.set("Select a folder to see what it holds." if self.folders_var.get()
+                            else "Select a result to see its GPS coordinates and content hash.")
+
+    FOLDER_LIMIT = 2000  # more is slow to show and too many to look through
+
+    def _show_folders(self, query, folders):
+        self._clear_results()
+        for folder in folders[:self.FOLDER_LIMIT]:
+            dates = folder.first_date if folder.first_date == folder.last_date \
+                else f"{folder.first_date} to {folder.last_date}"
+            item = self.tree.insert("", "end", values=(
+                folder.filepath, dates, self._human_size(folder.size_bytes),
+                self._modified(folder.newest_mtime_ns), f"{folder.files:,}", "",
+                Path(folder.source_path).name,
+            ))
+            self.results[item] = folder
+        files = sum(folder.files for folder in folders)
+        count = len(folders)
+        label = "all indexed files" if not query else "your search"
+        shown = (f"; showing the first {self.FOLDER_LIMIT:,}, so add words to narrow it down"
+                 if count > self.FOLDER_LIMIT else "")
+        self.status_var.set(f"{count:,} folder{'s' if count != 1 else ''} with "
+                            f"{files:,} file{'s' if files != 1 else ''} matching {label}{shown}")
+        self._loading = False
+        self.search_btn.configure(state="normal")
+
     def _show_results(self, query, append, rows, more):
         if not append:
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            self.results.clear()
-            self.copy_btn.configure(state="disabled")
-            self.open_btn.configure(state="disabled")
-            self.detail_var.set("Select a result to see its GPS coordinates and content hash.")
+            self._clear_results()
         for result in rows:
             item = self.tree.insert("", "end", values=(
                 result.filepath, result.date_taken, self._human_size(result.size_bytes),
-                self._modified(result.mtime_ns), result.location, Path(result.source_path).name,
+                self._modified(result.mtime_ns), result.location, result.stack,
+                Path(result.source_path).name,
             ))
             self.results[item] = result
         count = len(self.results)
-        suffix = " — more matches available" if more else ""
+        suffix = " so far; scroll to the end for more" if more else ""
         label = "all indexed files" if not query else "your search"
         self.status_var.set(f"{count:,} result{'s' if count != 1 else ''} for {label}{suffix}")
+        self._more = more
+        self._loading = False
         (self.more_btn.grid if more else self.more_btn.grid_remove)()
         self.more_btn.configure(state="normal")
         self.search_btn.configure(state="normal")
@@ -619,6 +708,15 @@ class FileSearchDialog(ctk.CTkToplevel):
     def _selection_changed(self, _event=None):
         result = self._selected_result()
         if not result:
+            return
+        self.copy_btn.configure(state="normal")
+        self.open_btn.configure(state="normal")
+        if isinstance(result, FolderResult):
+            dates = result.first_date if result.first_date == result.last_date \
+                else f"{result.first_date} to {result.last_date}"
+            self.detail_var.set(f"{result.files:,} matching files, "
+                                f"{self._human_size(result.size_bytes)}"
+                                + (f"; photos taken {dates}" if dates else ""))
             return
         gps = ", ".join(part for part in (result.gps_lat, result.gps_lon) if part) or "none"
         content_hash = result.content_hash or "none"
@@ -731,9 +829,14 @@ class FileSearchDialog(ctk.CTkToplevel):
                     _, generation, query, append, rows, more = event
                     if generation == self.generation:
                         self._show_results(query, append, rows, more)
+                elif kind == "folders":
+                    _, generation, query, folders = event
+                    if generation == self.generation:
+                        self._show_folders(query, folders)
                 elif kind == "search_error":
                     _, generation, error = event
                     if generation == self.generation:
+                        self._loading = False
                         self.status_var.set(error)
                         self.more_btn.configure(state="normal")
                         self.search_btn.configure(state="normal")
@@ -843,7 +946,7 @@ class CoverageDialog(ctk.CTkToplevel):
                              stretch=column == "verdict")
         self.tree.tag_configure("risk", foreground="#e0603a" if dark else "#b3381a")
         self.tree.tag_configure("gone", foreground="gray55")
-        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        vertical = _scrollbar(frame, "vertical", self.tree.yview)
         self.tree.configure(yscrollcommand=vertical.set)
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
         vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
@@ -1152,7 +1255,7 @@ class CleanupDialog(ctk.CTkToplevel):
                                      ("size", "Size", 120)):
             self.tree.heading(column, text=title)
             self.tree.column(column, width=round(width * scale), stretch=column == "folder")
-        vertical = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        vertical = _scrollbar(frame, "vertical", self.tree.yview)
         self.tree.configure(yscrollcommand=vertical.set)
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
         vertical.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
@@ -1368,6 +1471,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self._job_label = ""
         self._last_report_dir = None
         self.exiftool_ready = False
+        self.unmounted = []  # plugged-in drives the system didn't mount
         self._advanced_auto_height = None
         self._compact_height = None
         self._hover_help = []
@@ -1422,8 +1526,9 @@ class FindPhotoDatesGUI(ctk.CTk):
         exif_row.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(exif_row, textvariable=self.exif_var, anchor="w",
                      text_color=("gray35", "gray72"), font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="ew")
-        self._text_button(exif_row, "Get ExifTool", lambda: __import__("webbrowser").open("https://exiftool.org/"))\
-            .grid(row=0, column=1, sticky="e")
+        # Shown only once the check finds ExifTool missing or out of date.
+        self.exif_link = self._text_button(
+            exif_row, "Get ExifTool", lambda: __import__("webbrowser").open("https://exiftool.org/"))
 
     def _scale_dialog_fonts(self):
         """Message boxes on Linux are drawn by Tk in its own fonts, which
@@ -1643,14 +1748,18 @@ class FindPhotoDatesGUI(ctk.CTk):
                 lists = fp.find_file_lists(self.list_dir)
                 fp.match_lists_to_drives(lists, drives)
                 fp.remember_connected_drives(lists)
-                self.events.put(("refresh", drives, lists, None))
+                try:
+                    unmounted = fp.unmounted_drives()
+                except Exception:
+                    unmounted = []  # only a convenience; never stop a refresh
+                self.events.put(("refresh", drives, lists, None, unmounted))
             except Exception as exc:
-                self.events.put(("refresh", [], [], str(exc)))
+                self.events.put(("refresh", [], [], str(exc), []))
         threading.Thread(target=work, daemon=True).start()
         threading.Thread(target=self._check_exiftool, daemon=True).start()
 
     def _check_exiftool(self):
-        self.events.put(("exiftool", fp._exiftool_available()))
+        self.events.put(("exiftool", fp._exiftool_status(fp._exiftool_version())))
 
     def _render_drives(self):
         for child in self.drive_frame.winfo_children():
@@ -1660,6 +1769,7 @@ class FindPhotoDatesGUI(ctk.CTk):
             self.drive_status.set("No connected drives found. Plug one in and refresh, or use Advanced to list a folder.")
             ctk.CTkLabel(self.drive_frame, textvariable=self.drive_status, anchor="w",
                          wraplength=720, font=ctk.CTkFont(size=15)).grid(row=0, column=0, sticky="ew")
+            self._render_unmounted(1)
             return
         widths = (32, 220, 78, 100, 145)
         header = ctk.CTkFrame(self.drive_frame, fg_color="transparent")
@@ -1669,6 +1779,9 @@ class FindPhotoDatesGUI(ctk.CTk):
             ctk.CTkLabel(header, text=title, width=widths[column], anchor="w",
                          font=ctk.CTkFont(size=14, weight="bold"))\
                 .grid(row=0, column=column, sticky="ew", padx=(7, 0))
+        unmount_width = 96
+        ctk.CTkLabel(header, text="", width=unmount_width)\
+            .grid(row=0, column=5, padx=(7, 8))  # keeps the titles over their columns
         for index, drive in enumerate(self.drives):
             var = ctk.BooleanVar(value=False)
             self.selected[drive.mount] = var
@@ -1705,7 +1818,94 @@ class FindPhotoDatesGUI(ctk.CTk):
                              text_color=("gray32", "gray76"))\
                     .grid(row=line, column=1, columnspan=4, sticky="ew", padx=(7, 8),
                           pady=(0, 8 if line == 2 else 0))
+            if unmount_command(drive.mount):
+                button = ctk.CTkButton(row, text="Unmount", width=unmount_width,
+                                       fg_color="transparent", border_width=1,
+                                       text_color=("gray10", "gray90"))
+                button.configure(command=lambda drive=drive, button=button:
+                                 self._unmount(drive, button))
+                button.grid(row=0, column=5, rowspan=3, padx=(7, 8))
+            else:
+                ctk.CTkLabel(row, text="", width=unmount_width)\
+                    .grid(row=0, column=5, rowspan=3, padx=(7, 8))
         self.drive_status.set("")
+        self._render_unmounted(len(self.drives) + 1)
+
+    def _render_unmounted(self, first_row):
+        """Plugged-in drives that aren't mounted, so they can't be scanned yet;
+        a red ✗ marks one the system refused because it wasn't shut down cleanly."""
+        for index, drive in enumerate(self.unmounted):
+            row = ctk.CTkFrame(self.drive_frame, corner_radius=5, border_width=1,
+                               border_color=("#d9a49a", "#7a3b30") if drive.dirty
+                               else ("gray82", "gray32"),
+                               fg_color=("gray94", "gray19"))
+            row.grid(row=first_row + index, column=0, sticky="ew", pady=2)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(row, text="✗" if drive.dirty else "○", width=32,
+                         text_color=("#c0392b", "#ff6b5b") if drive.dirty else ("gray45", "gray62"),
+                         font=ctk.CTkFont(size=22, weight="bold"))\
+                .grid(row=0, column=0, rowspan=2, padx=(8, 0))
+            size = fp._human_size(drive.size_bytes)
+            title = f"{drive.display_name}  ({', '.join(filter(None, (size, drive.fstype)))})"
+            ctk.CTkLabel(row, text=title, anchor="w", font=ctk.CTkFont(size=15, weight="bold"))\
+                .grid(row=0, column=1, sticky="ew", padx=(7, 0), pady=(9, 0))
+            if drive.dirty:
+                note = ("Plugged in, but not mounted: it wasn't shut down cleanly, so it's marked "
+                        "as needing a check. Mount it read-only to scan it. To fix it, plug it "
+                        "into Windows and run chkdsk on it (chkdsk X: /f, with its drive letter).")
+            else:
+                note = f"Plugged in, but not mounted ({drive.device}). Mount it to scan it."
+            ctk.CTkLabel(row, text=note, anchor="w", justify="left", wraplength=640,
+                         font=ctk.CTkFont(size=14), text_color=("gray32", "gray76"))\
+                .grid(row=1, column=1, sticky="ew", padx=(7, 8), pady=(0, 8))
+            command = fp.mount_command(drive.device, read_only=drive.dirty)
+            if command:
+                button = ctk.CTkButton(row, text="Mount read-only" if drive.dirty else "Mount",
+                                       width=130, fg_color="transparent", border_width=1,
+                                       text_color=("gray10", "gray90"))
+                button.configure(command=lambda drive=drive, button=button, command=command:
+                                 self._mount(drive, button, command))
+                button.grid(row=0, column=2, rowspan=2, padx=(7, 8))
+
+    def _mount(self, drive, button, command):
+        button.configure(state="disabled", text="Mounting…")
+
+        def work():
+            try:
+                result = subprocess.run(command, capture_output=True, text=True,
+                                        stdin=subprocess.DEVNULL, timeout=120)
+                error = "" if result.returncode == 0 else (
+                    (result.stderr or result.stdout).strip() or "udisksctl failed.")
+            except (OSError, subprocess.SubprocessError) as exc:
+                error = str(exc)
+            self.events.put(("mounted", drive.display_name, error))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _unmount(self, drive, button):
+        """Unmount a drive so it can be unplugged; its file list is kept."""
+        if self.running:
+            messagebox.showinfo("Unmount", "Wait for the current job to finish, or cancel it, "
+                                           "before unmounting a drive.")
+            return
+        command = unmount_command(drive.mount)
+        if not command:
+            return
+        button.configure(state="disabled", text="Unmounting…")
+        name = drive.display_name
+
+        def work():
+            try:
+                # Unsaved data is written out first, which can take a while.
+                result = subprocess.run(command, capture_output=True, text=True,
+                                        stdin=subprocess.DEVNULL, timeout=300)
+                error = "" if result.returncode == 0 else (
+                    (result.stderr or result.stdout).strip() or f"{command[0]} failed.")
+            except subprocess.TimeoutExpired:
+                error = "The drive is still busy after 5 minutes."
+            except OSError as exc:
+                error = str(exc)
+            self.events.put(("unmounted", name, error))
+        threading.Thread(target=work, daemon=True).start()
 
     def _sync_settings(self):
         try:
@@ -1842,7 +2042,7 @@ class FindPhotoDatesGUI(ctk.CTk):
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "refresh":
-                    _, self.drives, self.lists, error = event
+                    _, self.drives, self.lists, error, self.unmounted = event
                     self.refreshing = False
                     self.refresh_btn.configure(state="normal")
                     self.list_for = {fl.drive.mount: fl for fl in self.lists if fl.drive}
@@ -1855,11 +2055,30 @@ class FindPhotoDatesGUI(ctk.CTk):
                         update_search_index_in_background(self.lists)
                     if error:
                         messagebox.showerror("Refresh drives", error)
+                elif kind == "mounted":
+                    _, name, error = event
+                    if error:
+                        messagebox.showerror("Mount", f"{name} could not be mounted.\n\n{error}")
+                    self.refresh()
+                elif kind == "unmounted":
+                    _, name, error = event
+                    if error:
+                        messagebox.showerror(
+                            "Unmount", f"{name} could not be unmounted. Close any programs "
+                                       f"or windows using it and try again.\n\n{error}")
+                    else:
+                        messagebox.showinfo("Unmount", f"{name} is unmounted and safe to unplug.")
+                    self.refreshing = False  # show the drives as they are now, either way
+                    self.refresh()
                 elif kind == "exiftool":
-                    self.exiftool_ready = event[1]
-                    self.exif_var.set("ExifTool is ready." if event[1] else
-                                      "ExifTool is required to read photo dates. Install it before scanning.")
-                    self.start_btn.configure(state="normal" if event[1] and not self.running else "disabled")
+                    usable, up_to_date, message = event[1]
+                    self.exiftool_ready = usable
+                    self.exif_var.set(message)
+                    if up_to_date:
+                        self.exif_link.grid_remove()
+                    else:
+                        self.exif_link.grid(row=0, column=1, sticky="e")
+                    self.start_btn.configure(state="normal" if usable and not self.running else "disabled")
                 elif kind == "process":
                     self.process = event[1]
                     if self.stopping:

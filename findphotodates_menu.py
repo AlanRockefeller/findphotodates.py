@@ -23,6 +23,7 @@ from findphotodates_common import (  # noqa: F401
 )
 
 from findphotodates_drives import (  # noqa: F401
+    unmounted_drives,
     _count_rows,
     _last_updated_label,
     canonical_list_name,
@@ -116,11 +117,42 @@ def _exiftool_install_hint():
             "libimage-exiftool-perl  (Debian/Ubuntu)  or  sudo pacman -S perl-image-exiftool  (Arch).")
 
 
-def _exiftool_available():
+# Oldest ExifTool that reads dates from every file type we send it; 12.23
+# (2021) added JPEG XL, and HEIC, AVIF and Canon CR3 support came before that.
+# Older versions still work, but leave dates blank for the newer formats.
+EXIFTOOL_MIN_VERSION = 12.23
+
+
+def _exiftool_version():
+    """The installed ExifTool's version number, or None if it can't be run."""
     try:
-        return subprocess.run(["exiftool", "-ver"], capture_output=True, timeout=10).returncode == 0
+        result = subprocess.run(["exiftool", "-ver"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip().split()[0])
+    except (ValueError, IndexError):
+        return 0.0  # it runs, but says something we can't read as a version
+
+
+def _exiftool_available():
+    return _exiftool_version() is not None
+
+
+def _exiftool_status(version):
+    """(usable, up_to_date, message) for an ExifTool version from
+    _exiftool_version(). Only a missing or out-of-date ExifTool needs the
+    download link."""
+    if version is None:
+        return False, False, "ExifTool is required to read photo dates. Install it before scanning."
+    if version < EXIFTOOL_MIN_VERSION:
+        found = f"ExifTool {version:.2f}" if version else "This ExifTool"
+        return True, False, (f"{found} is out of date and may miss the dates in newer photo "
+                             f"types (HEIC, CR3, JPEG XL). Version {EXIFTOOL_MIN_VERSION:.2f} "
+                             f"or later is recommended.")
+    return True, True, f"ExifTool {version:.2f} is ready."
 
 
 _ADVANCED_HELP = {
@@ -302,7 +334,24 @@ def _drive_table_row(values, widths):
             for line in range(height)]
 
 
-def _print_drive_menu(drives, list_for, list_dir, lists):
+def _print_unmounted(unmounted):
+    """Plugged-in drives that aren't mounted, with how to mount them."""
+    for drive in unmounted:
+        size = _human_size(drive.size_bytes)
+        name = f"{drive.display_name} ({', '.join(filter(None, (size, drive.fstype)))})"
+        if drive.dirty:
+            print(f"\n  ✗ {name} is plugged in but wasn't mounted: it wasn't shut down cleanly,")
+            print("    so it's marked as needing a check. To scan it, mount it read-only:")
+            print(f"      udisksctl mount -b {drive.device} -o ro")
+            print("    To fix it, plug it into Windows and run chkdsk on it (chkdsk X: /f).")
+        else:
+            print(f"\n  ○ {name} is plugged in but not mounted. To scan it, mount it:")
+            print(f"      udisksctl mount -b {drive.device}")
+    if unmounted:
+        print("    Then choose r to look for drives again.")
+
+
+def _print_drive_menu(drives, list_for, list_dir, lists, unmounted=()):
     import textwrap
 
     print(f"\nFile lists are kept in: {list_dir}  ({len(lists)} list{'s' if len(lists) != 1 else ''})")
@@ -333,6 +382,7 @@ def _print_drive_menu(drives, list_for, list_dir, lists):
                                           break_on_hyphens=False):
                     print("| " + line.ljust(detail_width) + " |")
             print(rule)
+    _print_unmounted(unmounted)
     print()
     if len(drives) > 1:
         print("  To do several drives in a row, type their numbers, e.g. 1 3 or 2-4")
@@ -682,10 +732,14 @@ def _interactive_coverage(state):
 def interactive_main():
     """Menu-driven mode used when the program is started with no arguments."""
     print(f"\nfindphotodates {fp.__version__}: lists of the files on your drives\n")
-    if not _exiftool_available():
+    usable, up_to_date, message = _exiftool_status(_exiftool_version())
+    if not usable:
         print("ExifTool is needed to read the dates inside photos and videos, but it isn't installed.")
         print(_wrap(_exiftool_install_hint(), indent="  "))
         return
+    if not up_to_date:
+        print(_wrap(message + " Get the latest from https://exiftool.org", indent=""))
+        print()
     fp.migrate_default_hash_cache(quiet=True)
     settings = _InteractiveSettings()
     state = {"list_dir": default_inventory_dir(), "dirty": True}
@@ -708,8 +762,13 @@ def interactive_main():
                 state["list_for"] = {fl.drive.mount: fl for fl in state["lists"] if fl.drive}
                 state["dirty"] = False
                 remember_connected_drives(state["lists"])
+                try:
+                    state["unmounted"] = unmounted_drives()
+                except Exception:
+                    state["unmounted"] = []
             drives, list_for = state["drives"], state["list_for"]
-            _print_drive_menu(drives, list_for, state["list_dir"], state["lists"])
+            _print_drive_menu(drives, list_for, state["list_dir"], state["lists"],
+                              state.get("unmounted", ()))
             choice = _ask("\nChoose: ").lower()
             if choice in ("q", "quit", "exit"):
                 return

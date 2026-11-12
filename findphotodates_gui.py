@@ -1475,6 +1475,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         # A drive being mounted or unmounted: no jobs start until the drive
         # list has been refreshed afterwards.
         self.drive_busy = None
+        self._drive_op = 0              # counts mounts and unmounts
+        self._drive_op_finished = True  # whether the latest one has reported back
         self._advanced_auto_height = None
         self._compact_height = None
         self._hover_help = []
@@ -1745,7 +1747,8 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.refreshing = True
         self.refresh_btn.configure(state="disabled")
         self.drive_status.set("Looking for drives and file lists…")
-        busy = self.drive_busy  # a refresh started before a mount or unmount doesn't end it
+        # Only a refresh started after the mount or unmount reported back ends it.
+        busy = (self._drive_op, self._drive_op_finished)
 
         def work():
             try:
@@ -1875,12 +1878,17 @@ class FindPhotoDatesGUI(ctk.CTk):
                                  self._mount(drive, button, command))
                 button.grid(row=0, column=2, rowspan=2, padx=(7, 8))
 
+    def _begin_drive_op(self, description):
+        self._drive_op += 1
+        self._drive_op_finished = False
+        self.drive_busy = description
+
     def _mount(self, drive, button, command):
         if self.running:
             messagebox.showinfo("Mount", "Wait for the current job to finish first.")
             return
         button.configure(state="disabled", text="Mounting…")
-        self.drive_busy = f"mounting {drive.display_name}"
+        self._begin_drive_op(f"mounting {drive.display_name}")
 
         def work():
             try:
@@ -1904,7 +1912,7 @@ class FindPhotoDatesGUI(ctk.CTk):
             return
         button.configure(state="disabled", text="Unmounting…")
         name = drive.display_name
-        self.drive_busy = f"unmounting {name}"
+        self._begin_drive_op(f"unmounting {name}")
 
         def work():
             try:
@@ -2061,7 +2069,7 @@ class FindPhotoDatesGUI(ctk.CTk):
                 if kind == "refresh":
                     _, self.drives, self.lists, error, self.unmounted, busy = event
                     self.refreshing = False
-                    if busy == self.drive_busy:
+                    if busy == (self._drive_op, True):
                         self.drive_busy = None  # the list now shows the drives as they are
                     self.refresh_btn.configure(state="normal")
                     self.list_for = {fl.drive.mount: fl for fl in self.lists if fl.drive}
@@ -2076,12 +2084,14 @@ class FindPhotoDatesGUI(ctk.CTk):
                         messagebox.showerror("Refresh drives", error)
                 elif kind == "mounted":
                     _, name, error = event
+                    self._drive_op_finished = True
                     if error:
                         messagebox.showerror("Mount", f"{name} could not be mounted.\n\n{error}")
                     self.refreshing = False  # show the drives as they are now, either way
                     self.refresh()
                 elif kind == "unmounted":
                     _, name, error = event
+                    self._drive_op_finished = True
                     if error:
                         messagebox.showerror(
                             "Unmount", f"{name} could not be unmounted. Close any programs "

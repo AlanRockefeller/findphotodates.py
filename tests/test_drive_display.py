@@ -119,3 +119,18 @@ def test_menu_without_udisksctl_suggests_sudo_mount(capsys, monkeypatch):
     monkeypatch.setattr(menu, "mount_command", lambda device, read_only=False: None)
     fp._print_unmounted([drives.UnmountedDrive("/dev/sda2", "LaCie", "ntfs", 1, True)])
     assert "sudo mount -o ro /dev/sda2 /mnt/LaCie" in capsys.readouterr().out
+
+
+def test_mount_commands_are_quoted_for_awkward_labels(capsys, monkeypatch):
+    import shlex
+    import findphotodates_drives as drives
+    import findphotodates_menu as menu
+
+    monkeypatch.setattr(menu, "mount_command", lambda device, read_only=False: None)
+    fp._print_unmounted([drives.UnmountedDrive("/dev/sd b2", "John's $(rm) Drive", "ntfs", 1,
+                                               True)])
+    line = next(l.strip() for l in capsys.readouterr().out.splitlines() if "sudo mount" in l)
+    assert line == "sudo mkdir -p /mnt/John_s_rm_Drive && sudo mount -o ro '/dev/sd b2' /mnt/John_s_rm_Drive"
+    first, second = line.split(" && ")
+    assert shlex.split(second)[-2:] == ["/dev/sd b2", "/mnt/John_s_rm_Drive"]
+

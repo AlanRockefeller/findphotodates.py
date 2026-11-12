@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -342,17 +343,21 @@ def _print_unmounted(unmounted):
         name = f"{drive.display_name} ({', '.join(filter(None, (size, drive.fstype)))})"
         command = mount_command(drive.device, read_only=drive.dirty)
         if command is None:  # no udisksctl: mount it as administrator instead
-            folder = f"/mnt/{drive.label or 'drive'}".replace(" ", "_")
-            command = ["sudo", "mkdir", "-p", folder, "&&", "sudo", "mount",
-                       *(["-o", "ro"] if drive.dirty else []), drive.device, folder]
+            folder = "/mnt/" + (re.sub(r"[^A-Za-z0-9._-]+", "_", drive.label).strip("._")
+                                or "drive")
+            mount = ["sudo", "mount", *(["-o", "ro"] if drive.dirty else []), drive.device,
+                     folder]
+            command = f"sudo mkdir -p {shlex.quote(folder)} && {shlex.join(mount)}"
+        else:
+            command = shlex.join(command)
         if drive.dirty:
             print(f"\n  ✗ {name} is plugged in but wasn't mounted: it wasn't shut down cleanly,")
             print("    so it's marked as needing a check. To scan it, mount it read-only:")
-            print(f"      {' '.join(command)}")
+            print(f"      {command}")
             print("    To fix it, plug it into Windows and run chkdsk on it (chkdsk X: /f).")
         else:
             print(f"\n  ○ {name} is plugged in but not mounted. To scan it, mount it:")
-            print(f"      {' '.join(command)}")
+            print(f"      {command}")
     if unmounted:
         print("    Then choose r to look for drives again.")
 

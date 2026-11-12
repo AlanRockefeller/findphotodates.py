@@ -1878,6 +1878,13 @@ class FindPhotoDatesGUI(ctk.CTk):
                                  self._mount(drive, button, command))
                 button.grid(row=0, column=2, rowspan=2, padx=(7, 8))
 
+    def _drive_op_allowed(self, title):
+        """One mount or unmount at a time: drive_busy then covers exactly one."""
+        if self.drive_busy:
+            messagebox.showinfo(title, f"Wait until {self.drive_busy} has finished.")
+            return False
+        return True
+
     def _begin_drive_op(self, description):
         self._drive_op += 1
         self._drive_op_finished = False
@@ -1886,6 +1893,8 @@ class FindPhotoDatesGUI(ctk.CTk):
     def _mount(self, drive, button, command):
         if self.running:
             messagebox.showinfo("Mount", "Wait for the current job to finish first.")
+            return
+        if not self._drive_op_allowed("Mount"):
             return
         button.configure(state="disabled", text="Mounting…")
         self._begin_drive_op(f"mounting {drive.display_name}")
@@ -1908,7 +1917,7 @@ class FindPhotoDatesGUI(ctk.CTk):
                                            "before unmounting a drive.")
             return
         command = unmount_command(drive.mount)
-        if not command:
+        if not command or not self._drive_op_allowed("Unmount"):
             return
         button.configure(state="disabled", text="Unmounting…")
         name = drive.display_name

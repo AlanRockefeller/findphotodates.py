@@ -184,3 +184,25 @@ def test_unmount_command_is_only_offered_where_it_can_work(monkeypatch):
     assert drives.unmount_command("/no/such/mount") == ["umount", "/no/such/mount"]
     monkeypatch.setattr(drives, "_is_wsl", lambda: True)
     assert drives.unmount_command("/mnt/e") is None
+
+
+def test_a_second_mount_or_unmount_waits_for_the_first(monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, text: shown.append(text))
+    monkeypatch.setattr(gui, "unmount_command", lambda mount: ["udisksctl", "unmount"])
+    started = []
+    monkeypatch.setattr(gui.threading, "Thread",
+                        lambda target, daemon: types.SimpleNamespace(start=lambda: started.append(1)))
+    app = types.SimpleNamespace(running=False, drive_busy=None, _drive_op=0,
+                                _drive_op_finished=True)
+    app._drive_op_allowed = lambda title: gui.FindPhotoDatesGUI._drive_op_allowed(app, title)
+    app._begin_drive_op = lambda text: gui.FindPhotoDatesGUI._begin_drive_op(app, text)
+    button = types.SimpleNamespace(configure=lambda **kw: None)
+    drive = types.SimpleNamespace(mount="/run/media/a/A", display_name="A", device="/dev/sdb1")
+
+    gui.FindPhotoDatesGUI._unmount(app, drive, button)
+    assert started == [1] and app.drive_busy == "unmounting A"
+    gui.FindPhotoDatesGUI._mount(app, drive, button, ["udisksctl", "mount"])
+    gui.FindPhotoDatesGUI._unmount(app, drive, button)
+    assert started == [1] and app._drive_op == 1  # neither second operation started
+    assert shown == ["Wait until unmounting A has finished."] * 2

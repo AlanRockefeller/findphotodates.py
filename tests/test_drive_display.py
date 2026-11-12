@@ -75,8 +75,12 @@ def test_unmounted_drives_skip_system_partitions_and_mark_dirty_ones(monkeypatch
         "udisksctl", "mount", "-b", "/dev/sda2", "-o", "ro"]
 
 
-def test_menu_explains_a_dirty_drive(capsys):
+def test_menu_explains_a_dirty_drive(capsys, monkeypatch):
     import findphotodates_drives as drives
+    import findphotodates_menu as menu
+
+    monkeypatch.setattr(drives.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(menu, "mount_command", drives.mount_command)
 
     fp._print_unmounted([drives.UnmountedDrive("/dev/sda2", "LaCie", "ntfs", 4 * 10**12, True)])
     out = capsys.readouterr().out

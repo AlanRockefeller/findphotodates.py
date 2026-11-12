@@ -207,9 +207,10 @@ def _dirty_ntfs_devices(log_text):
         if match and all(part.startswith(match.group(1)) for part in match.group(2).split()):
             dirty = {name for name in dirty if not name.startswith(match.group(1))}
             continue
-        match = re.search(r"ntfs3\((\w+)\): volume is dirty", line)
+        # "ntfs3(sdb2): ..." in newer kernels, "ntfs3: sdb2: ..." in older ones
+        match = re.search(r"ntfs3(?:\((\w+)\)|: (\w+)): volume is dirty", line)
         if match:
-            dirty.add(match.group(1))
+            dirty.add(match.group(1) or match.group(2))
     return dirty
 
 
@@ -218,8 +219,10 @@ def unmounted_drives():
     Linux only, and not WSL; elsewhere the system mounts drives itself."""
     if platform.system() != "Linux" or _is_wsl() or not shutil.which("lsblk"):
         return []
-    out = _run_quiet(["lsblk", "-J", "-b", "-o",
-                      "NAME,PATH,LABEL,FSTYPE,SIZE,MOUNTPOINT,HOTPLUG,TYPE,PARTTYPENAME"])
+    columns = "NAME,PATH,LABEL,FSTYPE,SIZE,MOUNTPOINT,HOTPLUG,TYPE"
+    # PARTTYPENAME needs util-linux 2.35; without it, the EFI label check remains.
+    out = (_run_quiet(["lsblk", "-J", "-b", "-o", columns + ",PARTTYPENAME"])
+           or _run_quiet(["lsblk", "-J", "-b", "-o", columns]))
     try:
         stack = list(json.loads(out or "{}").get("blockdevices", []))
     except ValueError:

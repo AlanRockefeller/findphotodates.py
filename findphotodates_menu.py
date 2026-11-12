@@ -23,6 +23,7 @@ from findphotodates_common import (  # noqa: F401
 )
 
 from findphotodates_drives import (  # noqa: F401
+    mount_command,
     unmounted_drives,
     _count_rows,
     _last_updated_label,
@@ -339,14 +340,19 @@ def _print_unmounted(unmounted):
     for drive in unmounted:
         size = _human_size(drive.size_bytes)
         name = f"{drive.display_name} ({', '.join(filter(None, (size, drive.fstype)))})"
+        command = mount_command(drive.device, read_only=drive.dirty)
+        if command is None:  # no udisksctl: mount it as administrator instead
+            folder = f"/mnt/{drive.label or 'drive'}".replace(" ", "_")
+            command = ["sudo", "mkdir", "-p", folder, "&&", "sudo", "mount",
+                       *(["-o", "ro"] if drive.dirty else []), drive.device, folder]
         if drive.dirty:
             print(f"\n  ✗ {name} is plugged in but wasn't mounted: it wasn't shut down cleanly,")
             print("    so it's marked as needing a check. To scan it, mount it read-only:")
-            print(f"      udisksctl mount -b {drive.device} -o ro")
+            print(f"      {' '.join(command)}")
             print("    To fix it, plug it into Windows and run chkdsk on it (chkdsk X: /f).")
         else:
             print(f"\n  ○ {name} is plugged in but not mounted. To scan it, mount it:")
-            print(f"      udisksctl mount -b {drive.device}")
+            print(f"      {' '.join(command)}")
     if unmounted:
         print("    Then choose r to look for drives again.")
 

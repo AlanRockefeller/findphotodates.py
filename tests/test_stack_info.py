@@ -143,3 +143,23 @@ def test_stack_is_searchable_and_dash_is_blank(tmp_path):
     assert names("stack:stacked") == ["b.JPG"]
     assert sorted(names("focus")) == ["a.ORF", "b.JPG"]
     assert names("stack:missing") == ["c.JPG"]
+
+
+def test_failed_full_reread_keeps_its_error_and_leaves_stack_unread(monkeypatch):
+    import json
+
+    def fake_send(self, args):
+        fast2 = "-fast2" in args
+        records = [{"SourceFile": fp, "DateTimeOriginal": "2026:11:02 15:48:14",
+                    "Make": "OLYMPUS CORPORATION", "DriveMode": "-", "StackedImage": "-",
+                    **({} if fast2 else {"Error": "Error reading file"})}
+                   for fp in [a for a in args if a.startswith("/")]]
+        return json.dumps(records).splitlines()
+
+    monkeypatch.setattr(fpd.ExifToolPersistent, "_send_and_read", fake_send)
+    monkeypatch.setattr(fpd, "_is_read_error_message", lambda message: True)
+    tool = fpd.ExifToolPersistent()
+    results = tool.batch_query(["/p/o.jpg"], fast2=True)
+    assert results["/p/o.jpg"][0] == "2026:11:02 15:48:14"  # the fast read's date is kept
+    assert tool.last_errors == {"/p/o.jpg": "Error reading file"}
+    assert tool.last_stack == {}  # blank, so a later scan tries again

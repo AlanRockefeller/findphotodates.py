@@ -81,3 +81,41 @@ def test_menu_explains_a_dirty_drive(capsys):
     fp._print_unmounted([drives.UnmountedDrive("/dev/sda2", "LaCie", "ntfs", 4 * 10**12, True)])
     out = capsys.readouterr().out
     assert "✗ LaCie" in out and "udisksctl mount -b /dev/sda2 -o ro" in out and "chkdsk" in out
+
+
+def test_older_kernels_colon_dirty_message_is_recognized():
+    import findphotodates_drives as drives
+
+    log = " sdb: sdb1 sdb2\nntfs3: sdb2: volume is dirty and \"force\" flag is not set!"
+    assert drives._dirty_ntfs_devices(log) == {"sdb2"}
+
+
+def test_lsblk_without_parttypename_falls_back(monkeypatch):
+    import json
+    import findphotodates_drives as drives
+
+    calls = []
+
+    def run_quiet(cmd, timeout=30):
+        calls.append(cmd)
+        if cmd[0] == "lsblk" and "PARTTYPENAME" in cmd[-1]:
+            return None  # util-linux older than 2.35
+        return json.dumps({"blockdevices": [
+            {"name": "sdb1", "path": "/dev/sdb1", "type": "part", "hotplug": True,
+             "fstype": "exfat", "label": "Card", "size": 64}]})
+
+    monkeypatch.setattr(drives.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(drives, "_is_wsl", lambda: False)
+    monkeypatch.setattr(drives.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(drives, "_run_quiet", run_quiet)
+    assert [d.device for d in drives.unmounted_drives()] == ["/dev/sdb1"]
+    assert len(calls) == 2
+
+
+def test_menu_without_udisksctl_suggests_sudo_mount(capsys, monkeypatch):
+    import findphotodates_drives as drives
+    import findphotodates_menu as menu
+
+    monkeypatch.setattr(menu, "mount_command", lambda device, read_only=False: None)
+    fp._print_unmounted([drives.UnmountedDrive("/dev/sda2", "LaCie", "ntfs", 1, True)])
+    assert "sudo mount -o ro /dev/sda2 /mnt/LaCie" in capsys.readouterr().out

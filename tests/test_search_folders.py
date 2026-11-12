@@ -52,3 +52,8 @@ def test_search_folders_counts_files_per_matching_folder(tmp_path):
     assert [f.filepath for f in index.search_folders("ext:orf")] == \
         ["/c/olympus.stack.input.photos/2026"]
     assert index.search_folders("olympus", should_stop=lambda: True) is None
+
+
+def test_windows_drive_root_keeps_its_separator():
+    assert folder_for(r"F:\a.jpg", []) == "F:\\"
+    assert folder_for(r"F:\Photos\a.jpg", ["photos"]) == r"F:\Photos"

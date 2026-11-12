@@ -1325,7 +1325,9 @@ class ExifToolPersistent:
             error = rec.get("Error")
             if error and str(error) != "-" and _is_read_error_message(str(error)):
                 self.last_errors[matched_fp] = str(error)
-            if _file_extension(matched_fp) in STACK_EXTENSIONS:
+            # A file that couldn't be read has no stack value, so a later scan reads it.
+            if (_file_extension(matched_fp) in STACK_EXTENSIONS
+                    and matched_fp not in self.last_errors):
                 self.last_stack[matched_fp] = _stack_label(rec)
                 if fast2 and _is_olympus(rec.get("Make")):
                     olympus.append(matched_fp)
@@ -1338,7 +1340,13 @@ class ExifToolPersistent:
             for fp in olympus:
                 if full.get(fp, (None,))[0] or not results[fp][0]:
                     results[fp] = full[fp]
-            stack.update(self.last_stack)
+                if fp in self.last_errors:
+                    errors[fp] = self.last_errors[fp]
+                    stack.pop(fp, None)  # the maker notes weren't read
+                elif fp in self.last_stack:
+                    stack[fp] = self.last_stack[fp]
+                else:
+                    stack.pop(fp, None)
             self.last_errors, self.last_stack = errors, stack
 
         return results

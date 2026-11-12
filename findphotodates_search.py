@@ -91,8 +91,16 @@ def folder_for(filepath, words):
         lowered = filepath.lower()
         for end in separators:
             if end and all(word in lowered[:end] for word in words):
-                return filepath[:end]
-    return filepath[:parent_end] or filepath[:1]
+                return _with_root_separator(filepath, end)
+    return _with_root_separator(filepath, parent_end) if parent_end else filepath[:1]
+
+
+def _with_root_separator(filepath, end):
+    """filepath[:end], keeping the separator after a Windows drive letter:
+    F:\\ is the drive's root folder, but F: alone means F:'s current folder."""
+    if end == 2 and filepath[1] == ":":
+        return filepath[:3]
+    return filepath[:end]
 
 
 def normalize_photo_day(value):

@@ -19,6 +19,7 @@ _ICONS = {
     "warning": ("!", ("#c47f00", "#d99a1e")),
     "error": ("!", ("#c0392b", "#d9534f")),
 }
+_FOCUS_RING = ("#0f3f66", "#9ccbf0")
 _HEADLINE_MAX = 90
 _SCROLL_AFTER_LINES = 18
 
@@ -73,28 +74,49 @@ class _Dialog(ctk.CTkToplevel):
 
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.grid(row=2, column=0, columnspan=2, sticky="e", padx=22, pady=(22, 20))
-        primary = None
-        # buttons: [(text, value, is_primary)], shown left to right.
+        # buttons: [(text, value, is_primary)], shown left to right. CTkButton
+        # can't take keyboard focus, so the dialog tracks which one is focused:
+        # Tab/arrow keys move a focus ring, Enter/Space press the focused one,
+        # and each button's first letter presses it directly.
+        self._buttons = []
+        self._focused = 0
         for column, (text, value, is_primary) in enumerate(buttons):
             if is_primary:
                 button = ctk.CTkButton(row, text=text, width=96, height=34, corner_radius=8,
+                                       border_width=2, border_color=ctk.ThemeManager.theme[
+                                           "CTkButton"]["fg_color"],
                                        command=lambda v=value: self._finish(v))
-                primary = (button, value)
+                self._focused = column
             else:
                 button = ctk.CTkButton(row, text=text, width=96, height=34, corner_radius=8,
-                                       fg_color="transparent", border_width=1,
+                                       fg_color="transparent", border_width=2,
                                        border_color=("gray65", "gray40"),
                                        text_color=("gray15", "gray90"),
                                        hover_color=("gray85", "gray25"),
                                        command=lambda v=value: self._finish(v))
             button.grid(row=0, column=column, padx=(8, 0))
+            self._buttons.append((button, value, button.cget("border_color")))
+            self.bind(f"<Key-{text[0].lower()}>", lambda _e, v=value: self._finish(v))
+        self._show_focus()
 
         self.protocol("WM_DELETE_WINDOW", lambda: self._finish(self._cancel_value))
         self.bind("<Escape>", lambda _e: self._finish(self._cancel_value))
-        if primary is not None:
-            self.bind("<Return>", lambda _e: self._finish(primary[1]))
-            self.bind("<KP_Enter>", lambda _e: self._finish(primary[1]))
+        for key in ("<Return>", "<KP_Enter>", "<space>"):
+            self.bind(key, lambda _e: self._finish(self._buttons[self._focused][1]))
+        for key in ("<Tab>", "<Right>"):
+            self.bind(key, lambda _e: self._move_focus(1))
+        for key in ("<ISO_Left_Tab>", "<Shift-Tab>", "<Left>"):
+            self.bind(key, lambda _e: self._move_focus(-1))
         self._place_over(parent)
+
+    def _show_focus(self):
+        for index, (button, _value, border) in enumerate(self._buttons):
+            button.configure(border_color=_FOCUS_RING if index == self._focused else border)
+
+    def _move_focus(self, step):
+        self._focused = (self._focused + step) % len(self._buttons)
+        self._show_focus()
+        return "break"  # keep Tab from moving focus out of the dialog
 
     def _place_over(self, parent):
         self.update_idletasks()
@@ -145,11 +167,15 @@ def _show(kind, title, message, buttons, cancel_value, options):
         from tkinter import messagebox
         fallback = {"info": messagebox.showinfo, "warning": messagebox.showwarning,
                     "error": messagebox.showerror}
+        plain = {key: value for key, value in options.items() if key in ("icon", "default")}
         if kind in fallback:
-            return fallback[kind](title, message)
+            return fallback[kind](title, message, **plain)
         if len(buttons) == 3:
-            return messagebox.askyesnocancel(title, message)
-        return messagebox.askyesno(title, message)
+            return messagebox.askyesnocancel(title, message, **plain)
+        return messagebox.askyesno(title, message, **plain)
+    icon = options.get("icon")
+    if icon in _ICONS:  # e.g. askyesno(..., icon="warning") before a permanent delete
+        kind = icon
     return _Dialog(parent, kind, title, message, buttons, cancel_value).run()
 
 

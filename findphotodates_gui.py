@@ -99,6 +99,12 @@ _CHANGE_GROUPS = (("New files", "new"), ("Changed files", "changed"),
                   ("Moved or renamed", "moved"), ("Removed", "removed"))
 
 
+_READ_PROBLEMS = ((r"([\d,]+) folder\(s\) couldn't be opened", "folders couldn't be opened"),
+                  (r"([\d,]+) file\(s\) couldn't be read", "files couldn't be read"),
+                  (r"([\d,]+) photo\(s\)/video\(s\) couldn't be read",
+                   "photos/videos couldn't be read for dates"))
+
+
 def note_summary_line(line, summary):
     """Remember the parts of a job's output worth repeating once it finishes."""
     line = line.strip()
@@ -123,6 +129,12 @@ def note_summary_line(line, summary):
             return
     if line.startswith("Reports saved in: "):
         summary["reports"] = True
+        return
+    for pattern, word in _READ_PROBLEMS:
+        match = re.match(pattern, line)
+        if match:
+            summary.setdefault("read_problems", {})[word] = int(match.group(1).replace(",", ""))
+            return
 
 
 def summary_text(summary):
@@ -143,6 +155,11 @@ def summary_text(summary):
             parts.append("no changes since the last scan")
     if summary.get("reports"):
         parts.append("backup reports are ready")
+    problems = summary.get("read_problems")
+    if problems:
+        # Lead with this so it isn't lost behind the counts.
+        parts.insert(0, "Read problems: " + ", ".join(
+            f"{problems[word]:,} {word}" for _, word in _READ_PROBLEMS if word in problems) + " (see details)")
     if not parts:
         return None
     text = " · ".join(parts)
@@ -2207,6 +2224,8 @@ class FindPhotoDatesGUI(ctk.CTk):
             self.detail_var.set("Start the same scan again to continue where it left off.")
         elif code == 0:
             self.detail_var.set(summary or "Finished.")
+            if self._summary.get("read_problems") and not self._log_open:
+                self._toggle_log()
         if self.stopping:
             self.phase_var.set("Stopped — saved progress can be resumed")
             self._pending_scans.clear()

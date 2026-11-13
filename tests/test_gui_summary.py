@@ -46,3 +46,16 @@ def test_dialog_uses_a_short_first_paragraph_as_its_headline():
     assert dialogs.split_message("Unmount", "E is safe to unplug.") == ("E is safe to unplug.", "")
     long_line = "x" * 200
     assert dialogs.split_message("Command", long_line) == ("Command", long_line)
+
+
+def test_read_problems_lead_the_summary():
+    lines = [
+        "Read problems:",
+        "  3 folder(s) couldn't be opened (Permission denied).",
+        "  1,204 file(s) couldn't be read (Input/output error).",
+        "Dates written to 'x' (10 files listed).",
+        "  Nothing new, changed or removed.",
+    ]
+    assert _summarize(lines) == (
+        "Read problems: 3 folders couldn't be opened, 1,204 files couldn't be read (see details)"
+        " · 10 files in the file list · no changes since the last scan")

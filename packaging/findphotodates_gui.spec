@@ -21,7 +21,7 @@ gui = Analysis(
     pathex=[ROOT],
     binaries=[],
     datas=collect_data_files("customtkinter"),
-    hiddenimports=["findphotodates", "findphotodates_common", "findphotodates_drives",
+    hiddenimports=["findphotodates", "findphotodates_gui_dialogs", "findphotodates_common", "findphotodates_drives",
                    "findphotodates_health", "findphotodates_menu", "findphotodates_coverage",
                    "check_photo_backups"],
     hookspath=[],

@@ -18,10 +18,12 @@ from pathlib import Path
 from findphotodates_gui_startup import dependency_message
 
 try:
-    from tkinter import Menu, TclError, filedialog, messagebox, ttk
+    from tkinter import Menu, TclError, filedialog, ttk
     from tkinter import font as tkfont
 
     import customtkinter as ctk
+
+    import findphotodates_gui_dialogs as messagebox
 except (ImportError, OSError) as exc:
     if __name__ == "__main__":
         message = dependency_message(exc)
@@ -30,6 +32,7 @@ except (ImportError, OSError) as exc:
             import tkinter
             root = tkinter.Tk()
             root.withdraw()
+            import tkinter.messagebox
             tkinter.messagebox.showerror("Find Photo Dates", message)
             root.destroy()
         except Exception:
@@ -90,6 +93,77 @@ def progress_fraction(line):
     if match:
         return min(1.0, max(0.0, float(match.group(3)) / 100))
     return None
+
+
+_CHANGE_GROUPS = (("New files", "new"), ("Changed files", "changed"),
+                  ("Moved or renamed", "moved"), ("Removed", "removed"))
+
+
+_READ_PROBLEMS = ((r"([\d,]+) folder\(s\) couldn't be opened", "folders couldn't be opened"),
+                  (r"([\d,]+) file\(s\) couldn't be read", "files couldn't be read"),
+                  (r"([\d,]+) photo\(s\)/video\(s\) couldn't be read",
+                   "photos/videos couldn't be read for dates"))
+
+
+def note_summary_line(line, summary):
+    """Remember the parts of a job's output worth repeating once it finishes."""
+    line = line.strip()
+    match = re.search(r"\(([\d,]+) files listed\)", line)
+    if match:
+        summary["files"] = int(match.group(1).replace(",", ""))
+        return
+    match = re.match(r"Files indexed: [\d,]+ \(([\d,]+) with EXIF dates\)", line)
+    if match:
+        summary["dated"] = int(match.group(1).replace(",", ""))
+        return
+    if line == "Nothing new, changed or removed.":
+        summary["changes"] = {}
+        return
+    if "no earlier scan to compare with" in line:
+        summary["first_scan"] = True
+        return
+    for prefix, word in _CHANGE_GROUPS:
+        match = re.match(re.escape(prefix) + r"[^:]*: ([\d,]+)$", line)
+        if match:
+            summary.setdefault("changes", {})[word] = int(match.group(1).replace(",", ""))
+            return
+    if line.startswith("Reports saved in: "):
+        summary["reports"] = True
+        return
+    for pattern, word in _READ_PROBLEMS:
+        match = re.match(pattern, line)
+        if match:
+            summary.setdefault("read_problems", {})[word] = int(match.group(1).replace(",", ""))
+            return
+
+
+def summary_text(summary):
+    """One short line describing a finished job, or None if there is nothing to say."""
+    parts = []
+    if "files" in summary:
+        parts.append(f"{summary['files']:,} files in the file list")
+        if summary.get("dated"):
+            parts[-1] += f" ({summary['dated']:,} with photo dates)"
+    if summary.get("first_scan"):
+        parts.append("first scan of this drive")
+    elif "changes" in summary:
+        changes = summary["changes"]
+        if changes:
+            parts.append(", ".join(f"{changes[word]:,} {word}" for _, word in _CHANGE_GROUPS
+                                   if word in changes) + " since the last scan")
+        else:
+            parts.append("no changes since the last scan")
+    if summary.get("reports"):
+        parts.append("backup reports are ready")
+    problems = summary.get("read_problems")
+    if problems:
+        # Lead with this so it isn't lost behind the counts.
+        parts.insert(0, "Read problems: " + ", ".join(
+            f"{problems[word]:,} {word}" for _, word in _READ_PROBLEMS if word in problems) + " (see details)")
+    if not parts:
+        return None
+    text = " · ".join(parts)
+    return text[0].upper() + text[1:]
 
 
 def open_folder(path):
@@ -1467,6 +1541,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.advanced_open = False
         self._log_open = False
         self._lines = []
+        self._summary = {}
         self._pending_scans = []
         self._job_label = ""
         self._last_report_dir = None
@@ -2003,6 +2078,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.running = True
         self.stopping = False
         self._lines.clear()
+        self._summary = {}
         self._last_report_dir = None
         self.reports_btn.grid_remove()
         self.activity.grid()
@@ -2013,6 +2089,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.progress.configure(mode="indeterminate")
         self.progress.start()
         self.stop_btn.configure(state="normal")
+        self.stop_btn.grid()
         self.start_btn.configure(state="disabled")
         self.health_btn.configure(state="disabled")
         self.refresh_btn.configure(state="disabled")
@@ -2059,6 +2136,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.log.see("end")
         if line.strip():
             self.detail_var.set(line[:250])
+        note_summary_line(line, self._summary)
         fraction = progress_fraction(line)
         if fraction is not None:
             self.progress.stop()
@@ -2136,11 +2214,18 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.progress.stop()
         self.progress.configure(mode="determinate")
         self.progress.set(1 if code == 0 and not self.stopping else 0)
-        self.stop_btn.configure(state="disabled")
+        self.stop_btn.grid_remove()  # nothing left to stop; a greyed-out button looked like the job was still running
         self.start_btn.configure(state="normal" if self.exiftool_ready else "disabled")
         self.health_btn.configure(state="normal")
         self.refresh_btn.configure(state="normal")
         label = self._job_label
+        summary = summary_text(self._summary)
+        if self.stopping:
+            self.detail_var.set("Start the same scan again to continue where it left off.")
+        elif code == 0:
+            self.detail_var.set(summary or "Finished.")
+            if self._summary.get("read_problems") and not self._log_open:
+                self._toggle_log()
         if self.stopping:
             self.phase_var.set("Stopped — saved progress can be resumed")
             self._pending_scans.clear()
@@ -2174,7 +2259,7 @@ class FindPhotoDatesGUI(ctk.CTk):
         self.stopping = True
         self._pending_scans.clear()
         self.phase_var.set("Stopping after saving progress…")
-        self.stop_btn.configure(state="disabled")
+        self.stop_btn.grid_remove()
         self._signal_stop()
 
     def _health(self, extended=None):

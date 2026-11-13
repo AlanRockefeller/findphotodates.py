@@ -66,7 +66,7 @@ RESULT_SORT_COLUMNS = {
     "modified": "f.mtime_ns",
     "location": "f.location COLLATE NOCASE",
     "stack": "f.stack COLLATE NOCASE",
-    "list": "s.path COLLATE NOCASE",
+    "list": "s.name COLLATE NOCASE",  # the file name the table shows
 }
 
 # The same columns for folder results, where "location" is the file count.

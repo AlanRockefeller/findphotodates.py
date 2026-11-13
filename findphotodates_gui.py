@@ -637,6 +637,9 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._search_version = _IndexState.version
         if not append:
             self.offset = 0
+            # Folders from an earlier search must not come back if this one
+            # fails: the table is empty then, and sorting must not refill it.
+            self._folder_rows = None
         selected = self.list_choices.get(self.list_var.get())
         sources = [selected] if selected else None
         self.search_btn.configure(state="disabled")

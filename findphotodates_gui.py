@@ -48,6 +48,7 @@ from findphotodates_search import (
     InventorySearchIndex,
     SearchQueryError,
     normalize_photo_day,
+    sort_folders,
 )
 
 APP_TITLE = f"Find Photo Dates {fp.__version__}"
@@ -347,6 +348,10 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._index_error = ""  # why the latest index update failed, if it did
         self.pending_search = False
         self.offset = 0
+        self.sort_column = None      # result column the table is sorted by, if any
+        self.sort_descending = False
+        self._folder_rows = None     # every folder found, in the order shown
+        self._folder_query = ""      # the search those folders came from
         self._more = False      # the search has more file results to load
         self._loading = False   # a search is running
         self._after_id = None
@@ -632,12 +637,16 @@ class FileSearchDialog(ctk.CTkToplevel):
         self._search_version = _IndexState.version
         if not append:
             self.offset = 0
+            # Folders from an earlier search must not come back if this one
+            # fails: the table is empty then, and sorting must not refill it.
+            self._folder_rows = None
         selected = self.list_choices.get(self.list_var.get())
         sources = [selected] if selected else None
         self.search_btn.configure(state="disabled")
         self.more_btn.configure(state="disabled")
         self._loading = True
         folders = self.folders_var.get()
+        sort = self._sort_spec()
         self.status_var.set("Finding folders…" if folders else
                             "Loading more…" if append else "Searching…")
 
@@ -651,7 +660,8 @@ class FileSearchDialog(ctk.CTkToplevel):
                         self.events.put(("folders", generation, query, found))
                     return
                 rows, more = self.index.search(query, source_paths=sources,
-                                               limit=self.RESULT_LIMIT, offset=self.offset)
+                                               limit=self.RESULT_LIMIT, offset=self.offset,
+                                               sort=sort)
                 self.events.put(("results", generation, query, append, rows, more))
             except (SearchQueryError, sqlite3.Error) as exc:
                 self.events.put(("search_error", generation, str(exc)))
@@ -684,19 +694,55 @@ class FileSearchDialog(ctk.CTkToplevel):
                       ("size", "Total size", 100), ("date", "Photo dates", 210),
                       ("modified", "Newest change", 145), ("list", "File list", 170))
 
+    def _heading_text(self, column, title):
+        if column != self.sort_column:
+            return title
+        return f"{title} {'▼' if self.sort_descending else '▲'}"
+
     def _set_columns(self):
         folders = self.folders_var.get() if hasattr(self, "folders_var") else False
         layout = self.FOLDER_COLUMNS if folders else self.tree_columns
         scale = self.parent.gui_scale
         self.tree.configure(displaycolumns=[column for column, _title, _width in layout])
         for column, title, width in layout:
-            self.tree.heading(column, text=title, anchor="e" if column == "location" and folders
-                              else "center")
+            self.tree.heading(column, text=self._heading_text(column, title),
+                              command=lambda column=column: self._sort_by(column),
+                              anchor="e" if column == "location" and folders else "center")
             self.tree.column(column, width=round(width * scale), minwidth=round(60 * scale),
                              anchor="e" if column == "location" and folders else "w",
                              stretch=column == "path" or (column == "location" and not folders))
 
+    def _sort_by(self, column):
+        """Sort by a column, or flip the order if it is already the sort column.
+        File results are sorted by the search itself, so every match is
+        covered; folder results are sorted in memory."""
+        if column == self.sort_column:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column, self.sort_descending = column, False
+        self._set_columns()
+        if self._loading:
+            # A search is running; its results are sorted when they arrive.
+            # (Folder results are sorted in _show_folders.)
+            if not self.folders_var.get():
+                self._search()
+            return
+        if self.folders_var.get():
+            if self._folder_rows is not None:
+                self._folder_rows = sort_folders(self._folder_rows, self.sort_column,
+                                                 self.sort_descending)
+                self._clear_results()
+                self._show_folder_page()
+        elif self._searched:
+            self._search()
+
+    def _sort_spec(self):
+        return (self.sort_column, self.sort_descending) if self.sort_column else None
+
     def _folders_toggled(self):
+        # A sort column means a different thing for folders (Place is the
+        # file count, for one), so start the folder list unsorted.
+        self.sort_column, self.sort_descending = None, False
         self._set_columns()
         self._clear_results()
         if self._searched or self.query_var.get().strip() or self.date_var.get().strip():
@@ -704,6 +750,9 @@ class FileSearchDialog(ctk.CTkToplevel):
 
     def _load_more(self):
         if not self._more or self._loading:
+            return
+        if self.folders_var.get():
+            self._show_folder_page()
             return
         self.offset = len(self.results)
         self._search(append=True)
@@ -732,11 +781,19 @@ class FileSearchDialog(ctk.CTkToplevel):
         self.detail_var.set("Select a folder to see what it holds." if self.folders_var.get()
                             else "Select a result to see its GPS coordinates and content hash.")
 
-    FOLDER_LIMIT = 2000  # more is slow to show and too many to look through
-
     def _show_folders(self, query, folders):
         self._clear_results()
-        for folder in folders[:self.FOLDER_LIMIT]:
+        self._folder_rows = sort_folders(folders, self.sort_column, self.sort_descending)
+        self._folder_query = query
+        self._loading = False
+        self.search_btn.configure(state="normal")
+        self._show_folder_page()
+
+    def _show_folder_page(self):
+        """Show the next batch of folders, after those already on screen."""
+        rows = self._folder_rows
+        start = len(self.results)
+        for folder in rows[start:start + self.RESULT_LIMIT]:
             dates = folder.first_date if folder.first_date == folder.last_date \
                 else f"{folder.first_date} to {folder.last_date}"
             item = self.tree.insert("", "end", values=(
@@ -745,15 +802,17 @@ class FileSearchDialog(ctk.CTkToplevel):
                 Path(folder.source_path).name,
             ))
             self.results[item] = folder
-        files = sum(folder.files for folder in folders)
-        count = len(folders)
-        label = "all indexed files" if not query else "your search"
-        shown = (f"; showing the first {self.FOLDER_LIMIT:,}, so add words to narrow it down"
-                 if count > self.FOLDER_LIMIT else "")
+        shown = len(self.results)
+        count = len(rows)
+        files = sum(folder.files for folder in rows)
+        more = shown < count
+        self._more = more
+        (self.more_btn.grid if more else self.more_btn.grid_remove)()
+        self.more_btn.configure(state="normal")
+        label = "all indexed files" if not self._folder_query else "your search"
+        suffix = f"; {shown:,} shown so far; scroll to the end for more" if more else ""
         self.status_var.set(f"{count:,} folder{'s' if count != 1 else ''} with "
-                            f"{files:,} file{'s' if files != 1 else ''} matching {label}{shown}")
-        self._loading = False
-        self.search_btn.configure(state="normal")
+                            f"{files:,} file{'s' if files != 1 else ''} matching {label}{suffix}")
 
     def _show_results(self, query, append, rows, more):
         if not append:

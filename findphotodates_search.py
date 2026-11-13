@@ -58,6 +58,37 @@ class FolderResult:
     newest_mtime_ns: int
 
 
+# Result table columns that can be sorted, as SQL for file results.
+RESULT_SORT_COLUMNS = {
+    "path": "f.filepath COLLATE NOCASE",
+    "date": "f.date_taken",
+    "size": "f.size_bytes",
+    "modified": "f.mtime_ns",
+    "location": "f.location COLLATE NOCASE",
+    "stack": "f.stack COLLATE NOCASE",
+    "list": "s.name COLLATE NOCASE",  # the file name the table shows
+}
+
+# The same columns for folder results, where "location" is the file count.
+FOLDER_SORT_KEYS = {
+    "path": lambda folder: folder.filepath.lower(),
+    "location": lambda folder: folder.files,
+    "size": lambda folder: folder.size_bytes,
+    "date": lambda folder: (folder.first_date, folder.last_date),
+    "modified": lambda folder: folder.newest_mtime_ns,
+    "list": lambda folder: Path(folder.source_path).name.lower(),
+}
+
+
+def sort_folders(folders, column, descending=False):
+    """The folders in the order of a result column; unknown columns keep
+    the order they came in."""
+    key = FOLDER_SORT_KEYS.get(column)
+    if key is None:
+        return list(folders)
+    return sorted(folders, key=key, reverse=descending)
+
+
 def _folder_words(query):
     """The lowercase words a folder's own path should contain: plain words
     and path: filters.  Field filters such as ext:jpg describe files."""
@@ -720,11 +751,17 @@ class InventorySearchIndex:
         results.sort(key=lambda r: (r.filepath.lower(), r.source_path.lower()))
         return results
 
-    def search(self, query, *, source_paths=None, limit=500, offset=0):
+    def search(self, query, *, source_paths=None, limit=500, offset=0, sort=None):
+        """One page of matching files.  `sort` is (column, descending) with
+        column a key of RESULT_SORT_COLUMNS; the whole result is sorted, so
+        paging through it with offset covers every match in that order."""
         with closing(self._connect()) as connection:
             join, where, params, order = compile_query(
                 query, fts_enabled=self._has_fts(connection)
             )
+            if sort and sort[0] in RESULT_SORT_COLUMNS:
+                order = (f"{RESULT_SORT_COLUMNS[sort[0]]} {'DESC' if sort[1] else 'ASC'}, "
+                         "f.id")
             where = self._limit_sources(where, params, source_paths)
             sql = f"""SELECT s.path, f.filepath, f.date_taken, f.size_bytes, f.mtime_ns,
                             f.gps_lat, f.gps_lon, f.location, f.content_hash, f.stack

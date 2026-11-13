@@ -206,3 +206,45 @@ def test_a_second_mount_or_unmount_waits_for_the_first(monkeypatch):
     gui.FindPhotoDatesGUI._unmount(app, drive, button)
     assert started == [1] and app._drive_op == 1  # neither second operation started
     assert shown == ["Wait until unmounting A has finished."] * 2
+
+
+def _sorting_dialog(searches):
+    dialog = types.SimpleNamespace(
+        sort_column=None, sort_descending=False, _loading=False, _searched=True,
+        folders_var=types.SimpleNamespace(get=lambda: False), _folder_rows=None,
+        _set_columns=lambda: None, _search=lambda: searches.append(
+            (dialog.sort_column, dialog.sort_descending)),
+    )
+    return dialog
+
+
+def test_clicking_a_heading_sorts_ascending_then_flips_and_moves_on():
+    searches = []
+    dialog = _sorting_dialog(searches)
+    sort = gui.FileSearchDialog._sort_by
+    sort(dialog, "size")
+    sort(dialog, "size")
+    sort(dialog, "date")
+    assert searches == [("size", False), ("size", True), ("date", False)]
+
+
+def test_heading_shows_an_arrow_for_the_sort_direction_only():
+    dialog = types.SimpleNamespace(sort_column="size", sort_descending=False)
+    heading = gui.FileSearchDialog._heading_text
+    assert heading(dialog, "size", "Size") == "Size ▲"
+    dialog.sort_descending = True
+    assert heading(dialog, "size", "Size") == "Size ▼"
+    assert heading(dialog, "date", "Photo date") == "Photo date"
+
+
+def test_sorting_during_a_search_waits_for_its_results_instead_of_restarting():
+    searches = []
+    dialog = _sorting_dialog(searches)
+    dialog._loading = True
+    dialog.folders_var = types.SimpleNamespace(get=lambda: True)
+    gui.FileSearchDialog._sort_by(dialog, "size")
+    assert searches == []  # folder results are sorted when they arrive
+
+    dialog.folders_var = types.SimpleNamespace(get=lambda: False)
+    gui.FileSearchDialog._sort_by(dialog, "size")
+    assert searches == [("size", True)]  # file results: start the search over, sorted
